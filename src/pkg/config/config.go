@@ -584,9 +584,31 @@ type KnowledgeLayer struct {
 }
 
 type KnowledgeCurator struct {
+	// Enabled gates the scheduled auto-promotion loop. It is a pointer so an
+	// absent key is distinguishable from an explicit `enabled: false`, and it
+	// defaults to FALSE — unlike BeadSynthesizer, which defaults to true.
+	//
+	// The asymmetry is deliberate. Auto-promotion copies facts into a
+	// higher-precedence knowledge layer with no human review, and `schedule`
+	// has been parsed-but-unactioned since it was introduced (#5430), so every
+	// existing hive that set it did so without ever having the loop run. If
+	// the loop defaulted on, upgrading would silently begin mutating the org
+	// layer on hives that never opted in. Scheduled promotion is therefore
+	// opt-in: `schedule` alone does NOT start it.
+	Enabled              *bool    `yaml:"enabled,omitempty"`
 	Schedule             string   `yaml:"schedule"`
 	ExtractFrom          []string `yaml:"extract_from"`
 	AutoPromoteThreshold float64  `yaml:"auto_promote_threshold"`
+	// PromoteFrom / PromoteTo name the source and target layers for the
+	// scheduled promotion sweep. Empty values fall back to project→org.
+	PromoteFrom string `yaml:"promote_from,omitempty"`
+	PromoteTo   string `yaml:"promote_to,omitempty"`
+}
+
+// IsEnabled reports whether scheduled auto-promotion is active. Absent (nil)
+// means DISABLED — see the Enabled field comment for why this defaults false.
+func (k KnowledgeCurator) IsEnabled() bool {
+	return k.Enabled != nil && *k.Enabled
 }
 
 type KnowledgePrimer struct {
@@ -612,6 +634,18 @@ type ProjectConfig struct {
 	// polarity is Governor.Labels.Exempt, which wins on conflict. Absent/empty
 	// = no filtering, the pre-existing behavior. See IssueFilterConfig.
 	IssueFilter IssueFilterConfig `yaml:"issue_filter,omitempty"`
+	// CheckoutsDir is a host-local directory holding one checkout per monitored
+	// repo, as "<CheckoutsDir>/<repo name>" — the bare name from Repos, without
+	// the org. It is how an operator supplies the per-repo checkout root the
+	// AGENTS.md convention needs (kubestellar/hive#5227): Hive agents work over
+	// the API and keep no clones of their own, so without this there is no local
+	// path for the scheduler to read a repo's AGENTS.md from.
+	//
+	// Optional and additive. Empty (the default) means no checkout root, which
+	// is exactly the previous behavior — AGENTS.md injection stays a no-op. A
+	// directory that is absent or holds no AGENTS.md is also a no-op; nothing
+	// here can fail a kick. See CheckoutRootFor.
+	CheckoutsDir string `yaml:"checkouts_dir,omitempty"`
 }
 
 const (
@@ -630,6 +664,31 @@ func (p *ProjectConfig) ForgeKind() string {
 		return ForgeGitHub
 	}
 	return p.Forge
+}
+
+// CheckoutRootFor returns the host-local checkout root for one monitored repo,
+// or "" when none is configured. repo may be a bare name ("hive") or an
+// org-qualified slug ("kubestellar/hive"); only the name portion is used, since
+// CheckoutsDir is keyed by bare repo name.
+//
+// Returning "" is the no-op case and is deliberately the default: a hive that
+// never sets checkouts_dir behaves exactly as it did before this existed.
+func (p *ProjectConfig) CheckoutRootFor(repo string) string {
+	dir := strings.TrimSpace(p.CheckoutsDir)
+	name := strings.TrimSpace(repo)
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	if dir == "" || name == "" {
+		return ""
+	}
+	// Refuse a name that would escape CheckoutsDir. A repo name comes from
+	// config rather than from a forge, but this is a filesystem path built from
+	// a string and the guard costs nothing.
+	if name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+		return ""
+	}
+	return filepath.Join(dir, name)
 }
 
 // PRsAllowed returns whether agents may open pull requests. Defaults to true.
@@ -663,15 +722,21 @@ type StatsDisplayEntry struct {
 }
 
 // ChannelConfig declares a trigger channel for an agent.
+//
+// Only ChannelTypeKick (governor timer kicks) has a runtime. The former
+// webhook/discord/schedule/bead trigger types were declarative-only: the
+// pkg/channels runtime meant to serve them was never wired into the binary
+// and was removed (#5591). Declaring one of those types used to validate
+// cleanly while suppressing governor kicks, leaving the agent permanently
+// dormant with no diagnostics; ValidateChannels now rejects them instead.
 type ChannelConfig struct {
-	Type     string            `yaml:"type" json:"type"`
-	Enabled  *bool             `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	Events   []string          `yaml:"events,omitempty" json:"events,omitempty"`
-	Patterns []string          `yaml:"patterns,omitempty" json:"patterns,omitempty"`
-	Schedule string            `yaml:"schedule,omitempty" json:"schedule,omitempty"`
-	Match    map[string]string `yaml:"match,omitempty" json:"match,omitempty"`
-	Repos    []string          `yaml:"repos,omitempty" json:"repos,omitempty"`
+	Type    string `yaml:"type" json:"type"`
+	Enabled *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 }
+
+// ChannelTypeKick is the only channel type with a live trigger runtime:
+// ordinary governor timer kicks.
+const ChannelTypeKick = "kick"
 
 // IsEnabled returns whether this channel is active (defaults to true).
 func (c *ChannelConfig) IsEnabled() bool {
@@ -943,8 +1008,10 @@ type AgentConfig struct {
 	// agent_sandbox.enabled gate is also true.
 	Sandbox *AgentSandboxOverride `yaml:"sandbox,omitempty" json:"sandbox,omitempty"`
 
-	// Channels declares how this agent gets triggered (kick, webhook, discord, schedule, bead).
-	// When nil/empty, the agent uses governor timer kicks by default (implicit kick channel).
+	// Channels declares how this agent gets triggered. Only "kick" (governor
+	// timer kicks) is a valid type; when nil/empty, the agent uses governor
+	// timer kicks by default (implicit kick channel). See ChannelConfig for
+	// why the former webhook/discord/schedule/bead types are rejected.
 	Channels []ChannelConfig `yaml:"channels,omitempty" json:"channels,omitempty"`
 
 	// Tools declares what tools this agent can use. When nil, the existing Mode field governs.
@@ -952,6 +1019,20 @@ type AgentConfig struct {
 
 	// Connections declares external service integrations (MCP servers, APIs, knowledge sources).
 	Connections []ConnectionConfig `yaml:"connections,omitempty" json:"connections,omitempty"`
+
+	// Skills names reusable "how to do X" skills to resolve out of the hive's
+	// skill registry (pkg/skillreg, loaded from the host-local skills directory)
+	// and inject into this agent's kick context. Names are resolved at kick
+	// time, so editing a skill file takes effect on the next kick without a
+	// restart. An unknown name is skipped, not fatal: a typo degrades the kick
+	// rather than blocking the agent.
+	//
+	// This is deliberately host-local rather than per-repo. Hive agents work
+	// over the GitHub API and have no guaranteed per-repo checkout, so a
+	// repo-declared skills directory would resolve to nothing on most kicks;
+	// the registry directory is the same kind of operator-managed volume as
+	// /data/policies and is present on every hive host.
+	Skills []string `yaml:"skills,omitempty" json:"skills,omitempty"`
 
 	// Managed is true for agents loaded from the overlay directory (not base config).
 	Managed bool `yaml:"-" json:"managed"`
@@ -1013,7 +1094,7 @@ func (a *AgentConfig) UsesGovernorKick() bool {
 	if len(a.Channels) == 0 {
 		return true
 	}
-	return a.HasChannel("kick")
+	return a.HasChannel(ChannelTypeKick)
 }
 
 // ShouldIncludeRepos returns whether the repos section should be appended to kicks.
@@ -2729,6 +2810,38 @@ type BudgetConfig struct {
 	TotalTokens int64 `yaml:"total_tokens"`
 	PeriodDays  int   `yaml:"period_days"`
 	CriticalPct int   `yaml:"critical_pct"`
+}
+
+// MinUsableBudgetTokens is the sanity floor for governor.budget.total_tokens.
+// A fleet audit (#5508) found LIVE spokes configured with limits of 5, 50 and
+// 1000 tokens — unit mistakes where the operator meant 5M/50M. A single model
+// call consumes more than any of those, so the budget gate closes on the first
+// kick and the spoke sits permanently budget-exhausted, doing no work, while
+// the fleet view shows only a generic quiet hive.
+//
+// The floor is a plausibility test, not a policy minimum: it separates "a
+// small budget" from "a value that cannot fund one call". Zero is exempt
+// everywhere — total_tokens: 0 is the documented way to disable budget
+// tracking entirely and must keep working.
+const MinUsableBudgetTokens int64 = 100_000
+
+// BudgetLimitBelowFloor reports whether a configured token limit is a likely
+// unit mistake: positive, but too small to fund a single model call. Zero
+// (budget tracking disabled) and negative values are NOT below-floor — zero is
+// a legitimate mode and negatives are rejected by the normal range checks.
+func BudgetLimitBelowFloor(totalTokens int64) bool {
+	return totalTokens > 0 && totalTokens < MinUsableBudgetTokens
+}
+
+// SuggestBudgetUnitMistake renders the "did you mean" hint for a below-floor
+// limit — "50" almost always means "50M". Returns "" when the value is not
+// below the floor, so callers can use it as both the test and the message.
+func SuggestBudgetUnitMistake(totalTokens int64) string {
+	if !BudgetLimitBelowFloor(totalTokens) {
+		return ""
+	}
+	return fmt.Sprintf("limit of %d tokens is below any usable budget (floor %d) — did you mean %dM?",
+		totalTokens, MinUsableBudgetTokens, totalTokens)
 }
 
 type ModeConfig struct {
@@ -4584,6 +4697,21 @@ func (c *Config) applyDefaults() {
 	if c.Governor.Budget.CriticalPct == 0 {
 		c.Governor.Budget.CriticalPct = defaultBudgetCriticalPct
 	}
+	// WARN, NEVER REJECT, on the load path (#5508). Three spokes are live
+	// right now with below-floor limits. If load REFUSED them they would fail
+	// to start on the next restart — converting a starving hive into a dead
+	// one, which is strictly worse than the bug being fixed. The operator can
+	// only correct the value through a hive that boots.
+	//
+	// Rejection belongs solely to the dashboard SAVE path, where a human is
+	// present to read the message and fix the number. Do not "make validation
+	// consistent" by promoting this to an error; the asymmetry is the fix.
+	// TestBelowFloorBudgetStillLoads pins it.
+	if msg := SuggestBudgetUnitMistake(c.Governor.Budget.TotalTokens); msg != "" {
+		log.Printf("WARNING: governor.budget.total_tokens: %s "+
+			"— agents will exhaust this budget on their first model call and stop working; "+
+			"config loaded unchanged, correct it in the dashboard (Governor → Budget)", msg)
+	}
 	if c.Governor.Logging.Dir == "" {
 		c.Governor.Logging.Dir = c.Data.LogsDir
 	}
@@ -4626,7 +4754,13 @@ func (c *Config) applyDefaults() {
 		if len(c.Knowledge.Primer.Priority) == 0 {
 			c.Knowledge.Primer.Priority = []string{"regression", "gotcha", "test_scaffold", "pattern", "decision"}
 		}
-		if c.Knowledge.Curator.Schedule == "" {
+		// Schedule is only defaulted when the curator has been explicitly
+		// enabled. Defaulting it unconditionally (the pre-#5430 behaviour) was
+		// harmless while nothing read the field, but now that it drives a
+		// promotion loop a blanket default would hand every hive a cadence it
+		// never asked for. The Enabled gate is the real guard; leaving Schedule
+		// empty on disabled hives keeps the config honest about what will run.
+		if c.Knowledge.Curator.IsEnabled() && c.Knowledge.Curator.Schedule == "" {
 			c.Knowledge.Curator.Schedule = defaultCuratorSchedule
 		}
 		if c.Knowledge.Curator.AutoPromoteThreshold == 0 {
@@ -4964,28 +5098,20 @@ func (c *Config) validate() error {
 }
 
 func validateChannels(agentName string, channels []ChannelConfig) error {
-	validTypes := map[string]bool{"kick": true, "webhook": true, "discord": true, "schedule": true, "bead": true}
+	return ValidateChannels(agentName, channels)
+}
+
+// ValidateChannels rejects any channel declaration whose type has no trigger
+// runtime. Only ChannelTypeKick is valid: the webhook/discord/schedule/bead
+// runtime (pkg/channels) was never wired into the binary and was removed
+// (#5591). Accepting those types would silently suppress governor kicks (see
+// UsesGovernorKick) with no runtime left to fire the declared trigger,
+// leaving the agent permanently dormant. Exported so config writers such as
+// the dashboard channels endpoint can fail fast before persisting.
+func ValidateChannels(agentName string, channels []ChannelConfig) error {
 	for i, ch := range channels {
-		if !validTypes[ch.Type] {
-			return fmt.Errorf("agent %s: channel[%d]: invalid type %q", agentName, i, ch.Type)
-		}
-		switch ch.Type {
-		case "webhook":
-			if len(ch.Events) == 0 {
-				return fmt.Errorf("agent %s: channel[%d]: webhook requires at least one event", agentName, i)
-			}
-		case "discord":
-			if len(ch.Patterns) == 0 {
-				return fmt.Errorf("agent %s: channel[%d]: discord requires at least one pattern", agentName, i)
-			}
-		case "schedule":
-			if ch.Schedule == "" {
-				return fmt.Errorf("agent %s: channel[%d]: schedule requires a cron expression", agentName, i)
-			}
-		case "bead":
-			if len(ch.Match) == 0 {
-				return fmt.Errorf("agent %s: channel[%d]: bead requires at least one match criterion", agentName, i)
-			}
+		if ch.Type != ChannelTypeKick {
+			return fmt.Errorf("agent %s: channel[%d]: type %q has no trigger runtime (only %q is supported; the webhook/discord/schedule/bead runtime was removed, see #5591) — declaring it would leave the agent permanently unkicked", agentName, i, ch.Type, ChannelTypeKick)
 		}
 	}
 	return nil
@@ -5327,11 +5453,15 @@ func (c *Config) saveLocked() error {
 	// renamed or removed here — see RuntimeConfigFileLegacy.
 	runtimePath := RuntimeConfigFile
 	var runtimeErr error
-	if err := os.WriteFile(runtimePath, data, 0o644); err != nil {
+	// 0600, not 0644: the marshaled config carries dashboard.auth_token (and
+	// github.token in PAT mode), and /data is world-traversable on hive
+	// hosts, so a group/world-readable runtime config hands the dashboard
+	// owner credential to every unprivileged agent user (#5331).
+	if err := os.WriteFile(runtimePath, data, 0o600); err != nil {
 		// Common cause: init container created the file as root, runtime user
 		// can't overwrite. Remove and retry so runtime state is not silently lost.
 		_ = os.Remove(runtimePath) // best-effort; the retry's own WriteFile error is what's recorded below
-		if retryErr := os.WriteFile(runtimePath, data, 0o644); retryErr != nil {
+		if retryErr := os.WriteFile(runtimePath, data, 0o600); retryErr != nil {
 			runtimeErr = retryErr
 			log.Printf("[config] warning: failed to write PVC runtime config to %s (even after remove): %v", runtimePath, retryErr)
 		} else {
@@ -5339,6 +5469,12 @@ func (c *Config) saveLocked() error {
 		}
 	} else {
 		log.Printf("[config] PVC runtime config written to %s", runtimePath)
+		// os.WriteFile's mode only applies when it CREATES the file; a
+		// pre-existing world-readable inode (every hive deployed before
+		// this fix) keeps its old 0644 bits, so tighten explicitly.
+		if chmodErr := os.Chmod(runtimePath, 0o600); chmodErr != nil {
+			log.Printf("[config] warning: failed to tighten permissions on %s: %v", runtimePath, chmodErr)
+		}
 	}
 
 	overlayErr := c.saveDashboardOverlay()
@@ -5465,12 +5601,20 @@ func (c *Config) saveDashboardOverlay() error {
 		return err
 	}
 	tmpPath := DashboardOverlayFile + ".tmp"
-	const overlayFileMode = 0o644
+	// 0600, not 0644: dashboardOverlayBytes only folds the dashboard auth
+	// token back to its env form when it matches a bootstrap env var — a
+	// dashboard-minted token is persisted verbatim, so the overlay is not
+	// reliably secret-free (#5331).
+	const overlayFileMode = 0o600
 	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, overlayFileMode)
 	if err != nil {
 		log.Printf("[config] warning: failed to open dashboard overlay temp file %s (dashboard saves will not survive pod restarts): %v", tmpPath, err)
 		return err
 	}
+	// OpenFile's mode only applies on create; a leftover 0644 tmp file from a
+	// crash before this fix would otherwise carry its old bits through the
+	// rename. Best-effort: the rename below installs whatever mode f has.
+	_ = f.Chmod(overlayFileMode)
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close() // best-effort cleanup; the write error is what's returned
 		log.Printf("[config] warning: failed to write dashboard overlay temp file %s (dashboard saves will not survive pod restarts): %v", tmpPath, err)

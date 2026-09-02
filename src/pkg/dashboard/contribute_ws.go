@@ -78,6 +78,12 @@ type ContributorConnection struct {
 	ws              *websocket.Conn
 	profile         *ContributorProfile
 	cliBackend      string
+	// session is the OPTIONAL client-declared session label from auth_response
+	// (multi-session-per-account). Empty for a single-session contributor, which
+	// keeps identityOf() at the bare ContributorID. When set, identityOf()
+	// returns ContributorID#session so concurrent relays under one account get
+	// independent lease/assignment/failure slots. Sanitized at auth time.
+	session         string
 	model           string
 	reasoningEffort string
 	role            string // empty = task-driven mode, "scanner"/"reviewer"/etc. = role mode
@@ -102,6 +108,12 @@ type ContributorConnection struct {
 	// cleanupLoop auto-releases a task whose lease has not been renewed within
 	// wsTaskTimeout. Zero when no task is active.
 	lastLeaseRenew time.Time
+	// taskAssignedAt is when currentTask was assigned, kept SEPARATE from
+	// lastLeaseRenew (which task_progress refreshes) so a terminal report can
+	// record the task's real wall-clock duration in the run log
+	// (task_run_log.go). Zero when no task is active or the task was adopted
+	// via the resume path without a fresh assignment.
+	taskAssignedAt time.Time
 	lastPong       time.Time
 	tmuxOutput     []string
 	// tokenMintedAt is when the scoped GitHub token for currentTask was last
@@ -183,6 +195,24 @@ type ContributorConnection struct {
 func (c *ContributorConnection) send(msg WSMessage) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	// Bound the write (kubestellar/hive#5090). WriteJSON on a gorilla connection
+	// with no write deadline blocks INDEFINITELY once the peer's receive window
+	// closes — a half-open socket (an L7 proxy that dropped the tunnel without
+	// telling either endpoint) accepts no bytes and sends no RST, so the write
+	// neither completes nor fails. Every caller of send holds writeMu for the
+	// duration, so one wedged peer would park the heartbeat ticker, the read
+	// loop's replies, and the operator revoke/yank/reassign paths for that
+	// connection behind a lock nothing can break.
+	//
+	// wsWriteDeadline turns that unbounded park into a bounded failure the
+	// existing error paths already handle: the heartbeat's write-failure branch
+	// closes the socket with a reason, and a reply failure surfaces to its
+	// caller. The deadline is per-write and generous enough that an ordinary
+	// slow-but-live client is never cut — it exists to bound the pathological
+	// case, not to police latency.
+	if err := c.ws.SetWriteDeadline(time.Now().Add(wsWriteDeadline)); err != nil {
+		return err
+	}
 	return c.ws.WriteJSON(msg)
 }
 
@@ -212,6 +242,19 @@ type WSMessage struct {
 	// routing authority; Model remains the canonical selection transport.
 	Provider        string `json:"provider,omitempty"`
 	Model           string `json:"model,omitempty"`
+	// Session is an OPTIONAL client-declared session label (kubestellar/hive:
+	// multi-session-per-account). One GitHub account has ONE contributor profile
+	// (one ContributorID, one auth token, one trust tier), but a contributor may
+	// want to run several relays at once under that account — e.g. one per CLI
+	// backend (claude, agy, pi, kiro). All identity-keyed hub state (task leases,
+	// assignment cooldowns, failure streaks, ownership fences) keys on
+	// identityOf(); without a distinguisher those sessions would collide on a
+	// single active-task slot. A distinct Session yields a distinct
+	// session-scoped identity (ContributorID#session) for that state, while auth,
+	// tier, model admission and rate-limit accounting stay per-account. Additive
+	// and backward-compatible: omitted → identity is the bare ContributorID,
+	// exactly the previous single-session behavior. Sanitized/bounded before use.
+	Session         string `json:"session,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	TaskID          string `json:"task_id,omitempty"`
 	// TaskGen is the assignment GENERATION / lease token for this task (kubestellar/
@@ -316,6 +359,18 @@ type WSMessage struct {
 	// keeps yielding no work — precisely the signal needed to go answer the
 	// gating question. Truncated server-side to noWorkReasonMaxLen.
 	VerdictReason string `json:"verdict_reason,omitempty"`
+	// CompletionSignal records WHICH signal ended an interactive task
+	// (kubestellar/hive#5376): "verdict" when the agent printed its own
+	// HIVE_VERDICT: line, "chrome_idle" when it never did and the relay fell
+	// back to a bounded grace period of idle-looking terminal chrome.
+	//
+	// Diagnostic only — it changes no cooldown, no trust and no selection. It
+	// exists so per-backend sentinel non-compliance is MEASURABLE rather than
+	// guessed at: chrome inference is the mechanism behind thirteen separate
+	// false-completion issues, and this field is how an operator sees which
+	// backends are still relying on it. Absent from relays predating #5376 and
+	// from the headless path, which takes the CLI's exit code instead.
+	CompletionSignal string `json:"completion_signal,omitempty"`
 	// Permanent marks a task_failed the relay will not retry: it exhausted its
 	// per-task CLI-restart budget and gave up (see MAX_TASK_CLI_RESTARTS in
 	// bin/contributor-relay.sh). Reassigning the same work item to the same
@@ -420,11 +475,15 @@ type ContributeWSHub struct {
 	// mu-guarded to match taskGen's reasoning above: it is touched from the
 	// upgrade path and from deferred cleanup, and must never contend with or
 	// re-enter h.mu.
-	pendingConns   atomic.Int64
-	activityMu     sync.RWMutex
-	activity       []ActivityEntry
-	server         *Server
-	completedTasks map[string]time.Time
+	pendingConns atomic.Int64
+	activityMu   sync.RWMutex
+	activity     []ActivityEntry
+	// absorbedReconnects counts flaps collapsed by absorbReconnectFlapLocked
+	// (kubestellar/hive#5151), so a contributor bouncing stays countable after its
+	// feed rows stop being written. Guarded by activityMu alongside activity itself.
+	absorbedReconnects int
+	server             *Server
+	completedTasks     map[string]time.Time
 	// completedTaskCooldown holds a per-task override for how long, from the
 	// completion time in completedTasks, the issue stays in cooldown. It is
 	// populated by markTaskCompleted based on whether a PR was reported. When a
@@ -942,6 +1001,31 @@ func (h *ContributeWSHub) addActivity(username, action, role, cli, model, effort
 			}
 		}
 	}
+	// #5151: absorb a fast reconnect instead of booking it as a departure plus an
+	// arrival. A flap emits "released: connection lost" -> "left" -> "joined"; the
+	// debounce above never fires on it because consecutive entries never repeat an
+	// action. At three rows per flap against maxActivityEntries (50), one flapping
+	// contributor evicts the entire retained feed in under 20 minutes, which is what
+	// #5090 measured as 19 joined / 19 left filling 38 of 50 slots.
+	//
+	// Retracting the trailing flap rows on the "joined" that closes the round trip is
+	// what makes this correct rather than merely quieter: the pair is only collapsed
+	// once the reconnect has PROVEN the contributor came back, so a genuine departure
+	// — where no "joined" ever arrives — keeps every row exactly as today. That is the
+	// property #5151 asks for ("expiry must fall through to exactly today's
+	// behavior"), and it needs no timer, no deferred work, and no grace period during
+	// which the hub is holding a decision it has not made.
+	//
+	// It touches ONLY the feed. The #2356 duplicate-PR guarantee is untouched and is
+	// not this function's to weaken: the release cooldown is still booked eagerly by
+	// the disconnect defer, and is withdrawn only by the lease-bound resume in
+	// task_progress via clearReleaseCooldown (#5322) — which withdraws it because the
+	// original owner has re-entered activeIssues, the stronger guard the cooldown was
+	// standing in for. No window is ever open in which the issue is both out of
+	// activeIssues and out of cooldown.
+	if action == "joined" {
+		h.absorbReconnectFlapLocked(username)
+	}
 	entry := ActivityEntry{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Username:  username,
@@ -966,6 +1050,111 @@ func (h *ContributeWSHub) addActivity(username, action, role, cli, model, effort
 	// center). Done AFTER releasing activityMu, and the fan-out itself is a
 	// non-blocking send, so a subscribed browser can never stall the WS path.
 	h.broadcastActivity(entry)
+}
+
+// reconnectFlapWindow is how recently a "left" must have been written for the
+// following "joined" to count as the same contributor bouncing rather than a
+// genuine departure followed later by a fresh arrival.
+//
+// It is sized against the relay's reconnect backoff, not against human behaviour:
+// BASE_RECONNECT_DELAY_MS is 1s and MAX_RECONNECT_DELAY_MS is 60s, so a relay that
+// is coming back does so inside a minute. Matching activityDebounceSecs keeps one
+// notion of "the same session, still" in this file rather than two that can drift.
+const reconnectFlapWindow = activityDebounceSecs * time.Second
+
+// absorbReconnectFlapLocked retracts the trailing "left" — and the
+// "released: connection lost" that may immediately precede it — written for this
+// user by a disconnect that a reconnect has now undone (kubestellar/hive#5151).
+//
+// Called from addActivity with activityMu already held, immediately before a
+// "joined" is appended. It walks back over at most the two rows one flap can
+// write, requires them to belong to THIS user and to be inside
+// reconnectFlapWindow, and stops at anything else. It therefore cannot reach past
+// a flap into unrelated history, cannot collapse two different users' rows
+// together, and cannot touch a "picked up" or "completed" — the rows an operator
+// actually wants and that this churn was evicting.
+//
+// A departure with no reconnect behind it is never reached at all: this runs only
+// on "joined". A departure whose reconnect arrives later than the window keeps its
+// rows, because at that distance it is no longer a flap.
+//
+// The flap stays COUNTABLE. #5151 is explicit that absorbing must not become
+// silence — the hub-side "[contribute-ws] disconnected" log line and the relay's
+// describeWsClose output are untouched and unconditional (they are the #5107
+// instrumentation and the real diagnostic surface), and absorbedReconnects
+// increments here so "this contributor flapped N times" stays answerable more
+// cheaply than by counting feed rows, which is what the issue asked for.
+func (h *ContributeWSHub) absorbReconnectFlapLocked(username string) {
+	if username == "" {
+		return
+	}
+	end := len(h.activity)
+	i := end
+	sawLeft := false
+	// At most three rows, which is everything one flap cycle can leave behind:
+	// the "left", the "released: connection lost" that may precede it, and the
+	// "joined" written by the PREVIOUS absorbed flap.
+	//
+	// That third row is what makes repeated flapping actually collapse. Each
+	// absorbed flap leaves its own "joined" as the new trailing row, so on the next
+	// flap the walk would stop at it and the feed would still grow by one row per
+	// flap — 20 flaps leaving 20 "joined" rows, which is the same eviction #5151
+	// reports, only quieter. Consuming the superseded "joined" makes a contributor
+	// that flaps N times in a row occupy ONE row rather than N: the arrival that is
+	// still true is the one about to be appended, and the earlier ones describe a
+	// presence that never lapsed.
+	//
+	// Bounded explicitly rather than by a general scan so this can never chew
+	// through the feed.
+	for i > 0 && end-i < 3 {
+		e := h.activity[i-1]
+		if e.Username != username {
+			break
+		}
+		t, err := time.Parse(time.RFC3339, e.Timestamp)
+		if err != nil || time.Since(t) >= reconnectFlapWindow {
+			break
+		}
+		if e.Action == "left" && !sawLeft {
+			sawLeft = true
+			i--
+			continue
+		}
+		if sawLeft && e.Action == "released: connection lost" {
+			i--
+			continue
+		}
+		// Only reachable once the left (and any released) above it have been
+		// consumed, so this can only ever be the arrival that opened the session
+		// this flap just closed — never an unrelated join.
+		if sawLeft && e.Action == "joined" {
+			i--
+			continue
+		}
+		break
+	}
+	// Only collapse when a "left" was actually found. Without it there is no
+	// departure to undo, and a bare "released: connection lost" must survive — it
+	// describes work, not presence.
+	if !sawLeft {
+		return
+	}
+	h.activity = h.activity[:i]
+	h.absorbedReconnects++
+}
+
+// AbsorbedReconnects returns how many contributor reconnects have been absorbed
+// into the activity feed rather than booked as a departure plus an arrival
+// (kubestellar/hive#5151). It is the cheap, non-evicting answer to "is a
+// contributor flapping, and how much", which before this was answerable only by
+// counting the feed rows the flapping was simultaneously evicting.
+func (h *ContributeWSHub) AbsorbedReconnects() int {
+	if h == nil {
+		return 0
+	}
+	h.activityMu.RLock()
+	defer h.activityMu.RUnlock()
+	return h.absorbedReconnects
 }
 
 func (h *ContributeWSHub) RecentActivity() []ActivityEntry {
@@ -1227,6 +1416,39 @@ func normalizeCompletionVerdict(reported, verifiedPR string) string {
 		return completionVerdictNoWorkNeeded
 	}
 	return completionVerdictIdle
+}
+
+// Completion-signal vocabulary (kubestellar/hive#5376). Diagnostic only: these
+// values gate no cooldown, no trust and no selection.
+const (
+	// completionSignalVerdict — the agent printed its own HIVE_VERDICT: line.
+	// This is the trustworthy signal.
+	completionSignalVerdict = "verdict"
+	// completionSignalChromeIdle — the agent never printed one and the relay
+	// fell back to a bounded grace period of idle-looking terminal chrome.
+	// Chrome inference is the mechanism behind thirteen separate
+	// false-completion issues, so a rising count here for some backend is the
+	// operator's cue that that backend is not honouring the sentinel.
+	completionSignalChromeIdle = "chrome_idle"
+	// completionSignalUnknown — the field was absent (a relay predating #5376,
+	// or the headless path, which takes the CLI's exit code) or carried a
+	// value the hub does not recognise.
+	completionSignalUnknown = "unknown"
+)
+
+// normalizeCompletionSignal maps a client-reported completion_signal onto the
+// closed vocabulary above. Client-supplied free text never reaches the hub's
+// structured logs: an unrecognised value is reported as unknown, exactly as an
+// absent one is.
+func normalizeCompletionSignal(reported string) string {
+	switch strings.ToLower(strings.TrimSpace(reported)) {
+	case completionSignalVerdict:
+		return completionSignalVerdict
+	case completionSignalChromeIdle:
+		return completionSignalChromeIdle
+	default:
+		return completionSignalUnknown
+	}
 }
 
 // isSuppressedByNoWorkVerdict reports whether a live no_work_needed verdict
@@ -1870,6 +2092,43 @@ func (h *ContributeWSHub) bookReleaseCooldown(repo string, number int) {
 	h.failedTasks[key] = time.Now()
 	h.completedMu.Unlock()
 	h.saveFailedTasks()
+}
+
+// clearReleaseCooldown withdraws a cooldown booked by bookReleaseCooldown once the
+// release it was hedging against turns out not to have happened
+// (kubestellar/hive#5322).
+//
+// The disconnect path books that cooldown speculatively: at the moment a socket
+// drops the hub cannot know whether the relay is gone for good or reconnecting, so
+// it stamps the #2356 window to stop a second session being handed the same issue
+// during the gap. A lease-bound resume answers the question — the ORIGINAL relay is
+// back and still on the ORIGINAL task, so no release ever occurred and the hedge has
+// served its purpose. Leaving it stamped is what left a demonstrably in-flight issue
+// carrying a release cooldown for the rest of the window: the ledger said "recently
+// let go" about work nobody let go of, and the operator surfaces that read the
+// failure ledger agreed.
+//
+// It is deliberately NARROW. It clears only the timestamp, and only when the issue
+// carries NO consecutive-failure count — i.e. only a hedge booked by
+// bookReleaseCooldown, never a cooldown earned through recordTaskFailure by a real
+// task_failed, a watchdog give-up, or the wedged-task backstop. A resume therefore
+// cannot launder a genuine failure record, and the #2356 duplicate-PR guarantee is
+// intact because the very thing that clears the window is the original owner
+// re-entering activeIssues, which is the stronger guard the window was standing in
+// for.
+func (h *ContributeWSHub) clearReleaseCooldown(repo string, number int) {
+	key := fmt.Sprintf("%s#%d", repo, number)
+	h.completedMu.Lock()
+	_, booked := h.failedTasks[key]
+	if booked && h.consecutiveFailures[key] == 0 {
+		delete(h.failedTasks, key)
+	} else {
+		booked = false
+	}
+	h.completedMu.Unlock()
+	if booked {
+		h.saveFailedTasks()
+	}
 }
 
 // failureCooldownForLocked returns how long, from the last failure time, an
@@ -2853,6 +3112,50 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 			contributor.pendingToken = ""
 			contributor.credentialDelivered = false
 			contributor.mu.Unlock()
+
+			// #5322: deregister THIS socket before deciding whether its task is
+			// really abandoned. The check below asks "is some OTHER live
+			// connection for this identity already holding this task?", and the
+			// answer must not be able to include the connection being torn down.
+			// Moved up from the tail of this defer for exactly that reason; it is
+			// the same single delete of the same key, just ordered ahead of the
+			// release so the two cannot observe each other.
+			h.mu.Lock()
+			delete(h.connections, connID)
+			h.mu.Unlock()
+
+			// #5322: a socket that dies WITHOUT a close frame (an L7 proxy cutting
+			// the tunnel — the 1006 flap #5090/#5310 measured) leaves this read
+			// loop parked in ReadMessage, so this defer does not run when the
+			// socket dies; it runs whenever the next read finally errors. The
+			// relay meanwhile redials in ~1s and re-asserts its task over a NEW
+			// connection, which the lease-bound resume in task_progress legitimately
+			// adopts. h.connections is keyed by a random per-socket connID and the
+			// hub has no notion of "this contributor's current socket", so when this
+			// defer eventually fires it releases BY ISSUE a task that a live
+			// connection is demonstrably still working: it books a release cooldown
+			// on an in-flight issue and writes "released: connection lost" for work
+			// nobody released. That is the silent drop — the hub's own record of the
+			// assignment contradicted by the ghost of a socket that no longer
+			// represents the contributor.
+			//
+			// So: release only what is still ours to release. If another LIVE
+			// connection for this same identity already holds this exact task, the
+			// reconnect has already reconciled and this socket is a ghost — skip the
+			// release entirely. This changes nothing about a genuine departure (no
+			// other connection holds the task, so the release runs exactly as
+			// before, booking the same cooldown and writing the same rows —
+			// deliberately leaving kubestellar/hive#5151's accounting untouched).
+			if abandonedTask != nil && h.taskReadoptedByLiveConnection(contributor, abandonedTask) {
+				h.logger.Info("[contribute-ws] disconnect release skipped: task already re-adopted on a live connection",
+					"username", contributor.profile.GitHubUsername,
+					"task", abandonedTask.TaskID,
+					"repo", abandonedTask.Repo,
+					"number", abandonedTask.Number,
+				)
+				abandonedTask = nil
+			}
+
 			if abandonedTask != nil {
 				h.logger.Warn("[contribute-ws] task released on disconnect",
 					"username", contributor.profile.GitHubUsername,
@@ -2898,9 +3201,6 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 					contributor.role, contributor.cliBackend, contributor.model,
 					contributor.reasoningEffort, taskDescOf(abandonedTask))
 			}
-			h.mu.Lock()
-			delete(h.connections, connID)
-			h.mu.Unlock()
 			h.logger.Info("[contribute-ws] disconnected", "username", contributor.profile.GitHubUsername)
 			h.addActivity(contributor.profile.GitHubUsername, "left", contributor.role, contributor.cliBackend, contributor.model, contributor.reasoningEffort, "")
 		}
@@ -3048,6 +3348,7 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 				ws:              conn,
 				profile:         profile,
 				cliBackend:      msg.CLIBackend,
+				session:         sanitizeSessionLabel(msg.Session),
 				model:           msg.Model,
 				reasoningEffort: msg.ReasoningEffort,
 				role:            requestedRole,
@@ -3116,6 +3417,21 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 			case authDone <- contributor:
 			default:
 			}
+
+			// Count a PROTOCOL-level Pong as liveness, exactly as the JSON
+			// "pong" case below does (kubestellar/hive#5090). Now that the hub
+			// emits real Ping control frames, a relay that answers only those —
+			// which is what any conforming WebSocket client does automatically,
+			// with no relay code at all — must not be false-timed-out by the
+			// heartbeat sweep. gorilla invokes this handler from ReadMessage on
+			// the read goroutine, which holds neither mu nor writeMu here, so
+			// taking mu introduces no re-entrancy.
+			contributor.ws.SetPongHandler(func(string) error {
+				contributor.mu.Lock()
+				contributor.lastPong = time.Now()
+				contributor.mu.Unlock()
+				return nil
+			})
 
 			go h.heartbeatLoop(contributor)
 
@@ -3327,6 +3643,19 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 					// second time even though it never stopped working.
 					h.renewLease(identity, lease.taskID, time.Now())
 
+					// #5322: the disconnect that preceded this resume booked a
+					// speculative release cooldown on the issue (#2356's
+					// duplicate-assign hedge). This resume proves the release never
+					// happened — the original relay is back, on the original task,
+					// under the original generation — so withdraw the hedge rather
+					// than leave a live, in-flight issue stamped "recently released"
+					// in the failure ledger for the rest of the window. Narrow by
+					// construction: clearReleaseCooldown refuses to touch an issue
+					// that carries a real consecutive-failure count.
+					if lease.number > 0 {
+						h.clearReleaseCooldown(lease.repo, lease.number)
+					}
+
 					h.logger.Info("[contribute-ws] task resumed from server-issued lease",
 						"username", contributor.profile.GitHubUsername,
 						"task", lease.taskID, "repo", lease.repo, "number", lease.number)
@@ -3426,6 +3755,10 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 				}
 				hasTask := contributor.currentTask != nil && contributor.currentTask.TaskID == msg.TaskID
 				completedTask := contributor.currentTask
+				// Captured before the clear below so the run log can record the
+				// task's wall-clock duration. Zero when the task was adopted
+				// without a fresh assignment; the record then omits duration.
+				taskAssignedAt := contributor.taskAssignedAt
 				// SECURITY (audit N9, CWE-862/639): clear ONLY when the reported
 				// task_id actually matches the held assignment.
 				//
@@ -3447,6 +3780,7 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 					contributor.currentPrompt = ""
 					contributor.currentLabels = nil
 					contributor.tokenMintedAt = time.Time{}
+					contributor.taskAssignedAt = time.Time{}
 					// #2537: clear any pending/delivered credential state with the task.
 					contributor.pendingToken = ""
 					contributor.credentialDelivered = false
@@ -3542,7 +3876,38 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 						"pr_verified", verifiedPR != "",
 						"verdict", verdict,
 						"verdict_reason", strings.TrimSpace(msg.VerdictReason),
+						// #5376: which signal ended the task. Diagnostic only —
+						// normalized to a closed vocabulary so a client cannot
+						// inject arbitrary text into the hub's structured logs.
+						"completion_signal", normalizeCompletionSignal(msg.CompletionSignal),
 					)
+					// Durable per-run record (task_run_log.go) — the same
+					// normalized fields the slog line above carries, plus the
+					// duration nothing recorded before. DECLARE only.
+					runRec := TaskRunRecord{
+						TaskID:           msg.TaskID,
+						TaskGen:          msg.TaskGen,
+						Username:         contributor.profile.GitHubUsername,
+						Backend:          contributor.cliBackend,
+						Provider:         provider,
+						Model:            contributor.model,
+						Effort:           contributor.reasoningEffort,
+						Role:             contributor.role,
+						Outcome:          "completed",
+						CompletionSignal: normalizeCompletionSignal(msg.CompletionSignal),
+						Verdict:          verdict,
+						VerdictReason:    strings.TrimSpace(msg.VerdictReason),
+						PRURL:            verifiedPR,
+						PRVerified:       verifiedPR != "",
+					}
+					if completedTask != nil {
+						runRec.Repo = completedTask.Repo
+						runRec.Number = completedTask.Number
+					}
+					if !taskAssignedAt.IsZero() {
+						runRec.DurationS = time.Since(taskAssignedAt).Seconds()
+					}
+					h.appendTaskRun(runRec)
 					contributor.mu.Lock()
 					contributor.profile.TasksCompleted++
 					// Trust credit is gated on the VERIFIED PR, not the reported one:
@@ -3613,6 +3978,9 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 				}
 				hasTask := contributor.currentTask != nil && contributor.currentTask.TaskID == msg.TaskID
 				failedTask := contributor.currentTask
+				// Duration anchor for the run log, captured before the clear —
+				// same shape as task_complete above.
+				taskAssignedAt := contributor.taskAssignedAt
 				// SECURITY (audit N9, CWE-862/639): same hole as task_complete —
 				// clear only on a genuine TaskID match. Unconditionally, a failure
 				// naming any other task released the assignment while revokeLease
@@ -3622,6 +3990,7 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 				if hasTask {
 					contributor.currentTask = nil
 					contributor.tokenMintedAt = time.Time{}
+					contributor.taskAssignedAt = time.Time{}
 					// #2537: clear any pending/delivered credential state with the task.
 					contributor.pendingToken = ""
 					contributor.credentialDelivered = false
@@ -3685,6 +4054,31 @@ func (h *ContributeWSHub) HandleWS(w http.ResponseWriter, r *http.Request) {
 						"failure_kind", failureKind,
 						"permanent", msg.Permanent,
 					)
+					// Durable per-run record (task_run_log.go). The reason is
+					// the same bounded, fleet-view-displayed text stored on
+					// lastFailure above; failure_kind is already normalized.
+					runRec := TaskRunRecord{
+						TaskID:      msg.TaskID,
+						TaskGen:     msg.TaskGen,
+						Username:    contributor.profile.GitHubUsername,
+						Backend:     contributor.cliBackend,
+						Provider:    provider,
+						Model:       contributor.model,
+						Effort:      contributor.reasoningEffort,
+						Role:        contributor.role,
+						Outcome:     "failed",
+						FailureKind: failureKind,
+						Reason:      msg.Reason,
+						Permanent:   msg.Permanent,
+					}
+					if failedTask != nil {
+						runRec.Repo = failedTask.Repo
+						runRec.Number = failedTask.Number
+					}
+					if !taskAssignedAt.IsZero() {
+						runRec.DurationS = time.Since(taskAssignedAt).Seconds()
+					}
+					h.appendTaskRun(runRec)
 					contributor.mu.Lock()
 					contributor.profile.TasksFailed++
 					contributor.mu.Unlock()
@@ -3723,6 +4117,35 @@ func (h *ContributeWSHub) heartbeatLoop(c *ContributorConnection) {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		// Stop as soon as this socket has been deregistered (kubestellar/hive#5090).
+		//
+		// The disconnect defer in HandleWS runs on the READ goroutine the moment
+		// ReadMessage errors: it deletes the connID from h.connections and closes
+		// the socket. This loop learns none of that — it has no done channel and no
+		// reference to the read side — so it slept out the remainder of its 30s tick
+		// and then wrote a ping to an already-closed connection. That write of
+		// course failed, and the failure branch logged
+		//
+		//     [contribute-ws] heartbeat ping failed, closing
+		//
+		// which reads as a diagnosis of why the connection died and is nothing of
+		// the sort: the connection was already dead and buried, by up to a full
+		// heartbeat interval. That line is what #5090 spent an investigation
+		// chasing. Because the tick is a fixed offset from REGISTRATION, it landed
+		// ~29-30s after every "new connection" regardless of what actually killed
+		// the socket, which is precisely why the flap looked like a clean 30s idle
+		// timer and sent the diagnosis toward per-direction proxy timeouts.
+		//
+		// Checking registration here makes the loop exit silently on a socket
+		// somebody else already tore down, so the "heartbeat ping failed" line is
+		// emitted ONLY when the heartbeat write is genuinely the first thing to
+		// notice the socket is bad. It also stops the goroutine leaking for up to
+		// one interval per disconnect, which on a flapping session is a goroutine
+		// per flap.
+		if !h.connectionRegistered(c) {
+			return
+		}
+
 		c.mu.Lock()
 		lastPong := c.lastPong
 		c.mu.Unlock()
@@ -3737,8 +4160,19 @@ func (h *ContributeWSHub) heartbeatLoop(c *ContributorConnection) {
 
 		if err := c.send(WSMessage{Type: "ping", Seq: h.nextSeq()}); err != nil {
 			h.logger.Info("[contribute-ws] heartbeat ping failed, closing", "username", c.profile.GitHubUsername)
-			_ = c.ws.Close()
+			closeWithReason(c.ws, websocket.CloseGoingAway, "heartbeat ping write failed")
 			return
+		}
+
+		// Also emit a PROTOCOL-level Ping control frame alongside the JSON one
+		// (kubestellar/hive#5090). See writeProtocolPing for why the JSON ping
+		// alone is not enough to hold the connection open through the ingress
+		// path. A failure here is not fatal on its own: the JSON ping above
+		// already succeeded, so the socket is live and the next tick's
+		// heartbeat-timeout check remains the authority on when to hang up.
+		if err := writeProtocolPing(c.ws); err != nil {
+			h.logger.Debug("[contribute-ws] protocol ping failed",
+				"username", c.profile.GitHubUsername, "error", err)
 		}
 	}
 }
@@ -3759,6 +4193,7 @@ func (h *ContributeWSHub) maybeRefreshToken(c *ContributorConnection) {
 	if err != nil {
 		h.logger.Warn("[contribute-ws] token refresh: mint failed, will retry next heartbeat",
 			"username", c.profile.GitHubUsername, "tier", tier, "error", err)
+		h.sendTokenRefreshFailed(c, "mint failed, will retry on the next heartbeat")
 		return
 	}
 	if tok == "" {
@@ -3807,6 +4242,90 @@ func (h *ContributeWSHub) taskHeldByAnotherConnection(candidate *ContributorConn
 	return false
 }
 
+// connectionRegistered reports whether this exact connection object is still in
+// the hub's live connection map (kubestellar/hive#5090).
+//
+// h.connections is keyed by a random per-socket connID that the heartbeat loop
+// never sees, so the lookup is by VALUE: scan for the pointer. The map is capped
+// at maxWSConnections (50), so this is a bounded scan once per 30s tick per
+// connection — negligible next to the network write it guards.
+//
+// Pointer identity is the right test rather than any field comparison: it is
+// exactly "is the object I was started for still the registered one", which is
+// false both when the socket was deregistered by its disconnect defer and when a
+// reconnect replaced it under a new connID. Both mean this loop has no further
+// work to do.
+//
+// Takes only h.mu.RLock and no connection-level lock, so it cannot participate in
+// any lock ordering — callers may hold c.mu or c.writeMu or neither.
+func (h *ContributeWSHub) connectionRegistered(c *ContributorConnection) bool {
+	if h == nil || c == nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, conn := range h.connections {
+		if conn == c {
+			return true
+		}
+	}
+	return false
+}
+
+// taskReadoptedByLiveConnection reports whether some OTHER live connection
+// belonging to the SAME contributor identity is currently holding the given task
+// (kubestellar/hive#5322).
+//
+// It exists because h.connections is keyed by a random per-socket connID, so the
+// hub cannot tell "the contributor's current socket" from "a socket the
+// contributor abandoned". When a tunnel is cut without a close frame the dead
+// socket's read loop stays parked until its next read errors, so its disconnect
+// defer can fire well AFTER the relay has redialed and re-adopted the task from
+// the server-issued lease. Releasing by issue at that point tears down work that
+// is demonstrably still in flight.
+//
+// The match is deliberately narrow — same identity AND same task id AND same
+// canonical repo/number — so it can only ever suppress the release of the exact
+// assignment that was reconciled. Anything else (a different task, a different
+// contributor, no live holder at all) is a genuine abandonment and releases
+// normally. It suppresses ONLY the release; it never adopts, assigns, extends a
+// lease, or relaxes any admission or ownership check.
+//
+// Concurrency: takes h.mu.RLock and each candidate's own mu, mirroring
+// taskHeldByAnotherConnection and the other read-only scans. `self` is skipped by
+// pointer identity, so the caller may hold neither, either, or both of self.mu
+// and self.writeMu without risking re-entrancy on this path.
+func (h *ContributeWSHub) taskReadoptedByLiveConnection(self *ContributorConnection, task *WSTaskAssign) bool {
+	if h == nil || task == nil || task.TaskID == "" {
+		return false
+	}
+	identity := identityOf(self)
+	if identity == "" {
+		return false
+	}
+	canonicalRepo := h.canonicalRepoKey(task.Repo)
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, conn := range h.connections {
+		if conn == nil || conn == self {
+			continue
+		}
+		if identityOf(conn) != identity {
+			continue
+		}
+		conn.mu.Lock()
+		held := conn.currentTask != nil &&
+			conn.currentTask.TaskID == task.TaskID &&
+			conn.currentTask.Number == task.Number &&
+			h.canonicalRepoKey(conn.currentTask.Repo) == canonicalRepo
+		conn.mu.Unlock()
+		if held {
+			return true
+		}
+	}
+	return false
+}
+
 // resumeTaskToken re-mints a scoped GitHub token for a task that has just been
 // re-asserted over a reconnect (task_progress rebuilt currentTask) and pushes it
 // to the relay, which re-arms the heartbeat refresh cycle: sendTokenRefresh
@@ -3833,6 +4352,7 @@ func (h *ContributeWSHub) resumeTaskToken(c *ContributorConnection, lease *taskL
 	if err != nil {
 		h.logger.Warn("[contribute-ws] resume token refresh: mint failed, refresh will re-arm on next resume/heartbeat",
 			"username", c.profile.GitHubUsername, "tier", tier, "error", err)
+		h.sendTokenRefreshFailed(c, "mint failed on task resume, refresh will re-arm on the next resume or heartbeat")
 		return
 	}
 	if tok == "" {
@@ -3866,6 +4386,47 @@ func tokenRefreshDue(c *ContributorConnection, now time.Time) (tier, repo string
 	}
 	repo = c.currentTask.Repo
 	return tier, repo, true
+}
+
+// sendTokenRefreshFailed tells the relay that a mid-task re-mint FAILED, so the
+// credential it is holding is the OLD one and will expire at the token_expires_at
+// it was last given (#5447).
+//
+// Before this, a failed mint was recorded only in the hub's log. The relay's first
+// evidence was a push that started failing roughly an hour into a long task, which
+// the agent saw as a generic auth error — the same misleading-symptom class as
+// #5343, where a credential problem was reported as "the branch doesn't exist on
+// the remote".
+//
+// It deliberately carries NO token material: only a type and a human-readable
+// reason. The reason is a fixed, caller-supplied string, never the mint error
+// itself, because that error can quote GitHub App responses and we do not want
+// hub-internal auth detail crossing to a contributor-controlled process.
+//
+// Advisory only, and it changes NOTHING about the refresh contract: the old token
+// stays installed, tokenMintedAt is untouched (so tokenRefreshDue keeps firing),
+// and the next heartbeat retries exactly as before. A send failure is swallowed —
+// this is a notification about a degraded credential, and failing the refresh path
+// because the notification could not be delivered would turn a warning into an
+// outage. The heartbeat's own ping remains the authority on whether the socket is
+// alive.
+//
+// Concurrency: goes through c.send, which takes writeMu, and takes no other lock.
+// Both callers (maybeRefreshToken, resumeTaskToken) hold neither c.mu nor c.writeMu
+// at the call site — tokenRefreshDue releases c.mu before returning — so there is
+// no re-entrancy here.
+func (h *ContributeWSHub) sendTokenRefreshFailed(c *ContributorConnection, reason string) {
+	if c == nil {
+		return
+	}
+	if err := c.send(WSMessage{
+		Type:   "token_refresh_failed",
+		Seq:    h.nextSeq(),
+		Reason: reason,
+	}); err != nil {
+		h.logger.Debug("[contribute-ws] token refresh: could not notify relay of mint failure",
+			"username", c.profile.GitHubUsername, "error", err)
+	}
 }
 
 // sendTokenRefresh writes a token_refresh message carrying the new token and its
@@ -4232,14 +4793,47 @@ const (
 // registered ContributorID is preferred; GitHubUsername is the fallback for
 // connections whose profile predates or lacks an ID. Two WebSocket connections
 // opened by the same registered contributor therefore share one identity.
+// sanitizeSessionLabel bounds and cleans a client-declared session label before
+// it becomes part of a map key, log field, and UI string. Multi-session-per-
+// account: the label distinguishes concurrent relays under one GitHub account.
+// Only [A-Za-z0-9._-] survive (so the ContributorID#session key stays a single
+// clean token and cannot smuggle path/format characters); the result is capped
+// at 32 bytes. An empty or all-stripped label returns "", which identityOf
+// treats as the historical single-session case.
+func sanitizeSessionLabel(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		}
+		if b.Len() >= 32 {
+			break
+		}
+	}
+	return b.String()
+}
+
 func identityOf(c *ContributorConnection) string {
 	if c == nil || c.profile == nil {
 		return ""
 	}
-	if c.profile.ContributorID != "" {
-		return c.profile.ContributorID
+	base := c.profile.ContributorID
+	if base == "" {
+		base = c.profile.GitHubUsername
 	}
-	return c.profile.GitHubUsername
+	// Session-scoped identity (multi-session-per-account): a distinct session
+	// label lets concurrent relays under one account hold independent task
+	// leases/cooldowns/ownership. Empty session preserves the historical bare
+	// ContributorID key, so existing single-session contributors are unchanged.
+	if base != "" && c.session != "" {
+		return base + "#" + c.session
+	}
+	return base
 }
 
 // rateWindowCounts returns how many task assignments the given identity has been
@@ -4428,7 +5022,28 @@ func buildTaskPromptBody(repoFull, issueRef, title, sourceHint string) string {
 			"remaining work is blocked on an unanswered maintainer decision, or merged "+
 			"PRs already cover everything actionable — do NOT open a PR; instead print "+
 			"a single line of the exact form 'HIVE_VERDICT: no_work_needed — <short reason>' "+
-			"and stop.",
+			"and stop. "+
+			// #5376: the completion sentinel. The interactive relay used to
+			// infer "this task is done" from the CLI's own terminal chrome —
+			// per-backend regexes over the last fifteen lines of the tmux pane.
+			// That produced thirteen separate issues (#1566, #4026, #4064,
+			// #4067, #4078, #4080, #4128, #4182, #4265, #5094, #5121, #5156,
+			// #5162) as one CLI after another restyled its output, because the
+			// input was a vendor's cosmetic rendering rather than a contract.
+			// This line IS the contract: the agent states it is finished. The
+			// relay's detectCompletionVerdict scrapes it; keep the marker
+			// spelling in sync with bin/contributor-relay.sh.
+			//
+			// Asked for LAST and on its own line for a reason: the relay reads
+			// a bounded tail of the pane, so a sentinel buried above a long
+			// summary can scroll out of view before the relay looks.
+			"When you HAVE finished the task — the PR is open, or you have "+
+			"otherwise done everything you intend to do — print, as the very "+
+			"last thing you output and on a line by itself, "+
+			"'HIVE_VERDICT: complete — <short reason>'. Print it exactly once, "+
+			"only when you are actually done, and never before starting work. "+
+			"If you printed the no_work_needed line above, that already counts "+
+			"as your completion — do not print both.",
 		repoFull, issueRef, title, sourceHint, repoFull, repoFull,
 	)
 }
@@ -5141,6 +5756,9 @@ func (h *ContributeWSHub) selectTask(c *ContributorConnection) *WSMessage {
 	// #2568: start the hub-owned lease clock. task_progress renews it; cleanupLoop
 	// auto-releases the task if it is not renewed within wsTaskTimeout.
 	c.lastLeaseRenew = time.Now()
+	// Duration anchor for the run log — lastLeaseRenew moves on every
+	// progress report, so it cannot serve as the start time.
+	c.taskAssignedAt = time.Now()
 	// Store the prompt (never the token) so FleetSnapshot can preview it (#2539),
 	// and clear any stale idle reason now that this connection has real work.
 	c.currentPrompt = prompt
@@ -5257,6 +5875,71 @@ func sendJSON(conn *websocket.Conn, msg WSMessage) error {
 // hold a goroutine open for a client that will never read it.
 const wsCloseFrameDeadline = time.Second
 
+// wsProtocolPingDeadline bounds the write of a keepalive Ping control frame.
+// It is deliberately far shorter than wsHeartbeatInterval so a wedged socket
+// cannot stack up heartbeat goroutines waiting on a peer that has stopped
+// reading.
+const wsProtocolPingDeadline = 10 * time.Second
+
+// wsWriteDeadline bounds every application JSON write to a live contributor
+// connection (kubestellar/hive#5090).
+//
+// gorilla/websocket applies no write deadline by default, so WriteJSON against a
+// peer that has stopped reading blocks until the OS gives up on the socket —
+// which, on a half-open TCP connection with no RST, can be many minutes of
+// retransmission backoff. Because send() holds writeMu across the write, that
+// stall is not confined to the writing goroutine: it blocks every other writer
+// on the same connection.
+//
+// It is deliberately shorter than wsHeartbeatInterval so a write cannot still be
+// parked when the next heartbeat tick arrives (which would stack ticker
+// goroutines on writeMu), and comfortably longer than wsProtocolPingDeadline so
+// an ordinary slow client is never mistaken for a wedged one.
+const wsWriteDeadline = 15 * time.Second
+
+// writeProtocolPing sends a WebSocket PROTOCOL-level Ping control frame (opcode
+// 0x9) on the connection.
+//
+// THE DEFECT (kubestellar/hive#5090): the contributor keepalive was implemented
+// ENTIRELY as application JSON — the hub sends {"type":"ping"} as a text frame
+// and the relay answers {"type":"pong"}, and neither side ever emitted a
+// control frame. websocket.PingMessage appeared nowhere in this package, and
+// the relay never called ws.ping().
+//
+// That distinction is invisible to the two endpoints and decisive to everything
+// between them. An L7 proxy that understands WebSocket — and the hosted spokes
+// sit behind both ingress-nginx and an OCI load balancer — may account only for
+// control-frame traffic when deciding whether a tunnel is idle, precisely
+// because application payload can be a long-running unidirectional stream that
+// says nothing about liveness. Under such a proxy a connection carrying a text
+// frame every 30 seconds is still "idle", and gets reaped on the idle timer
+// with no Close frame: the peer sees 1006 with an empty reason and no
+// application-layer log on either side, which is exactly the signature #5090
+// measured — the hub proven to send Close frames on its own hangups, yet every
+// observed flap frameless.
+//
+// Sending a real Ping costs one 2-byte control frame per 30s tick and makes the
+// connection unambiguously live to any conforming intermediary. It is additive:
+// the JSON ping/pong stays exactly as it was, so old relays that answer only
+// the JSON heartbeat are unaffected, and gorilla/websocket answers an inbound
+// Ping with a Pong automatically via its default ping handler, so a relay needs
+// no change to make the reverse direction work either.
+//
+// WriteControl is documented as safe to call concurrently with all other
+// methods, so — like closeWithReason — this deliberately does NOT take writeMu.
+// Taking it here would nest a second lock under callers that already hold it
+// and buy nothing.
+func writeProtocolPing(conn *websocket.Conn) error {
+	if conn == nil {
+		return nil
+	}
+	return conn.WriteControl(
+		websocket.PingMessage,
+		nil,
+		time.Now().Add(wsProtocolPingDeadline),
+	)
+}
+
 // closeWithReason closes a contributor socket after telling the client WHY.
 //
 // THE DEFECT (kubestellar/hive#5090): every close on this path was a bare
@@ -5289,4 +5972,102 @@ func closeWithReason(conn *websocket.Conn, code int, reason string) {
 		time.Now().Add(wsCloseFrameDeadline),
 	)
 	_ = conn.Close()
+}
+
+// wsDrainReason is the close reason every contributor socket receives when the
+// hub process is shutting down. It is a fixed string rather than a formatted
+// one so a relay may match on it verbatim.
+const wsDrainReason = "hub restarting for upgrade"
+
+// wsDrainBudget bounds the ENTIRE shutdown drain, not one socket.
+//
+// closeWithReason writes a Close frame with a wsCloseFrameDeadline (1s) write
+// deadline, so a peer that has stopped reading can stall a single close for up
+// to a second. Against the maxWSConnections cap of 50 a serial drain is a 50s
+// worst case — longer than terminationGracePeriodSeconds (30s), which would
+// mean the drain itself delays the exit past the point where SIGKILL lands and
+// the archive hook that follows it never runs. The budget makes that
+// impossible: whatever has not been closed when it expires is abandoned, and
+// the sockets left behind are exactly as dead as they are today.
+const wsDrainBudget = 2 * time.Second
+
+// DrainForShutdown tells every registered contributor WHY the socket is about
+// to die (kubestellar/hive#5390).
+//
+// THE DEFECT: the hub process is killed on every upgrade roll — measured at 11
+// ReplicaSets in 5.5 hours on one hosted spoke, one per merge to v4 — and it
+// has no shutdown handling for contributor WebSockets at all. The sockets die
+// with the process at SIGKILL, so the peer observes a bare 1006 with no reason,
+// byte-for-byte identical to a yanked cable. #5107 made DELIBERATE closes
+// legible; process death was not one of them, which is why the hub provably
+// sends Close frames and yet every flap observed in #5090 was frameless.
+//
+// CloseServiceRestart (1012) is defined as "the server is restarting" and
+// carries the client expectation of reconnecting, which is exactly true here:
+// the deployment is maxSurge=1/maxUnavailable=0, so the replacement pod has
+// already passed its readiness probe by the time the old one gets SIGTERM.
+//
+// This does NOT stop the flap — the pod still rolls, the socket still dies.
+// What changes is that the relay learns immediately and reconnects into an
+// already-serving hub, instead of discovering the corpse by read error or
+// missed pong seconds later.
+//
+// Locking follows cleanupLoop exactly: snapshot the sockets under h.mu, then
+// close OUTSIDE it. Closing under the lock would hold the hub-wide mutex for up
+// to wsCloseFrameDeadline per wedged peer, serially. Connections are NOT
+// deleted from the map — the process is about to exit, and leaving the
+// bookkeeping untouched keeps this off the lease/cooldown accounting held under
+// #5151.
+//
+// Returns the number of sockets a Close frame was attempted on, for the
+// shutdown log line.
+func (h *ContributeWSHub) DrainForShutdown() int {
+	if h == nil {
+		return 0
+	}
+
+	var conns []*websocket.Conn
+	h.mu.RLock()
+	for _, c := range h.connections {
+		// Nil-guard mirrors cleanupLoop: a registered connection may carry no live
+		// socket (test-injected in-flight entry, or one torn down elsewhere).
+		if c != nil && c.ws != nil {
+			conns = append(conns, c.ws)
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(conns) == 0 {
+		return 0
+	}
+
+	// Fire-and-forget. A WebSocket Close is not a handshake we need to complete
+	// server-side, and waiting for acknowledgements would put a peer's silence on
+	// the shutdown path's critical section.
+	deadline := time.Now().Add(wsDrainBudget)
+	drained := 0
+	for _, ws := range conns {
+		if !time.Now().Before(deadline) {
+			break
+		}
+		closeWithReason(ws, websocket.CloseServiceRestart, wsDrainReason)
+		drained++
+	}
+
+	if h.logger != nil {
+		h.logger.Info("[contribute-ws] drained contributor sockets for shutdown",
+			"drained", drained, "registered", len(conns))
+	}
+	return drained
+}
+
+// DrainContributorsForShutdown is the Server-level entry point for the
+// pre-shutdown drain. It exists so cmd/hive can reach the contributor hub
+// without the hub itself being exported plumbing, and is a no-op on a Server
+// whose contribute routes were never registered.
+func (s *Server) DrainContributorsForShutdown() int {
+	if s == nil || s.contributeHub == nil {
+		return 0
+	}
+	return s.contributeHub.DrainForShutdown()
 }

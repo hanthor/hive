@@ -19,7 +19,7 @@ type Binding struct {
 	Scope string
 	// Available reports whether pressing Keys does something TODAY.
 	//
-	// The design doc's §4 table is a ROADMAP: most of its rows belong to tasks
+	// The design doc's §4 table is a ROADMAP: some of its rows belong to tasks
 	// that have not landed. app.go's footerText already refuses to advertise
 	// those ("showing them now would advertise actions that silently do
 	// nothing"), and the same rule matters more here, because help is exactly
@@ -43,12 +43,12 @@ func HelpBindings() []Binding {
 		{Keys: "tab / shift+tab", Action: "Cycle pane focus forward / backward", Scope: "global", Available: true},
 		{Keys: "?", Action: "Toggle this help overlay", Scope: "global", Available: true},
 		{Keys: "q / ctrl+c", Action: "Quit", Scope: "global", Available: true},
-		{Keys: "j / k, ↓ / ↑", Action: "Move the selection within the focused pane", Scope: "focused pane"},
+		{Keys: "j / k, ↓ / ↑", Action: "Move the selection within the focused pane", Scope: "Agents / Events panes", Available: true},
 		{Keys: "p", Action: "Pause or resume the selected agent", Scope: "Agents pane", Available: true},
-		{Keys: "m", Action: "Open the model picker for the selected agent", Scope: "Agents pane"},
-		{Keys: "K", Action: "Kick the selected agent now", Scope: "Agents pane"},
-		{Keys: "A", Action: "Open the ACMM level overlay", Scope: "global"},
-		{Keys: "a", Action: "Attach to the selected agent's tmux session", Scope: "Agents pane (local)"},
+		{Keys: "m", Action: "Open the model picker for the selected agent", Scope: "Agents pane", Available: true},
+		{Keys: "K", Action: "Kick the selected agent now", Scope: "Agents pane", Available: true},
+		{Keys: "A", Action: "Open the ACMM level overlay", Scope: "global", Available: true},
+		{Keys: "a", Action: "Attach to the selected agent's tmux session", Scope: "Agents pane (local)", Available: true},
 	}
 }
 
@@ -113,11 +113,17 @@ func Help() string {
 			body.WriteString(row(b) + "\n")
 		}
 	}
-	body.WriteString("\n")
-	body.WriteString(helpSectionStyle.Render(helpUnavailableHeading))
-	body.WriteString("\n")
-	for _, b := range bindings {
-		if !b.Available {
+	// The roadmap section is drawn only when it has rows. T19 wired `A`, the
+	// last unavailable binding in the design doc's §4 table, so today it has
+	// none — and a heading reading "Not wired up yet" above nothing at all
+	// would say the opposite of the truth it was written to tell. The section
+	// is kept rather than deleted because the table is a transcription of a
+	// design doc that can gain rows again.
+	if unavailable := unavailableBindings(bindings); len(unavailable) > 0 {
+		body.WriteString("\n")
+		body.WriteString(helpSectionStyle.Render(helpUnavailableHeading))
+		body.WriteString("\n")
+		for _, b := range unavailable {
 			body.WriteString(row(b) + "\n")
 		}
 	}
@@ -125,4 +131,15 @@ func Help() string {
 	body.WriteString(helpFootStyle.Render(helpDismiss))
 
 	return helpBoxStyle.Render(body.String())
+}
+
+// unavailableBindings returns the rows whose keys are not wired yet.
+func unavailableBindings(bindings []Binding) []Binding {
+	var out []Binding
+	for _, b := range bindings {
+		if !b.Available {
+			out = append(out, b)
+		}
+	}
+	return out
 }

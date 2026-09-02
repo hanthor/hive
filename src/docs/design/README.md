@@ -68,6 +68,17 @@ that status is the thing to check before treating a page as current behaviour:
   decision. Read it before steps 3-4, particularly for the unresolved fork:
   backend-specific resume envelopes versus an API-shaped backend hive owns.
 
+- [Evaluating a handoff path for the re-entrant turn model](agent-turn-handoff.md)
+  — **spike / investigation, no decision taken.** Step 3 of the same RFC. Its
+  finding is that hive has already built handoff's two hard mechanisms twice and
+  wired neither: `pkg/convergence/mutation` (#4255) holds an epoch-fenced claim
+  ledger and an idempotent operation journal, `pkg/turn` holds a second journal,
+  and nothing imports either. No single store has all three properties handoff
+  needs — atomic claim, cross-process serialization, corruption-resistant
+  persist — and the three partial implementations each hold a different two.
+  Recommends **no queue, and not yet**, with ordered prerequisites, and narrows
+  the beads-checkpointing challenge to the one variable still undecided.
+
 - [Copilot per-repo cost capture at the MITM proxy](copilot-cost-capture.md) —
   **investigation, no decision taken.** Phase 4 of epic #4836, which asked
   whether Copilot token usage can be captured per request with repo context and
@@ -82,15 +93,17 @@ that status is the thing to check before treating a page as current behaviour:
   with its timestamp would move Copilot from "structurally impossible" to
   phase 3's existing join, in `pkg/tokens` only and off the request path.
 
-- [`hive tui` — a terminal dashboard for Hive](tui.md) — **design only.** The
-  accepted plan for the k9s-style terminal client tracked in #4907: scope,
-  the fixed architecture decisions, the default 2x2 pane layout, the keybinding
-  table, and the golden-file testing convention. Read it before picking up any
-  #4907 sub-issue, for two corrections it carries that the sub-issue bodies do
-  not: their `v2/...` paths are pre-#3996 spellings and map to `src/pkg/tui/...`,
-  and `dashboard/openapi.json` — which the epic names as the contract for every
-  client task — publishes 32 of the dashboard's 298 routes and **no write
-  operations at all**, so the four action tasks have no spec to build against.
+- [`hive tui` — a terminal dashboard for Hive](tui.md) — **shipped (v1).** The
+  design record for the k9s-style terminal client tracked in #4907: scope, the
+  fixed architecture decisions, the default 2x2 pane layout, the keybinding
+  table, and the golden-file testing convention. Every v1 sub-issue has landed;
+  [`src/docs/hivectl.md`](../hivectl.md#tui--live-terminal-dashboard) is the
+  operator reference for what actually shipped and the one to read first — this
+  page is read afterward, for the reasoning and the two corrections it carries
+  against the sub-issue bodies: their `v2/...` paths are pre-#3996 spellings
+  that map to `src/pkg/tui/...`, and `dashboard/openapi.json` — which the epic
+  names as the contract for every client task — originally published 32 of the
+  dashboard's 298 routes and no write operations at all, closed by #5023.
 - [Agent host confinement on the default (unconfined) launch path](agent-host-confinement.md)
   — **investigation, no decision taken.** #4918: an agent doing correct,
   benign work on an assigned third-party repo ran that repo's own test suite,

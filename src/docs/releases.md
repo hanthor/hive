@@ -9,11 +9,26 @@ no human ever pushes a tag or clicks "Draft a release" in the normal path.
 
 ## What triggers a release
 
-`.github/workflows/release.yml` runs after every successful
+`.github/workflows/tagged-release.yml` runs after every successful
 `Build and Push Docker Image` (`docker.yml`) run on `v4` — a `workflow_run`
 trigger, not a tag push, because there is no tag until this workflow decides
 to create one. It never runs for `v2`, `mk`, `dd`, or a manual
 `workflow_dispatch` build.
+
+It also runs **hourly on a schedule**, as a backstop (#5318). The
+`workflow_run` trigger alone can silently lose a release opportunity: a
+`docker.yml` run that is *cancelled* never fires `workflow_run` at all, and a
+run that fires but finds `v4` already advanced stands down in favour of a
+successor that may itself stand down. Standing down is correct — the run's
+images were built from the older tree, so tagging would name content those
+images do not contain — but nothing used to come back for the abandoned work.
+The scheduled pass evaluates `v4`'s **current** tip, whose images have long
+since been published, so it retags an existing digest exactly as the normal
+path does. It refuses to act unless `docker.yml` has a *successful, completed*
+push run for that tip, so a cancelled or in-flight build never produces a tag
+with no digest behind it, and it is a no-op whenever `## Unreleased` is empty
+— which on a healthy repository is almost always. Deferrals are logged as
+warnings so a skipped opportunity is visible rather than silent.
 
 `src/scripts/derive-release-version.sh` then decides two things by reading
 [`CHANGELOG.md`](../../CHANGELOG.md)'s `## Unreleased` section — nothing else,
@@ -93,9 +108,9 @@ errors loudly) rather than a silent pick — remove all but one.
 |---|---|---|
 | `v4-latest`, `stable`, `candidate`, `edge` | `docker.yml`, every merge to `v4` | Yes — moving pointers |
 | `<7-hex-sha>` | `docker.yml`, every successful build | No — immutable, but not a *release* |
-| `v1.2.3` | `release.yml`, only when a release is cut | No — immutable, and **is** the release |
+| `v1.2.3` | `tagged-release.yml`, only when a release is cut | No — immutable, and **is** the release |
 
-`release.yml` never writes `stable`/`candidate`/`edge`. Channel promotion is a
+`tagged-release.yml` never writes `stable`/`candidate`/`edge`. Channel promotion is a
 separate, deliberate policy described in
 [release-channels.md](release-channels.md); cutting a version tag never
 silently couples to it, on purpose — the operator explicitly asked for these
@@ -103,10 +118,10 @@ to stay decoupled.
 
 ## How a release is actually built
 
-`release.yml` does **not** rebuild the image. `docker.yml`'s own freshness
+`tagged-release.yml` does **not** rebuild the image. `docker.yml`'s own freshness
 guard already proved, for this exact commit, that the pushed digest's
 embedded commit hash matches — rebuilding would only reintroduce the risk
-that guard exists to eliminate. Instead, `release.yml` retags the
+that guard exists to eliminate. Instead, `tagged-release.yml` retags the
 already-published `<7-hex-sha>` digest as the immutable version tag with
 `docker buildx imagetools create`, the same primitive
 `src/scripts/publish-image-tags.sh` already uses for the moving tags. The
@@ -128,36 +143,43 @@ Concretely, per release:
    (see "Software bill of materials (SBOM)" below) — this happens before the
    changelog commit, using the version tag written in step 3.
 5. That change is committed (`git commit -s`, signed off by the release bot).
-5a. Before it can reach `v4`, the commit has to earn the `gate` status check
-   that branch protection requires (see "Satisfying branch protection"
-   below) — the commit is pushed to a throwaway `release-gate/v<version>`
-   branch first, the workflow waits for `gate` to succeed on that exact SHA,
-   then deletes the scratch branch.
-6. The workflow pushes the same commit to `v4` (protection now finds a
-   successful `gate` check already on it and allows the fast-forward), then
-   creates and pushes the `v<version>` git tag on that commit.
+5a. Before it can reach `v4`, the commit has to earn the `gate` check that
+   branch protection requires (see "Satisfying branch protection" below).
+   The commit is pushed to a throwaway `release-gate/v<version>` branch,
+   `docker.yml` is dispatched, and the workflow waits for `gate` to succeed
+   on that exact SHA. It then mirrors the verified result as a SHA-scoped
+   `gate: success` commit status so a release PR can see it.
+6. The workflow opens a PR from the scratch branch into `v4` and merges it
+   through the SHA-keyed merge API, leaving branch protection fully enforced.
+   It deletes the scratch branch, then creates and pushes the `v<version>` tag
+   on the commit that landed on `v4`.
 7. A GitHub Release is created from the tag, with GitHub's auto-generated
    notes plus an SBOM callout, and the three SBOM files from step 4a attached
    as release assets.
 
 ## Satisfying branch protection
 
-`v4`'s only required status check is `gate` (`docker.yml`). `gate` only ever
-attaches to a commit through `docker.yml`'s own `push` / `pull_request`
-triggers — nothing manufactures it out of band — so the release commit this
-workflow creates in-job has no `gate` check on it the moment it exists, and a
-direct push straight to `v4` is rejected (`GH006: Required status check
-"gate" is expected`, [#5026](https://github.com/kubestellar/hive/issues/5026)).
-This is not intermittent: every retry recreates the same ungated commit and
-fails identically, so the workflow cannot simply retry its way past it.
+`v4`'s only required context is `gate` (`docker.yml`). The release commit is
+created inside `tagged-release.yml`, so it has no check when it first exists;
+a direct push to `v4` is rejected (`GH006: Required status check "gate" is
+expected`, [#5026](https://github.com/kubestellar/hive/issues/5026)). Retrying
+does not create the missing evidence, so every attempt fails identically.
 
-GitHub evaluates a required status check against the commit **SHA**, not the
-ref the check happened to run on, and it accepts a check that already
-succeeded on that SHA before the push — pushing to a side branch first, then
-to the protected branch, is GitHub's own documented pattern for this. The
-release commit is pushed to a scratch branch (`release-gate/v<version>`)
-first, `gate` runs and succeeds on that exact SHA, and the workflow then
-pushes the *same* commit to `v4` — which protection now accepts.
+The workflow first pushes the commit to `release-gate/v<version>`, dispatches
+`docker.yml`, and waits for its `gate` check-run on the exact release SHA.
+That verifies the same code path as an ordinary PR gate, but a
+`workflow_dispatch` check-run has no pull-request association: its
+`pull_requests` list remains empty even if it is dispatched after the release
+PR exists. Consequently GitHub's protected-PR rollup omits it and the merge
+API still reports `gate` as expected ([#5356](https://github.com/kubestellar/hive/issues/5356)).
+
+After the check-run succeeds, the workflow posts a `gate: success` commit
+status on the same SHA using its `GITHUB_TOKEN` and `statuses: write`
+permission. A commit status is SHA-scoped rather than check-suite/PR-scoped,
+so it appears in the release PR's required-context rollup. This is a mirror,
+not a second source of truth: a missing or red docker gate prevents the status
+from being posted, a failed status POST prevents the PR from opening, and the
+SHA-keyed merge API still asks GitHub to enforce `v4` protection server-side.
 
 **Getting `docker.yml` to actually run on the scratch branch (#5072):**
 `docker.yml`'s `push` trigger is `branches: ["**"]` (minus bot branches — see
@@ -184,14 +206,15 @@ branch name is deliberately not in `docker.yml`'s `LONG_LIVED` set (`v2 v4 mk
 dd`) and the exception forces `push=false` for it unconditionally, so this
 detour never pushes a GHCR image or moves a channel tag; `gate` runs
 regardless of push policy, which is all this needs. The scratch branch is
-deleted immediately after (`trap ... EXIT`), whether the wait succeeds or
-fails, so a failed release run never leaves a stray branch behind.
+deleted by the merge step's `trap ... EXIT` once that step starts, whether the
+PR merges or fails. A failure during the preceding gate-earning step leaves the
+branch in place for diagnosis.
 
-This preserves the branch protection exactly as configured — no bypass, no
-weakened check, no `enforce_admins` change, no force push. The workflow earns
-the same check a human contributor's PR would, just via a scratch branch
-instead of a PR, because the release commit has no PR of its own to attach a
-check to.
+This preserves branch protection exactly as configured — no bypass, no
+weakened check, no `enforce_admins` change, and no force push. The workflow
+earns the real docker gate on the scratch branch, mirrors that exact-SHA
+verdict into the representation the release PR can consume, and lets the
+protected merge endpoint make the final decision.
 
 ## Software bill of materials (SBOM)
 
@@ -239,7 +262,7 @@ must stay a plain manifest.
 
 The release SBOM generated here never touches that constraint. It runs
 **after** `docker.yml` has already published the plain-manifest image
-(`release.yml` retags, never rebuilds — see above), scans the published
+(`tagged-release.yml` retags, never rebuilds — see above), scans the published
 digest from the outside with an independent tool, and writes an ordinary JSON
 file that is uploaded to the GitHub Release. Nothing about generating it adds
 an attestation to the GHCR image, changes its media type, or touches the
@@ -306,7 +329,7 @@ cover:
 not carry), and the SBOM gives full package inventory (OS + language runtime
 layers) that `NOTICE` does not attempt.
 
-**Shipped in releases.** `release.yml` copies the repo-root `NOTICE` (already
+**Shipped in releases.** `tagged-release.yml` copies the repo-root `NOTICE` (already
 kept fresh by `notice-drift` at every commit that changes dependencies) to
 `hive-v<version>-NOTICE` and attaches it to the GitHub Release alongside the
 three SBOM files, using the same `gh release create` asset-upload call.
@@ -315,7 +338,7 @@ three SBOM files, using the same `gh release create` asset-upload call.
 
 - **Step 5 emptying `Unreleased`** is what makes this safe to chain off
   `docker.yml`: pushing the release commit to `v4` triggers `docker.yml`
-  again, which triggers `release.yml` again — and on that second pass
+  again, which triggers `tagged-release.yml` again — and on that second pass
   `Unreleased` is empty, so `derive-release-version.sh` returns
   `release=false` and the workflow is a no-op. It never chases its own tail.
 - `concurrency: { group: tagged-release-v4, cancel-in-progress: false }`
@@ -338,7 +361,7 @@ build time via `-ldflags -X main.version=...`, exactly like the existing
 (every ordinary branch build, including plain `docker.yml` runs) the Go
 linker default `0.0.0-dev` ships instead — never an empty string.
 
-`release.yml` does not need to pass `VERSION` to a rebuild, because it never
+`tagged-release.yml` does not need to pass `VERSION` to a rebuild, because it never
 rebuilds (see above) — the retagged image was already built by `docker.yml`
 carrying whatever `version` that ordinary build embedded. This is deliberate:
 today, a tagged-release image and its `<sha>`/`v4-latest` sibling report the
@@ -353,7 +376,7 @@ concrete gap remains before the first automated `v0.x.y` should be trusted
 end-to-end:
 
 - **The running binary's `--version` output does not yet say `v1.2.3` for a
-  release build.** Because `release.yml` retags rather than rebuilds (by
+  release build.** Because `tagged-release.yml` retags rather than rebuilds (by
   design — see "How a release is actually built"), the image GHCR now calls
   `ghcr.io/kubestellar/hive:v1.2.3` still reports whatever `main.version`
   the original `docker.yml` build embedded, which today is always the

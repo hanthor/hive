@@ -28,9 +28,11 @@ import (
 )
 
 // skillsConventionalDir is the conventional on-disk location the dashboard
-// probes for a skills registry. The skills registry (pkg/skillreg) is not yet
-// wired into the runtime, so this is a best-effort, optional load: an absent
-// directory reports "not configured" rather than an error.
+// probes for a skills registry. It is the same directory the scheduler loads at
+// kick time (scheduler.skillsRegistryDir), so the count reported here and the
+// skills actually injected into an agent's context come from one place. The
+// load stays best-effort and optional: an absent directory reports "not
+// configured" rather than an error.
 //
 // It is a var, not a const, purely so tests can point it at a temp dir.
 var skillsConventionalDir = dataVolumePath + "/skills"
@@ -111,6 +113,16 @@ var (
 
 	cachedHealth   map[string]any
 	cachedHealthMu sync.RWMutex
+
+	// cachedGreenStreak carries the real green-CI streak (#5226) computed on
+	// the status-build path, where a GitHub client and context already exist.
+	// The ACMM advisor endpoint reads this cache rather than calling GitHub
+	// itself, so an advisory HTTP request never triggers an Actions API call.
+	// cachedGreenStreakOK stays false until a collect has actually succeeded,
+	// which is what keeps "not measured yet" distinct from a measured zero.
+	cachedGreenStreak   int
+	cachedGreenStreakOK bool
+	cachedGreenStreakMu sync.RWMutex
 
 	proxyViolationsMu sync.RWMutex
 	proxyViolationsFn func() map[string]int
@@ -543,6 +555,7 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 		}
 		cadence := cadenceDisplay(cadenceValue)
 		nextKick := computeNextKickFromCadence(proc.LastKick, cadenceValue)
+		nextKickIn := computeNextKickETA(proc.LastKick, cadenceValue)
 
 		// offByCadence: the agent's cadence for the CURRENT governor mode is a
 		// non-kicking value ("pause"/"off"), so the governor will never kick it
@@ -562,6 +575,23 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 		modeCadence := cfg.CadenceValueForMode(name, currentMode)
 		offByCadence := modeCadence != "" && modeCadence.IsPaused() &&
 			!proc.Config.OnDemand && !onDemandSet[name]
+
+		// noCadence: NO governor mode names this agent in its cadence map and it
+		// has never been kicked, so nothing will ever schedule it — the silent
+		// idle class named by governor.NoCadenceAgents (#5577). offByCadence is
+		// the OPPOSITE situation (an explicit pause/off entry, i.e. an operator
+		// choice), which is why the two are separate flags and both can be false.
+		//
+		// Predicate deliberately identical to the governor's, down to the
+		// never-kicked clause, so the fleet banner and the agent card cannot
+		// name different agents (#5594). The cadence lookup itself is the shared
+		// config.HasAnyCadenceIn the governor calls.
+		agentEnabled := !agentDisabledInConfig(cfg, name, proc)
+		noCadence := agentEnabled &&
+			!proc.Config.OnDemand && !onDemandSet[name] &&
+			proc.Config.UsesGovernorKick() &&
+			!cfg.HasAnyCadence(name) &&
+			proc.LastKick == nil
 
 		pinnedCli := proc.PinnedCLI != "" || proc.Config.CLIPinned
 		pinnedModel := proc.PinnedModel != ""
@@ -603,7 +633,7 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 			Color:         agentCfg.Color,
 			BeadRole:      agentCfg.GetBeadRole(),
 			Managed:       agentCfg.Managed,
-			Enabled:       !agentDisabledInConfig(cfg, name, proc),
+			Enabled:       agentEnabled,
 			ReplicaBase:   agentCfg.ReplicaOf,
 			ReplicaIndex:  agentCfg.ReplicaIndex,
 			ReplicaCount:  agentCfg.ReplicaCount,
@@ -618,6 +648,7 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 			PausedTrigger: proc.PausedTrigger,
 			PausedBy:      proc.PausedBy,
 			OffByCadence:  offByCadence,
+			NoCadence:     noCadence,
 			CLI:           cli,
 			Model:         model,
 			Cadence:       cadence,
@@ -627,6 +658,7 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 			Pinned:        pinnedCli || pinnedModel,
 			LastKick:      lastKick,
 			NextKick:      nextKick,
+			NextKickIn:    nextKickIn,
 			Restarts:      proc.RestartCount,
 			GovBackend:    cli,
 			GovModel:      model,
@@ -1380,7 +1412,29 @@ func buildHealth(ghClient *github.Client, ctx context.Context) map[string]any {
 	cachedHealth = health
 	cachedHealthMu.Unlock()
 
+	// Refresh the green-CI streak on the same pass that already talks to
+	// GitHub for workflow health (#5226). A failed or unmeasurable read leaves
+	// the previous cached value untouched rather than clobbering a real streak
+	// with an unknown — a transient API error must not make the advisor
+	// suddenly withdraw a recommendation it had legitimately earned.
+	if streak, measured := ghClient.GreenCIStreak(ctx); measured {
+		cachedGreenStreakMu.Lock()
+		cachedGreenStreak = streak
+		cachedGreenStreakOK = true
+		cachedGreenStreakMu.Unlock()
+	}
+
 	return copyHealthMap(health)
+}
+
+// greenCIStreakSnapshot returns the last successfully measured green-CI streak
+// and whether one has ever been measured. measured=false means "unknown", and
+// the ACMM advisor leaves its GreenStreak signal at the conservative zero
+// rather than treating the absence of data as a measured zero.
+func greenCIStreakSnapshot() (streak int, measured bool) {
+	cachedGreenStreakMu.RLock()
+	defer cachedGreenStreakMu.RUnlock()
+	return cachedGreenStreak, cachedGreenStreakOK
 }
 
 func buildBudget(gov *governor.Governor, tokenCollector *tokens.Collector) FrontendBudget {

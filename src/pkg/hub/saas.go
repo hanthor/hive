@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"testing"
 	"time"
 
 	"github.com/kubestellar/hive/pkg/config"
@@ -705,23 +704,6 @@ func (s *HubServer) registerSaaSRoutes() {
 	s.mux.HandleFunc("POST /api/saas/admin/slack/broadcast", s.requireAdmin(s.handleSlackBroadcast))
 	s.mux.HandleFunc("POST /api/saas/admin/journey-snooze", s.requireAdmin(s.handleJourneySnooze))
 	s.mux.HandleFunc("GET /api/saas/admin/journey-status", s.requireAdmin(s.handleJourneyStatus))
-
-	// Under `go test` these long-lived pollers leak across test cases: they
-	// immediately hit the GitHub API and read the package-level saas path
-	// variables that the filesystem test helper swaps per-test, which the
-	// race detector rightly flags. Production behavior is unchanged; tests
-	// that need poller logic call the functions directly.
-	if !testing.Testing() {
-		go s.startProvisionWatcher(context.Background())
-		go s.StartLatestSHAPoller(context.Background())
-		// Periodically probe every spoke's unauthenticated /api/status and alert
-		// on any that answer 200 (wide open) — catches auth drift automatically.
-		go s.StartAuthAudit(context.Background())
-		// Advisory-suppression profile (#4167): one structured log line every
-		// cycle saying how many hives are stale and how many are stale but
-		// UNREPORTED. Read-only measurement — no alert, no registry write.
-		go s.StartAdvisoryDiagnostics(context.Background())
-	}
 }
 
 // impersonateExitPath is the one mutating endpoint that stays callable while
@@ -2202,6 +2184,14 @@ type PerClusterHealth struct {
 	DataSource string               `json:"data_source,omitempty"` // "heartbeat" when data comes from spoke heartbeat instead of kubectl
 	DataStale  bool                 `json:"data_stale,omitempty"`  // true when heartbeat data is older than heartbeatHealthStaleness
 	DataAge    string               `json:"data_age,omitempty"`    // human-readable age or collection timestamp
+	// StuckPods reports hive-namespace pods stuck Terminating — the residue of
+	// nodes disappearing without draining (#5328 item 3). Nil means the hub
+	// could not determine it (unreachable cluster, pull-only pool, failed
+	// listing); a non-nil report with Total 0 means it looked and the cluster
+	// is clean. Those must not render alike: 27 orphans accumulated for three
+	// weeks precisely because nothing distinguished "none" from "nobody
+	// checked". See orphaned_pod_visibility.go.
+	StuckPods *StuckPodReport `json:"stuck_pods,omitempty"`
 }
 
 type ClusterHealthResponse struct {
@@ -2745,6 +2735,28 @@ func buildSingleClusterHealth(cluster *ClusterConfig, hiveCount int, logger *slo
 		}
 	}
 
+	// Orphaned Terminating-pod count (#5328 item 3). READ-ONLY: one extra
+	// `kubectl get pods` on a path that already lists pods. It needs its own
+	// listing because the query above is field-selected to phase=Running and
+	// therefore cannot see an orphan by construction.
+	//
+	// Best-effort: nil on failure, so a cluster the hub could not interrogate
+	// reports UNKNOWN rather than a reassuring zero.
+	if stuck := collectStuckPods(ctx, cluster, timeout, time.Now()); stuck != nil {
+		result.StuckPods = stuck
+		// Log when the fleet is actually accumulating orphans. The reaper
+		// clears them, so a persistently non-zero count here means orphans are
+		// being PRODUCED faster than they age past orphanedPodMinAge — which is
+		// the upstream node-lifecycle fault (#5328 item 1), not a reaper
+		// problem. Silence on zero keeps a healthy fleet quiet.
+		if stuck.Total > 0 && logger != nil {
+			logger.Warn("cluster has hive pods stuck terminating — check for ungraceful node loss",
+				"cluster", cluster.ID,
+				"stuck_pods", stuck.Total,
+				"namespaces_affected", stuck.NamespacesAffected)
+		}
+	}
+
 	return result, nil
 }
 
@@ -3100,6 +3112,32 @@ type MyHiveEntry struct {
 	// must never show the pill.
 	AdvisoryStale       bool   `json:"advisoryStale,omitempty"`
 	AdvisoryStaleReason string `json:"advisoryStaleReason,omitempty"`
+
+	// AutoUpgradeBlocked is true when this hive has auto-upgrade ON but the hub
+	// will REFUSE to arm it: upgradeCollectible() is false, so the spoke cannot
+	// pull the instruction off its own heartbeat and triggerAutoUpgrades()
+	// declines every cycle. AutoUpgradeBlockedReason is the operator-facing
+	// cause from uncollectibleUpgradeReason() — the SAME string
+	// noteUncollectibleUpgrade() writes to the timeline, and documented there as
+	// free of credentials and kubeconfig paths, so it is safe as a tooltip.
+	//
+	// WHY THIS IS COMPUTED ON READ RATHER THAN RE-DERIVED IN JAVASCRIPT. The
+	// fleet row used to render "Queued for auto-upgrade · 1pm ET" from
+	// autoUpgradeMode alone, which consults nothing about eligibility. A hive
+	// the hub had permanently refused therefore advertised a queued upgrade
+	// while the timeline recorded the refusal — two surfaces, opposite stories,
+	// and no way to tell "waiting for the window" from "will never fire". The
+	// browser must not re-implement the predicate or its staleRemoveAge bound;
+	// sending the evaluated decision is what keeps badge and hub in agreement.
+	//
+	// DELIBERATELY ONLY THE REFUSED GATE. The other gates in
+	// triggerAutoUpgrades() (claim in flight, wave full, provisioning, the
+	// schedule itself) are TRANSIENT — they clear on their own, so a badge
+	// saying "queued" is eventually true. Uncollectible is the one state that
+	// never resolves without operator action, which is why it is the one worth
+	// naming distinctly.
+	AutoUpgradeBlocked       bool   `json:"autoUpgradeBlocked,omitempty"`
+	AutoUpgradeBlockedReason string `json:"autoUpgradeBlockedReason,omitempty"`
 
 	// The inference-backend auth-failure signal (InferenceAuthError) is NOT
 	// re-declared here: MyHiveEntry embeds RegistryEntry, which already carries
@@ -3609,6 +3647,17 @@ func (s *HubServer) handleMyHives(w http.ResponseWriter, r *http.Request) {
 			result[i].AdvisoryStaleReason = reason
 		}
 
+		// Auto-upgrade REFUSAL, computed on read for the same reason: the
+		// predicate and its staleRemoveAge bound live ONLY in Go, so the fleet
+		// badge cannot drift from what triggerAutoUpgrades() will actually do.
+		// Gated on AutoUpgrade because the state only means anything for a hive
+		// that has asked for auto-upgrades in the first place — a manual hive is
+		// not "blocked", it is simply manual.
+		if blocked, reason := autoUpgradeBlocked(result[i].AutoUpgrade, result[i].LastHeartbeat, journeyNow); blocked {
+			result[i].AutoUpgradeBlocked = true
+			result[i].AutoUpgradeBlockedReason = reason
+		}
+
 		// Running-but-inactive agents, computed on read for the same reason:
 		// the thresholds and the paused/on-demand exclusions live ONLY in Go.
 		//
@@ -3661,6 +3710,21 @@ func (s *HubServer) handleMyHives(w http.ResponseWriter, r *http.Request) {
 			// just computed. Only for real (non-placeholder) hives with reported
 			// agents — a placeholder has nothing to produce.
 			verdict := hiveHealthFor(result[i].RegistryEntry, rollup, result[i].GitHubAppHealth, queuedWork, journeyNow)
+			// Digest-lag amber (#5577): the channel/behind-count divergence
+			// info lives on MyHiveEntry (TrackedChannel is hub-owned, the
+			// behind-count was computed just above), so this row of the
+			// signature table is applied here rather than in hiveHealthFor.
+			applyChannelLag(&verdict, result[i].TrackedChannel, result[i].CommitsBehindStableV4, result[i].Upgrading)
+			// The App-broken hint's install URL is cluster-scoped (a GHE
+			// cluster must never be handed a github.com link), so resolve it
+			// from this hive's cluster config — the same single URL builder
+			// the create-hive modal uses.
+			if verdict.cause == causeAppBroken && verdict.Remediation != nil {
+				if c, ok := s.clusters[result[i].ClusterID]; ok {
+					gh := clusterGitHubConfig(&c)
+					verdict.Remediation.Link = gh.AppInstallURL()
+				}
+			}
 			result[i].HealthVerdict = &verdict
 		}
 
@@ -3876,7 +3940,7 @@ func (s *HubServer) handleCreateHive(w http.ResponseWriter, r *http.Request) {
 	if host, org, reposFromOrg := normalizeProjectRef(req.Org); org != "" && (host != "" || len(reposFromOrg) > 0) {
 		if host != "" {
 			req.GitHubBaseURL = "https://" + host
-			req.GitHubAPIURL = gheAPIURLForHost(host)
+			req.GitHubAPIURL = forgeAPIURLForHost("", host)
 		}
 		req.Org = org
 		if len(reposFromOrg) > 0 {
@@ -3892,7 +3956,7 @@ func (s *HubServer) handleCreateHive(w http.ResponseWriter, r *http.Request) {
 		host, org, reposFromShifted := normalizeProjectRef(req.Org + "/" + originalFirstRepo)
 		if host != "" && org != "" && strings.Contains(req.Org, ".") {
 			req.GitHubBaseURL = "https://" + host
-			req.GitHubAPIURL = gheAPIURLForHost(host)
+			req.GitHubAPIURL = forgeAPIURLForHost("", host)
 			req.Org = org
 			repos := replaceFirstCSV(req.Repos, strings.Join(reposFromShifted, "/"))
 			req.Repos = repos
@@ -4617,12 +4681,59 @@ func (s *HubServer) handleUpgradeHive(w http.ResponseWriter, r *http.Request) {
 	// the wedge this PR fixes. The hive is latched Upgrading with a target the
 	// moment the request returns, which is what the dashboard renders.
 
+	// Do not ARM an upgrade this hive cannot COLLECT — the same predicate
+	// triggerAutoUpgrades() applies, for the same reason. Delivery is PULL on
+	// BOTH paths: the hub only records a target and arms the heartbeat, and the
+	// spoke patches its own Deployment when it next beats. A hive that never
+	// heartbeats (or is silent past staleRemoveAge) therefore never collects
+	// the instruction, while Upgrading=true latches on the hub and the
+	// stale-upgrade sweep re-arms it every staleUpgradeTimeout — an unbounded
+	// loop the orphan sweep's retry budget cannot break, because such a hive
+	// fails evaluateOrphanedUpgrade()'s liveness test. See pullonly_upgrade.go.
+	//
+	// Without this, the manual button was strictly WORSE than the auto path it
+	// diverged from: auto-upgrade refuses and records the refusal on the
+	// timeline, whereas the click reported {"status":"upgrading"} and a success
+	// toast for an upgrade that could never land. Worse, the asymmetry read as
+	// a workaround — the same spoke auto-upgrade had declined would accept a
+	// manual click, appearing to fix the problem while only hiding it.
+	//
+	// lastHeartbeat comes from the REGISTRY entry, which is the only record
+	// that carries it; SaaSHive (the loadSaaSHive record `h` above) has no such
+	// field. This is the identical source triggerAutoUpgrades() reads.
+	//
+	// Refused with 409, matching the pause-switch refusal above. The reason is
+	// operator-facing by construction and documented to carry no kubeconfig
+	// paths or credentials, so it is safe in the body.
 	s.mu.Lock()
-	var latestSHA string
+	var latestSHA, lastHeartbeat string
+	var found bool
 	for i := range s.registry.Hives {
 		if s.registry.Hives[i].ID == id {
+			found = true
+			lastHeartbeat = s.registry.Hives[i].LastHeartbeat
 			branch := s.upgradeBranchOrDefault(s.registry.Hives[i].GitBranch)
 			latestSHA = getLatestSHAForBranch(branch)
+			break
+		}
+	}
+	// A hive with no registry entry has never checked in at all, so it is
+	// uncollectible for exactly the reason the empty-heartbeat case is.
+	if !found || !upgradeCollectible(lastHeartbeat, time.Now()) {
+		s.mu.Unlock()
+		reason := uncollectibleUpgradeReason(lastHeartbeat)
+		s.logger.Warn("manual upgrade not armed — hive cannot collect the instruction",
+			"hive_id", id, "by", username, "cluster", cluster.ID,
+			"would_have_targeted", latestSHA, "last_heartbeat", orDash(lastHeartbeat),
+			"reason", reason)
+		s.noteUncollectibleUpgrade(id, latestSHA, reason)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": reason})
+		return
+	}
+	for i := range s.registry.Hives {
+		if s.registry.Hives[i].ID == id {
 			s.beginUpgrade(i, latestSHA)
 			break
 		}
@@ -4651,6 +4762,11 @@ func (s *HubServer) handleUpgradeHive(w http.ResponseWriter, r *http.Request) {
 	// collected by the spoke on its next beat. The UI uses this to say "queued"
 	// rather than implying an immediate roll.
 	const mode = "heartbeat"
+	// Armed successfully, so the uncollectible condition has genuinely cleared:
+	// drop the de-duplication memory (as the auto path does on its own successful
+	// arm) so a LATER refusal for this same target is reported afresh rather than
+	// suppressed by a stale entry.
+	s.forgetUncollectibleUpgrade(id)
 	s.logger.Info("audit: hosted hive upgrade requested",
 		"hive_id", id, "by", username, "cluster", cluster.ID, "mode", mode)
 	s.recordTimeline(id, TimelineUpgradeStarted, "upgrade requested from the hub dashboard ("+mode+")", username)
@@ -5795,6 +5911,14 @@ func (s *HubServer) StartLatestSHAPoller(ctx context.Context) {
 	// rate-limited to perHiveEnvMaxPatchesPerCycle patches per cycle, because
 	// each patch rolls that hive's pod. See perhive_env_reconcile.go.
 	s.reconcilePerHiveEnvIfDue()
+	// Force-delete hive-namespace pods stuck in Terminating past
+	// orphanedPodMinAge with no finalizers and a non-Running phase — the
+	// residue of nodes disappearing without draining (#5328). Throttled
+	// internally to orphanedPodReapInterval and capped per cycle; nothing else
+	// ever removes these, so without this they accumulate indefinitely (32
+	// measured across 16 namespaces, oldest three weeks). See
+	// orphaned_pod_reaper.go.
+	s.reapOrphanedPodsIfDue()
 	// Drop master generations whose verify window has closed, and warn when one
 	// is closing while spokes still carry it. Throttled internally to
 	// generationRetireInterval. This lane PERSISTS the drop and ALERTS; it is
@@ -5826,67 +5950,78 @@ func (s *HubServer) StartLatestSHAPoller(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		oldSHAs := getLatestSHAs()
-		oldInfos := snapshotBranchSHAs()
-		// Re-resolve each tick so branches from newly registered hives are
-		// picked up without a hub restart.
-		fetchAllBranchSHAs(s.logger, s.trackedBranchList())
-		newSHAs := getLatestSHAs()
-		if !maps.Equal(snapshotBranchSHAs(), oldInfos) {
-			persistLatestSHAs(s.logger)
+		s.pollLatestSHAsTick(ctx, time.Now())
+	}
+}
+
+// pollLatestSHAsTick is the body of StartLatestSHAPoller's ticker loop,
+// extracted so it can be invoked directly by tests without waiting on the
+// live ticker: re-fetches every tracked branch SHA, persists on change, drives
+// the throttled reconciliation lanes, and runs the hub auto-upgrade check.
+// now is injected so tests control the clock the same way
+// maybeSnapshotImagePulls already does.
+func (s *HubServer) pollLatestSHAsTick(ctx context.Context, now time.Time) {
+	oldSHAs := getLatestSHAs()
+	oldInfos := snapshotBranchSHAs()
+	// Re-resolve each tick so branches from newly registered hives are
+	// picked up without a hub restart.
+	fetchAllBranchSHAs(s.logger, s.trackedBranchList())
+	newSHAs := getLatestSHAs()
+	if !maps.Equal(snapshotBranchSHAs(), oldInfos) {
+		persistLatestSHAs(s.logger)
+	}
+	// Always check for pending auto-upgrades (retries failed/missed hives).
+	s.triggerAutoUpgrades()
+	s.sweepOrphanedUpgradesIfDue()
+	s.sweepStuckAssignmentsIfDue()
+	s.reconcileNetAdminIfDue()
+	s.reconcilePerHiveEnvIfDue()
+	s.reapOrphanedPodsIfDue()
+	s.retireExpiredGenerationsIfDue()
+	s.sweepExpiredAccessIfDue()
+	s.replenishPoolsIfDue()
+	s.maybeSnapshotImagePulls(ctx, now)
+	changed := false
+	for branch, sha := range newSHAs {
+		if sha != "" && sha != oldSHAs[branch] {
+			changed = true
+			break
 		}
-		// Always check for pending auto-upgrades (retries failed/missed hives).
-		s.triggerAutoUpgrades()
-		s.sweepOrphanedUpgradesIfDue()
-		s.sweepStuckAssignmentsIfDue()
-		s.reconcileNetAdminIfDue()
-		s.reconcilePerHiveEnvIfDue()
-		s.retireExpiredGenerationsIfDue()
-		s.sweepExpiredAccessIfDue()
-		s.replenishPoolsIfDue()
-		s.maybeSnapshotImagePulls(ctx, time.Now())
-		changed := false
-		for branch, sha := range newSHAs {
-			if sha != "" && sha != oldSHAs[branch] {
-				changed = true
-				break
-			}
+	}
+	_ = changed
+	// Hub auto-upgrade — checked EVERY cycle, not only when the SHA just
+	// changed. Previously this lived inside `if changed {}`, so if the hub
+	// missed the one poll where v2's SHA flipped (busy, mid-restart, or the
+	// SHA moved between polls), it stayed "queued" forever and never retried,
+	// while spokes retry every cycle via triggerAutoUpgrades() above. Mirror
+	// that: whenever auto-upgrade is on and the hub is behind latest v2, trigger
+	// a rollout restart. A debounce prevents re-restarting every 2min while a
+	// restart is already rolling out (the new pod reports the new hash, which
+	// clears the condition, but the poll can fire before the rollout lands).
+	// Use the hub's OWN branch, not a hardcoded "v2": hubUpgradeState() and
+	// handleHubSelfUpgrade() both read s.hubGitBranch, so hardcoding here
+	// made the badge and the poller disagree the moment a hub ran on v3.
+	hubBranchSHA := getLatestHubSHAForBranch(s.hubGitBranch)
+	s.hubUpgradeMu.Lock()
+	debounced := time.Since(s.lastHubUpgradeTrigger) > hubUpgradeDebounce
+	s.hubUpgradeMu.Unlock()
+	// Admin kill switch: while hub upgrades are paused the hub stays on its
+	// current build regardless of new tags — the auto-trigger below never
+	// fires. Checked every cycle (like the trigger itself), so flipping the
+	// switch takes effect on the next poll without a restart.
+	if hubPauseSw, hubPaused := s.hubUpgradesPaused(); hubPaused {
+		if isHubAutoUpgrade() && hubBranchSHA != "" && !sameCommit(hubBranchSHA, s.hubGitHash) {
+			s.logger.Debug("hub auto-upgrade suppressed — hub upgrades are paused",
+				"behind", hubBranchSHA, "paused_by", hubPauseSw.By, "paused_at", hubPauseSw.At)
 		}
-		_ = changed
-		// Hub auto-upgrade — checked EVERY cycle, not only when the SHA just
-		// changed. Previously this lived inside `if changed {}`, so if the hub
-		// missed the one poll where v2's SHA flipped (busy, mid-restart, or the
-		// SHA moved between polls), it stayed "queued" forever and never retried,
-		// while spokes retry every cycle via triggerAutoUpgrades() above. Mirror
-		// that: whenever auto-upgrade is on and the hub is behind latest v2, trigger
-		// a rollout restart. A debounce prevents re-restarting every 2min while a
-		// restart is already rolling out (the new pod reports the new hash, which
-		// clears the condition, but the poll can fire before the rollout lands).
-		// Use the hub's OWN branch, not a hardcoded "v2": hubUpgradeState() and
-		// handleHubSelfUpgrade() both read s.hubGitBranch, so hardcoding here
-		// made the badge and the poller disagree the moment a hub ran on v3.
-		hubBranchSHA := getLatestHubSHAForBranch(s.hubGitBranch)
-		s.hubUpgradeMu.Lock()
-		debounced := time.Since(s.lastHubUpgradeTrigger) > hubUpgradeDebounce
-		s.hubUpgradeMu.Unlock()
-		// Admin kill switch: while hub upgrades are paused the hub stays on its
-		// current build regardless of new tags — the auto-trigger below never
-		// fires. Checked every cycle (like the trigger itself), so flipping the
-		// switch takes effect on the next poll without a restart.
-		if hubPauseSw, hubPaused := s.hubUpgradesPaused(); hubPaused {
-			if isHubAutoUpgrade() && hubBranchSHA != "" && !sameCommit(hubBranchSHA, s.hubGitHash) {
-				s.logger.Debug("hub auto-upgrade suppressed — hub upgrades are paused",
-					"behind", hubBranchSHA, "paused_by", hubPauseSw.By, "paused_at", hubPauseSw.At)
-			}
-		} else if isHubAutoUpgrade() && hubBranchSHA != "" && !sameCommit(hubBranchSHA, s.hubGitHash) && debounced {
-			s.logger.Info("audit: hub auto-upgrade triggered", "from", s.hubGitHash, "to", hubBranchSHA)
-			// rolloutHubToSHA verifies the hub image exists (skips a doomed roll
-			// when the hive-hub build for this SHA failed) and pins the SHA so a
-			// stale cached v2-latest can't come back up. It records the in-flight
-			// state on success so the dashboard shows "Upgrading", not "queued".
-			if err := s.rolloutHubToSHA(hubBranchSHA); err != nil {
-				s.logger.Warn("hub auto-upgrade skipped", "to", hubBranchSHA, "reason", err)
-			}
+	} else if isHubAutoUpgrade() && hubBranchSHA != "" && !sameCommit(hubBranchSHA, s.hubGitHash) && debounced {
+		s.logger.Info("audit: hub auto-upgrade triggered", "from", s.hubGitHash, "to", hubBranchSHA)
+		// rolloutHubToSHA verifies the hub image exists (skips a doomed roll
+		// when the hive-hub build for this SHA failed) and pins the SHA so a
+		// stale cached v2-latest can't come back up. It records the in-flight
+		// state on success so the dashboard shows "Upgrading", not "queued".
+		if err := s.rolloutHubToSHA(hubBranchSHA); err != nil {
+			s.logger.Warn("hub auto-upgrade skipped", "to", hubBranchSHA, "reason", err)
 		}
 	}
 }
@@ -6263,6 +6398,49 @@ func (s *HubServer) triggerAutoUpgrades() {
 		if latestSHA == "" || sameCommit(currentSHA, latestSHA) {
 			continue
 		}
+		// Merge-driven debounce (#5391). Reached ONLY on the automatic
+		// chase-latest path: everything that starts an upgrade for an operator
+		// — a manual "Upgrade now" (upgradeHiveHandler), a bulk upgrade
+		// (saas_bulk.go), and a hard image pin (delivered as UpgradeTarget
+		// through the stale-recovery branch ABOVE the `if !h.AutoUpgrade` gate)
+		// — arms s.heartbeatUpgrade directly and never enters this loop body.
+		// So an operator's upgrade and a pin stay IMMEDIATE by construction,
+		// and only the merge-frequency-driven roll is held.
+		//
+		// Placed after every eligibility gate above so a hive that would not
+		// upgrade anyway never arms a window, and before the wave gate and the
+		// fire-date persistence below so a debounced hive costs no wave slot and
+		// keeps its daily/weekly window open.
+		debounce := shouldDebounceAutoUpgrade(
+			autoUpgradeDebounceState{
+				Target:       h.AutoUpgradePendingTarget,
+				ArmedAt:      h.AutoUpgradePendingSince,
+				FirstArmedAt: h.AutoUpgradePendingFirst,
+				Collapsed:    h.AutoUpgradeCollapsed,
+			},
+			latestSHA, autoUpgradeDebounceInterval(), autoUpgradeMaxHold(), time.Now())
+		if !debounce.Allowed {
+			// Persist the (possibly just-replaced) pending target so a hub
+			// restart inside the window resumes it rather than dropping it.
+			s.persistUpgradeDebounceState(&h, debounce.State)
+			s.logger.Info("auto-upgrade debounced — holding for a quiet branch",
+				"hive_id", h.ID, "branch", branch,
+				"target", debounce.State.Target, "current", currentSHA,
+				"collapsed", debounce.State.Collapsed,
+				"debounce", autoUpgradeDebounceInterval(),
+				"reason", debounce.Reason)
+			continue
+		}
+		if debounce.Collapsed > 0 {
+			// Report the collapse. Silent batching would trade one invisible
+			// problem for another: without this line, N merges producing one
+			// roll is indistinguishable from N-1 upgrades having been lost.
+			s.logger.Info("auto-upgrade debounce collapsed a merge burst into one roll",
+				"hive_id", h.ID, "branch", branch,
+				"merges_collapsed", debounce.Collapsed+1,
+				"final_target", latestSHA, "current", currentSHA,
+				"debounce", autoUpgradeDebounceInterval())
+		}
 		hiveCluster := s.clusterForHive(&h)
 		if hiveCluster == nil {
 			s.logger.Warn("auto-upgrade skipped — no cluster config", "hive_id", h.ID, "cluster_id", h.ClusterID)
@@ -6326,6 +6504,13 @@ func (s *HubServer) triggerAutoUpgrades() {
 					"hive_id", h.ID, "date", decision.FireDate, "error", err)
 			}
 		}
+		// Clear the debounce record now the roll is actually going out. Cleared
+		// HERE, after every gate that could still `continue`, so a hive turned
+		// away by the wave gate keeps its pending target and simply boards a
+		// later wave instead of re-arming a fresh window each cycle. Clearing
+		// before the rollout (like the fire date above) means a hub crash in
+		// between costs at most a re-armed window, never a duplicate roll.
+		s.persistUpgradeDebounceState(&h, autoUpgradeDebounceState{})
 		// The hive is deliverable again — drop any suppressed-refusal memory so a
 		// future undeliverable episode is reported afresh rather than swallowed.
 		s.forgetUncollectibleUpgrade(h.ID)
@@ -8243,7 +8428,7 @@ func (s *HubServer) handleApproveProvision(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		// An explicit "public" choice means public github.com. Record it as a
-		// blank host so gheAPIURLForHost pushes nothing and the spoke keeps its
+		// blank host so forgeAPIURLForHost pushes nothing and the spoke keeps its
 		// own api.github.com default — and so the cluster backfill below, which
 		// only ever fills a blank, does not silently re-GHE it.
 		if strings.EqualFold(host, githubHostPublic) {
@@ -8793,7 +8978,7 @@ func projectConfigForHiveID(hiveID, curOrg string, curRepos []string, curPrimary
 	// Deliberately conservative: an empty curAPIURL means the spoke is too old
 	// to report its API URL, which is UNKNOWN, not a mismatch — pushing on it
 	// would re-send on every beat with no read-back to ever stop it.
-	wantAPIURL := gheAPIURLForHost(h.GitHubHost)
+	wantAPIURL := forgeAPIURLForHost(h.Forge, h.GitHubHost)
 	// The api_url is the field where unknown-vs-mismatch actually bites: a spoke
 	// too old to report it sends "", which is NOT "I am on api.github.com". The
 	// observedKnown argument carries that distinction explicitly instead of
@@ -8864,7 +9049,7 @@ func projectConfigForHiveID(hiveID, curOrg string, curRepos []string, curPrimary
 			if forgeAPIURL != "" {
 				return forgeAPIURL
 			}
-			return gheAPIURLForHost(h.GitHubHost)
+			return forgeAPIURLForHost(h.Forge, h.GitHubHost)
 		}(),
 		// AIAuthor is deliberately left empty here. Provisioning state never
 		// knows the agents' GitHub account — the spoke owns it — and the spoke
@@ -9054,7 +9239,7 @@ func (s *HubServer) handleAssignHive(w http.ResponseWriter, r *http.Request) {
 	// right GitHub API. Never blank an existing value with an empty one.
 	//
 	// "public" is an explicit choice of public github.com on a cluster whose
-	// defaults point at GHE. Record it as a blank host (so gheAPIURLForHost
+	// defaults point at GHE. Record it as a blank host (so forgeAPIURLForHost
 	// pushes nothing and the spoke keeps api.github.com) PLUS the
 	// GitHubBaseURL sentinel, which is what makes effectiveGitHubBaseURL
 	// resolve to "" and therefore makes the cluster backfill below decline to
@@ -9073,7 +9258,7 @@ func (s *HubServer) handleAssignHive(w http.ResponseWriter, r *http.Request) {
 	// the placeholder carries one. Placeholders provisioned BEFORE their
 	// cluster gained github_base_url/github_api_url have GitHubHost == "", and
 	// nothing else ever fills it in: projectConfigForHiveID pushes
-	// gheAPIURLForHost(h.GitHubHost), which is empty for those hives, so the
+	// forgeAPIURLForHost(h.Forge, h.GitHubHost), which is empty for those hives, so the
 	// spoke keeps api.github.com and the public app_id even though the cluster
 	// is a GHE cluster (observed on the heartbeat-only cluster: hosted-available-vllmd-01 has
 	// base_url: "" / api_url: "" against a github.ibm.com cluster). The hive's
@@ -16406,6 +16591,21 @@ const dashboardHTML = `<!DOCTYPE html>
             var queuedTitle = queuedDaily
               ? 'Auto-upgrade will apply ' + branchLatest + ' (' + versionLabel(versionSel) + ') at the next 1pm ET window' + buildingHint
               : 'Auto-upgrade will apply ' + branchLatest + ' (' + versionLabel(versionSel) + ') shortly' + buildingHint;
+            /* REFUSED, not queued. autoUpgradeBlocked is the hub's own evaluated
+               decision (upgradeCollectible false), sent by the fleet API rather
+               than re-derived here — the badge must never claim an upgrade is
+               coming for a hive triggerAutoUpgrades() declines every cycle and
+               will keep declining until an operator intervenes. The mode-derived
+               label above says nothing about eligibility, which is exactly how a
+               hive sat 89 commits behind still advertising "· 1pm ET".
+               "Upgrade now" stays beside it: the manual path is pushed through a
+               different route and remains the operator's escape hatch. */
+            if (h.autoUpgradeBlocked) {
+              queuedLabel = 'Auto-upgrade blocked';
+              queuedTitle = 'The hub will not arm an auto-upgrade for this hive: ' +
+                (h.autoUpgradeBlockedReason || 'it cannot collect the upgrade instruction') +
+                '. It will not resolve on its own.' + buildingHint;
+            }
             /* escAttr, not esc, for the title: esc() leaves quotes intact and a
                branch name or commit subject carrying one would break out of the
                attribute. jsArg supplies its own quotes for the handler args. */
@@ -18477,6 +18677,24 @@ const dashboardHTML = `<!DOCTYPE html>
               var capRemaining = cs.hive_capacity_remaining;
               capacityLine = ' · <span title="Estimated headroom: per-hive CPU/memory request footprint bin-packed into free (allocatable minus requested) capacity on Ready, schedulable nodes only">room for ~' + capRemaining + ' more hive' + (capRemaining === 1 ? '' : 's') + '</span>';
             }
+            // Stuck (orphaned Terminating) hive pods — the residue of nodes
+            // disappearing without draining (#5328). ABSENT means the hub could
+            // not determine it and nothing is claimed; a present zero is
+            // deliberately silent so a healthy fleet stays quiet. Only a real
+            // non-zero count renders, because the whole cost of this incident
+            // was that 27 orphans across 15 namespaces accumulated for three
+            // weeks with nothing reporting them.
+            var stuckLine = '';
+            if (c.stuck_pods && c.stuck_pods.total > 0) {
+              var sp = c.stuck_pods;
+              var nsList = (sp.namespaces || []).map(function(x) { return x.namespace + ' (' + x.count + ')'; }).join(', ');
+              if (sp.truncated) { nsList += ', …'; }
+              var stuckTitle = 'Hive pods stuck Terminating past the reaper threshold: deletionTimestamp set, no finalizers, not Running. ' +
+                'Signature of a node removed without draining. Affected namespaces: ' + nsList;
+              stuckLine = ' · <span style="color:var(--red)" title="' + esc(stuckTitle) + '">' +
+                sp.total + ' stuck pod' + (sp.total === 1 ? '' : 's') +
+                ' in ' + sp.namespaces_affected + ' ns</span>';
+            }
             var errorLine = c.error ? '<div style="margin:8px 0;padding:6px 10px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:0.75rem;color:var(--red)">' + esc(c.error) + '</div>' : '';
             var headerHtml = '<div style="display:flex;align-items:center;gap:8px;margin:16px 0 8px">' +
               clusterBadge(c.id, c.name) +
@@ -18486,7 +18704,7 @@ const dashboardHTML = `<!DOCTYPE html>
               '<span style="color:' + cCpuColor + '">' + (cs.total_cpu_percent || 0) + '% cpu</span> · ' +
               '<span style="color:' + cMemColor + '">' + (cs.total_mem_percent || 0) + '% mem</span> · ' +
               cDiskSegment +
-              (c.hive_count || 0) + ' hives' + capacityLine + gpuLine +
+              (c.hive_count || 0) + ' hives' + capacityLine + gpuLine + stuckLine +
               '</span></div>';
             var nodesHtml = (c.nodes || []).length > 0
               ? '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">' + (c.nodes || []).map(renderNodeCard).join('') + '</div>'

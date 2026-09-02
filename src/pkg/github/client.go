@@ -166,6 +166,22 @@ type Client struct {
 	// issues:write) still surface within ~an hour instead of never. Guarded by
 	// advisoryMu.
 	advisoryDigestSkips map[string]int
+	// hiveIdentity records which accounts count as "this hive" for the
+	// self-authorization gate (pr_self_authorization.go, #5117). It is optional
+	// — the gate recognises the App bot without it — and exists so an issue
+	// filed under project.ai_author's plain user account is also recognised as
+	// ours rather than mistaken for a human's. Guarded because config reload
+	// re-installs it while the PR-request watcher goroutine may be reading it.
+	hiveIdentityMu sync.RWMutex
+	hiveIdentity   HiveIdentity
+	// commitTrees memoizes "owner/repo@commitSHA" -> tree SHA for the
+	// duplicate-payload guard (pr_duplicate_tree.go, #5111). A commit's tree
+	// can never change, so unlike defaultBranches this cache has no staleness
+	// window at all; it exists purely so re-inspecting the same open PRs on
+	// every PR creation does not re-pay a lookup per candidate. Guarded by
+	// commitTreeMu.
+	commitTreeMu sync.RWMutex
+	commitTrees  map[string]string
 }
 
 func (c *Client) SetCanaryScanner(enabled, failClosed bool, reg *ioscan.CanaryRegistry, onLeak func(ioscan.CanaryLeak)) {

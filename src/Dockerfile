@@ -29,7 +29,7 @@ ARG GIT_BRANCH=unknown
 # registration), wired the same way as GIT_HASH/GIT_BRANCH: an -X ldflag that
 # takes over from the Go linker default (cmd/hive/main.go, "0.0.0-dev") only
 # when a caller passes it. NO current workflow passes it — docker.yml never
-# does, and release.yml (.github/workflows/release.yml) deliberately does not
+# does, and .github/workflows/tagged-release.yml deliberately does not
 # rebuild at all; it retags the image docker.yml already published for that
 # commit rather than invoking this Dockerfile a second time. This ARG exists
 # so that gap can be closed later (teaching a build to embed a real semver)
@@ -60,7 +60,7 @@ RUN --mount=type=cache,id=hive-go-build,target=/tmp/gobuild \
 # supply-chain risk. Refresh deliberately (same technique as golang above,
 # repo library/node, tag 26-slim) and update both the tag and the @sha256
 # digest together in BOTH FROM node:26-slim lines in this file.
-FROM node:26-slim@sha256:4ebb5ace66f15a24c14c492e01a8beeed4fddf970a856109f5126e703e5fe503 AS tmux-builder
+FROM node:26-slim@sha256:c0753125a3789977aefe869cbebccf70e3cfd7ea84ca48547458f02e4f1d7146 AS tmux-builder
 ARG TARGETARCH
 ARG TMUX_VERSION=3.5a
 ARG TMUX_SHA256_AMD64=16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951
@@ -88,7 +88,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (and the rewrite RUN below) from the branch-scoped GHA cache — so a fresh
 # binary was rebuilt and then discarded, and the OLD binary shipped. See the
 # stale-binary note in .github/workflows/docker.yml.
-FROM node:26-slim@sha256:4ebb5ace66f15a24c14c492e01a8beeed4fddf970a856109f5126e703e5fe503 AS runtime
+FROM node:26-slim@sha256:c0753125a3789977aefe869cbebccf70e3cfd7ea84ca48547458f02e4f1d7146 AS runtime
 
 # --- Layer 1: system packages (rarely changes) ---
 # util-linux provides `setpriv`, used by the entrypoint to drop to `dev` with an

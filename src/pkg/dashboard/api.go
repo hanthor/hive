@@ -70,6 +70,10 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	// Full retained scrollback of an agent's latest run, as plain text (#3693).
 	// Backs the Terminal's "view / download full log" controls.
 	s.mux.HandleFunc("GET /api/agents/{name}/log", s.handleAgentFullLog)
+	// URLs visible in the agent's pane, joined across terminal wrapping, for
+	// the dashboard's click-to-copy control (#5188). The terminal itself
+	// cannot deliver a copy, so the copy is done server-side.
+	s.mux.HandleFunc("GET /api/agents/{name}/terminal-urls", s.handleAgentTerminalURLs)
 	// Durable per-kick run-log history (#4296, #4295): list archived kick
 	// logs, fetch one, and a minimal HTML index page linked from agent cards.
 	s.mux.HandleFunc("GET /api/agents/{name}/kicks", s.handleAgentKickLogList)
@@ -79,6 +83,10 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("GET /api/role", s.handleRole)
 
 	s.mux.HandleFunc("POST /api/kick/{agent}", s.handleKick)
+	// Outcome of the most recent asynchronous kick (#5325). The POST answers
+	// 202 as soon as the kick is queued; delivery success or failure is read
+	// from here, off the request path and therefore never proxy-timed-out.
+	s.mux.HandleFunc("GET /api/kick/{agent}/status", s.handleKickStatus)
 	s.mux.HandleFunc("POST /api/switch/{agent}/{backend}", s.handleSwitch)
 	s.mux.HandleFunc("POST /api/model/{agent}/{model}", s.handleModelSet)
 	s.mux.HandleFunc("POST /api/pause/{agent}", s.handlePause)
@@ -89,6 +97,9 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("POST /api/breaker/release", s.handleBreakerRelease)
 	s.mux.HandleFunc("POST /api/pin/{agent}/{dimension}", s.handlePin)
 	s.mux.HandleFunc("POST /api/unpin/{agent}/{dimension}", s.handleUnpin)
+	// Write-side twin of the terminal-urls copy control: the dashboard terminal
+	// can neither hand an operator a wrapped login URL nor accept the code back.
+	s.mux.HandleFunc("POST /api/agents/{name}/login-code", s.handleAgentLoginCode)
 	s.mux.HandleFunc("POST /api/restart/{agent}", s.handleRestart)
 	s.mux.HandleFunc("POST /api/reset-restarts/{agent}", s.handleResetRestarts)
 
@@ -402,6 +413,22 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": msg}); err != nil {
 		slog.Warn("jsonError encode failed", "error", err)
+	}
+}
+
+// jsonStatusResponse writes a JSON body under an explicit status code.
+//
+// The Content-Type MUST be set before WriteHeader — writing the status first
+// freezes the header map, and a JSON body served without its content type is
+// exactly what the dashboard's postJSON guard (#5301/#5306) treats as an
+// intermediary's HTML error page. Getting this backwards on the kick endpoint
+// would turn a healthy 202 into a reported failure, which is the whole class
+// of bug #5325 is about.
+func jsonStatusResponse(w http.ResponseWriter, code int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		slog.Warn("jsonStatusResponse encode failed", "error", err)
 	}
 }
 
@@ -1048,7 +1075,8 @@ func (s *Server) handleSnapshotPage(w http.ResponseWriter, r *http.Request) {
 	if mode != "dark" {
 		mode = "light"
 	}
-	snapshotFile := fmt.Sprintf("/data/snapshots/snapshot-%s.html", mode)
+	snapDir := s.snapshotDirOrDefault()
+	snapshotFile := filepath.Join(snapDir, fmt.Sprintf("snapshot-%s.html", mode))
 	info, err := os.Stat(snapshotFile)
 	intervalMin := cfg.Hub.SnapshotIntervalMin
 	if intervalMin < 5 {
@@ -1058,8 +1086,8 @@ func (s *Server) handleSnapshotPage(w http.ResponseWriter, r *http.Request) {
 	needsRebuild := err != nil || time.Since(info.ModTime()) > staleThreshold
 
 	if needsRebuild {
-		s.buildSnapshot("/data/snapshots/snapshot-dark.html", "dark")
-		s.buildSnapshot("/data/snapshots/snapshot-light.html", "light")
+		s.buildSnapshot(filepath.Join(snapDir, "snapshot-dark.html"), "dark")
+		s.buildSnapshot(filepath.Join(snapDir, "snapshot-light.html"), "light")
 	}
 
 	data, err := os.ReadFile(snapshotFile)
@@ -1102,8 +1130,33 @@ func (s *Server) handleSnapshotPage(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(html))
 }
 
+// snapshotDirOrDefault returns the directory handleSnapshotPage/buildSnapshot
+// read and write snapshot-{mode}.html under: s.snapshotDir when a test has
+// overridden it, otherwise the production default. See the field comment on
+// Server.snapshotDir (#5235).
+func (s *Server) snapshotDirOrDefault() string {
+	if s.snapshotDir != "" {
+		return s.snapshotDir
+	}
+	return "/data/snapshots"
+}
+
 func (s *Server) buildSnapshot(outputFile, mode string) {
-	if err := os.MkdirAll("/data/snapshots", 0o755); err != nil {
+	if s.buildSnapshotFn != nil {
+		s.buildSnapshotFn(s, outputFile, mode)
+		return
+	}
+	buildSnapshotProd(s, outputFile, mode)
+}
+
+// buildSnapshotProd is the real Node-builder invocation buildSnapshot runs in
+// production. Split out from buildSnapshot so tests can override the whole
+// invocation via Server.buildSnapshotFn (#5235) without ever spawning `node`
+// — see the field comment on Server.buildSnapshotFn for the seam convention
+// this follows (pkg/hub's afterGenerationsReadAttempt, #5080).
+func buildSnapshotProd(s *Server, outputFile, mode string) {
+	snapDir := s.snapshotDirOrDefault()
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
 		s.logger.Warn("snapshot directory creation failed", "error", err)
 		return
 	}
@@ -1481,8 +1534,35 @@ func (s *Server) handleKick(w http.ResponseWriter, r *http.Request) {
 		msg = s.deps.Scheduler.BuildAgentMessageFromLastActionable(name)
 	}
 
-	if err := s.deps.AgentMgr.SendKick(name, msg); err != nil {
+	// Queue the kick and answer immediately (#5325).
+	//
+	// The old code called the synchronous SendKick inline. Its slow leg waits
+	// for the CLI's input prompt for up to inputPromptTimeout (120s), which
+	// exceeds a typical ingress idle timeout (commonly 60s) — so a kick to an
+	// agent whose CLI was merely slow to present its prompt was answered by the
+	// proxy with 504 while the wait was still running. The wait then completed,
+	// the prompt WAS typed, and the agent ran the session; the operator had
+	// been told it failed, and the natural retry delivered the work twice.
+	//
+	// SendKickAsync keeps every fast, deterministic precondition synchronous —
+	// unknown agent, paused/stopped, missing tmux session, sandbox rejection
+	// still return 400 here — and moves only the prompt wait and the typing to
+	// a background goroutine with an exactly-once in-flight guard. The outcome
+	// is reported by GET /api/kick/{agent}/status, off the request path.
+	started, err := s.deps.AgentMgr.SendKickAsync(name, msg)
+	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !started {
+		// A delivery for this agent is already in flight. Answering 202 with
+		// status "in-flight" is what makes an operator's retry harmless: the
+		// prompt is delivered exactly once regardless of how many times Kick
+		// is clicked.
+		jsonStatusResponse(w, http.StatusAccepted, map[string]interface{}{
+			"ok": true, "status": kickStatusInFlight, "agent": name,
+			"message": "a kick is already being delivered to " + name + "; not sending it twice",
+		})
 		return
 	}
 
@@ -1490,19 +1570,87 @@ func (s *Server) handleKick(w http.ResponseWriter, r *http.Request) {
 	s.deps.Logger.Info("audit: agent kicked", "agent", name, "trigger", "dashboard-api")
 	s.auditFromRequest(r, "kick", "", name)
 	s.refreshAfterMutation()
-	okResponse(w, map[string]string{"status": "kicked", "agent": name})
+	// 202, not 200: the message is queued, not yet proven delivered.
+	jsonStatusResponse(w, http.StatusAccepted, map[string]interface{}{
+		"ok": true, "status": kickStatusQueued, "agent": name,
+	})
+}
+
+// Kick dispatch statuses on the wire. "queued"/"in-flight" are the POST's
+// answers; the poll adds the terminal "delivered" and "failed".
+const (
+	kickStatusQueued    = "queued"
+	kickStatusInFlight  = "in-flight"
+	kickStatusUnknown   = "unknown"
+	kickStatusDelivered = "delivered"
+	kickStatusFailed    = "failed"
+)
+
+// handleKickStatus reports the outcome of the most recent asynchronous kick
+// for an agent (#5325).
+//
+// This is where kick success or failure is now decided. The POST only promises
+// the kick was queued; a client learns whether the prompt actually reached the
+// CLI by polling here. While the phase is "queued"/"in-flight" the outcome is
+// INDETERMINATE — pending is not failure, and a UI must not render it as one.
+//
+// Read-only, so any authenticated role may call it.
+func (s *Server) handleKickStatus(w http.ResponseWriter, r *http.Request) {
+	name := s.resolveAgentParam(r.PathValue("agent"))
+	if s.deps == nil || s.deps.AgentMgr == nil {
+		jsonError(w, "agent manager unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	d, ok := s.deps.AgentMgr.KickDispatchState(name)
+	if !ok {
+		// No async kick has been dispatched for this agent in this process's
+		// lifetime. That is not an error — it is simply "nothing to report".
+		jsonResponse(w, map[string]interface{}{
+			"ok": true, "agent": name, "status": kickStatusUnknown, "pending": false,
+		})
+		return
+	}
+	resp := map[string]interface{}{
+		"ok":       true,
+		"agent":    name,
+		"status":   kickPhaseStatus(d.Phase),
+		"pending":  d.Pending(),
+		"queuedAt": d.QueuedAt.UTC().Format(time.RFC3339),
+	}
+	if d.Error != "" {
+		resp["error"] = d.Error
+	}
+	if !d.SettledAt.IsZero() {
+		resp["settledAt"] = d.SettledAt.UTC().Format(time.RFC3339)
+	}
+	jsonResponse(w, resp)
+}
+
+// kickPhaseStatus maps a manager dispatch phase onto the wire status. The
+// pending phase is reported as "in-flight" so the poll's vocabulary matches the
+// POST's, and so no client can mistake it for a settled outcome.
+func kickPhaseStatus(phase string) string {
+	switch phase {
+	case agent.KickPhaseDelivered:
+		return kickStatusDelivered
+	case agent.KickPhaseFailed:
+		return kickStatusFailed
+	default:
+		return kickStatusInFlight
+	}
 }
 
 // claimAgentFieldOwnership writes an operator's model and/or backend choice
-// into hive.yaml and marks those fields operator-owned. Empty arguments leave
-// the corresponding field untouched.
+// into hive.yaml and the per-agent overlay, and marks those fields
+// operator-owned. Empty arguments leave the corresponding field untouched.
 //
 // This is the durability half of the model/method revert fix. The in-memory
 // ModelOverride/BackendOverride on the agent process is replayed from
-// /data/hive-state.json on restart, but hive.yaml still carried the PACK's
-// model — and ApplyPack re-reconciles from the pack on every restart. Writing
-// the operator's value to the same layer the pack writes, plus an ownership
-// marker, is what makes the choice actually survive.
+// /data/hive-state.json on restart, but the saved config still carried the
+// PACK's model — and ApplyPack re-reconciles from the pack on every restart.
+// For managed agents the per-agent overlay replaces the hive.yaml entry on
+// every config load, so both persistent layers must receive the operator's
+// value and ownership marker for the choice to actually survive.
 func (s *Server) claimAgentFieldOwnership(name, model, backend string) {
 	if s.deps == nil || s.deps.Config == nil {
 		return
@@ -1526,6 +1674,14 @@ func (s *Server) claimAgentFieldOwnership(name, model, backend string) {
 		s.AddSystemAlert("agent-field-save-failed", "error",
 			"Could not save the model/method choice for "+name+" — it will revert on the next restart: "+err.Error())
 		return
+	}
+	if agentsDir := s.deps.Config.Data.AgentsDir; agentsDir != "" {
+		if err := config.SaveAgentFile(agentsDir, name, ac); err != nil {
+			s.deps.Logger.Error("failed to persist agent overlay after model/method choice", "agent", name, "error", err)
+			s.AddSystemAlert("agent-field-save-failed", "error",
+				"Could not save the model/method choice for "+name+" to its agent overlay — it will revert on the next config load: "+err.Error())
+			return
+		}
 	}
 	s.ClearSystemAlert("agent-field-save-failed")
 }
@@ -3576,8 +3732,16 @@ func (s *Server) handleAgentConfigCadences(w http.ResponseWriter, r *http.Reques
 		s.logger.Error("failed to persist config after cadence update", "agent", name, "error", err)
 	}
 	s.auditFromRequest(r, "config_agent_cadences", auditDetail("section", "cadences"), name)
-	s.refreshAndPersist()
-	okResponse(w, map[string]string{"status": "updated", "agent": name})
+	// The rebuild kicked here is asynchronous, so the browser's post-save
+	// GET /api/status can be served the CACHED pre-mutation snapshot and
+	// repaint the OLD cadence — the operator then waits for a later broadcast
+	// to see their own write (#5492). minStatusSeq is the lowest StatusSeq
+	// guaranteed to reflect this mutation; the dashboard raises its
+	// stale-snapshot floor to it and drops anything built earlier (#4348).
+	floor := s.refreshAndPersistSeq()
+	// jsonResponse rather than okResponse: the latter is typed map[string]string
+	// and cannot carry the numeric floor. "ok" is preserved for callers.
+	jsonResponse(w, map[string]any{"ok": true, "status": "updated", "agent": name, "minStatusSeq": floor})
 }
 
 func (s *Server) handleAgentConfigModels(w http.ResponseWriter, r *http.Request) {
@@ -3793,6 +3957,13 @@ func (s *Server) handleAgentConfigChannels(w http.ResponseWriter, r *http.Reques
 	}
 	if err := decodeBody(r, &body); err != nil {
 		jsonError(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	// Fail fast on channel types with no trigger runtime (#5591): persisting
+	// them would validate a config that silently never kicks the agent.
+	if err := config.ValidateChannels(name, body.Channels); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -4169,33 +4340,6 @@ func (s *Server) buildExportYAML(name string, cfg config.AgentConfig, cadences m
 			b.WriteString(fmt.Sprintf("    - type: %s\n", ch.Type))
 			if ch.Enabled != nil {
 				b.WriteString(fmt.Sprintf("      enabled: %t\n", *ch.Enabled))
-			}
-			if len(ch.Events) > 0 {
-				b.WriteString("      events:\n")
-				for _, e := range ch.Events {
-					b.WriteString(fmt.Sprintf("        - %s\n", e))
-				}
-			}
-			if len(ch.Patterns) > 0 {
-				b.WriteString("      patterns:\n")
-				for _, p := range ch.Patterns {
-					b.WriteString(fmt.Sprintf("        - %q\n", p))
-				}
-			}
-			if ch.Schedule != "" {
-				b.WriteString(fmt.Sprintf("      schedule: %q\n", ch.Schedule))
-			}
-			if len(ch.Match) > 0 {
-				b.WriteString("      match:\n")
-				for k, v := range ch.Match {
-					b.WriteString(fmt.Sprintf("        %s: %q\n", k, v))
-				}
-			}
-			if len(ch.Repos) > 0 {
-				b.WriteString("      repos:\n")
-				for _, r := range ch.Repos {
-					b.WriteString(fmt.Sprintf("        - %s\n", r))
-				}
 			}
 		}
 	}
@@ -4824,6 +4968,15 @@ func (s *Server) handleGovernorBudget(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.CriticalPct != nil {
 		criticalPct = *body.CriticalPct
+	}
+
+	// The sanity floor judges only what THIS request supplied, so a spoke
+	// already storing a below-floor limit can still edit its other budget
+	// fields (#5508). Checked before the range validation so the operator is
+	// told about the unit mistake first.
+	if err := validateSuppliedBudgetFloor(body.TotalTokens); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
 	if err := validateGovernorBudget(totalTokens, periodDays, criticalPct); err != nil {
@@ -6751,14 +6904,14 @@ func (s *Server) handleBackends(w http.ResponseWriter, r *http.Request) {
 	litellmModels := s.queryInferenceModels("litellm")
 
 	// CLI backends each have a DIFFERENT discovery source (see cli_models.go):
-	// copilot → per-account Copilot /models, gemini → generativelanguage
-	// /v1beta/models, claude → maintained static list (no API exists), goose →
-	// configured provider's static list. Every probe is best-effort and falls
-	// back to a current static list, so a dropdown is never empty.
+	// provider HTTP APIs, vendor CLI protocols/subcommands, or a deliberately
+	// authoritative single option. Every probe is best-effort and falls back to
+	// a current static list, so a dropdown is never empty.
 	claudeCLI := s.queryCLIModels("claude")
 	copilotCLI := s.queryCLIModels("copilot")
 	geminiCLI := s.queryCLIModels("gemini")
 	gooseCLI := s.queryCLIModels("goose")
+	agyCLI := s.queryCLIModels(agyBackendID)
 	// bob has no discovery source and no usable --model flag: it selects its
 	// own model. Served explicitly so the client never falls through to the
 	// copilot catalog and offers models bob cannot honor (see bobStaticModels).
@@ -6770,6 +6923,7 @@ func (s *Server) handleBackends(w http.ResponseWriter, r *http.Request) {
 		{"id": bobBackendID, "name": "bob (IBM bobshell)", "models": bobCLI.models, "fallback": bobCLI.fallback},
 		{"id": "gemini", "name": "Gemini", "models": geminiCLI.models, "fallback": geminiCLI.fallback},
 		{"id": "goose", "name": "Goose", "models": gooseCLI.models, "fallback": gooseCLI.fallback},
+		{"id": agyBackendID, "name": "Google Antigravity (agy)", "models": agyCLI.models, "fallback": agyCLI.fallback},
 		{"id": "vllm", "name": "vLLM (self-hosted)", "models": vllmModels, "inference": true},
 		{"id": "llm-d", "name": "llm-d (self-hosted)", "models": llmdModels, "inference": true},
 		{"id": "litellm", "name": "LiteLLM (proxy)", "models": litellmModels, "inference": true},

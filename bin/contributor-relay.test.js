@@ -26,7 +26,7 @@ const RELAY_PATH = path.join(__dirname, 'contributor-relay.sh');
 // bash and no WebSocket are ever touched.
 // ---------------------------------------------------------------------------
 
-function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '--allow-all', model = '', reasoningEffort = '', cliStates = ['ready'], procAlive = true, mode = 'interactive', execFileResult = null, statusFile = null, paneText = null, env = null, cliVersion = null, attachedClients = false } = {}) {
+function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '--allow-all', model = '', reasoningEffort = '', cliStates = ['ready'], procAlive = true, mode = 'interactive', execFileResult = null, statusFile = null, paneText = null, env = null, cliVersion = null, attachedClients = false, attachedIdleMs = 0, clientActivityRaw = null, listClientsThrows = false } = {}) {
   const commands = [];
   const sent = [];
   // Records every execFile (headless one-shot) invocation: { bin, args, opts }.
@@ -36,8 +36,19 @@ function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '-
   // Guard against a runaway loop in the code under test eating all memory.
   const MAX_RECORDED_COMMANDS = 10000;
 
+  // #5281: lets a test model a tmux send that fails, so the one-shot budget's
+  // behaviour on a throwing send is pinned rather than assumed.
+  let failNextLiteralSend = false;
+
   const fakeExecSync = (cmd) => {
     if (commands.length < MAX_RECORDED_COMMANDS) commands.push(cmd);
+    // Recorded BEFORE throwing: a test needs to see that the send was
+    // ATTEMPTED, which is the difference between "spent the budget" and
+    // "retried every tick".
+    if (failNextLiteralSend && /send-keys\b.*\s-l\s/.test(cmd)) {
+      failNextLiteralSend = false;
+      throw new Error('tmux: server exited unexpectedly');
+    }
     // backendBinary lets a test model backends.conf mapping a backend NAME to a
     // different BINARY (litellm → claude); it defaults to the identity mapping
     // every other backend has.
@@ -61,7 +72,16 @@ function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '-
     if (/list-clients/.test(cmd)) {
       // #5094: the relay asks whether a human is attached before it types a
       // retry into the pane. An empty answer means nobody is watching.
-      return attachedClients ? '/dev/pts/3: 0 [200x50 xterm-256color] (utf8)\n' : '';
+      //
+      // #5277: the question is now "has anyone typed recently", asked as
+      // `-F '#{client_activity}'`, so the stub answers in tmux's own currency —
+      // epoch SECONDS of last input. attachedIdleMs defaults to 0, i.e. a
+      // client that just typed, which is what every pre-#5277 test meant by
+      // `attachedClients: true`.
+      if (listClientsThrows) throw new Error('tmux: no server running');
+      if (!attachedClients) return '';
+      if (clientActivityRaw !== null) return clientActivityRaw;
+      return `${Math.floor((Date.now() - attachedIdleMs) / 1000)}\n`;
     }
     if (/display-message/.test(cmd)) {
       // The relay asks the PANE what it is running (pane_current_command).
@@ -176,6 +196,7 @@ function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '-
   const ws = new stubs.ws();
   relay.setWs(ws);
   relay.__commands = commands;
+  relay.__failNextNudge = () => { failNextLiteralSend = true; };
   relay.__sent = sent;
   relay.__tmpDir = tmpDir;
   relay.__execFileCalls = execFileCalls;
@@ -196,6 +217,19 @@ function loadRelay({ backend = 'copilot', backendBinary = null, backendPerm = '-
 function teardown(relay) {
   try { relay.cleanup(); } catch (_) {}
   try { fs.rmSync(relay.__tmpDir, { recursive: true, force: true }); } catch (_) {}
+}
+
+// Drive a full chrome-idle grace window (kubestellar/hive#5376).
+//
+// A pane that merely LOOKS idle no longer completes a task on the first tick:
+// classifyTmuxPane was demoted to liveness, and chrome alone must hold idle for
+// CHROME_IDLE_GRACE_TICKS consecutive ticks before it may conclude anything. A
+// test that wants the fallback completion therefore has to tick that many
+// times. Tests exercising the SENTINEL path do not need this — that is the
+// whole point of the sentinel, and several tests below assert exactly that by
+// completing in one tick.
+function graceTicks(relay, tick) {
+  for (let i = 0; i < relay.CHROME_IDLE_GRACE_TICKS; i++) tick();
 }
 
 const tests = [];
@@ -516,10 +550,14 @@ test('agy Gemini idle pane reports its visible PR as task_complete', () => {
   const relay = loadRelay({ backend: 'agy', paneText: AGY_GEMINI_IDLE_PANE });
   try {
     assignTask(relay, 'ct-agy-gemini-idle');
-    relay.__crashTick();
+    // #5376: this pane carries no HIVE_VERDICT line, so it completes on the
+    // chrome-idle FALLBACK — after the grace window, not on the first tick.
+    graceTicks(relay, () => relay.__crashTick());
     const complete = relay.__sent.find(m => m.type === 'task_complete');
     assert.ok(complete, 'the live agy/Gemini pane shape must complete the task');
     assert.strictEqual(complete.pr_url, 'https://github.com/foo/bar/pull/9');
+    assert.strictEqual(complete.completion_signal, 'chrome_idle',
+      'a completion inferred from chrome must be labelled as such');
   } finally { teardown(relay); }
 });
 
@@ -706,8 +744,17 @@ test('a pane that reaches real IDLE_COMPLETE between stall ticks is reported as 
     assert.strictEqual(relay.getStallConfirmCount(), 1);
     // The slow network call the pane was blocked on finally returns.
     capture = 'Pull request opened: foo/bar#4061 https://github.com/foo/bar/pull/4061\n? for shortcuts';
-    relay.__agePaneStallClock(relay.PANE_STALL_TIMEOUT_MS + 1);
-    relay.__stallTick();
+    // #5376: no HIVE_VERDICT line in this capture, so it takes the chrome-idle
+    // fallback and needs the grace window. The stall clock is aged past its
+    // timeout on every one of those ticks DELIBERATELY: an idle pane is
+    // byte-identical frame to frame, so if the grace window let the stall
+    // backstop keep running underneath it, this shipped PR would be handed back
+    // as an `environment` failure — the #4127 shape, reintroduced. The
+    // IDLE_COMPLETE branch must own the pane for the whole window.
+    graceTicks(relay, () => {
+      relay.__agePaneStallClock(relay.PANE_STALL_TIMEOUT_MS + 1);
+      relay.__stallTick();
+    });
     const completed = relay.__sent.filter(m => m.type === 'task_complete');
     assert.strictEqual(completed.length, 1,
       `late completion must be reported as completed, not failed: ${JSON.stringify(relay.__sent.map(m => m.type))}`);
@@ -1564,6 +1611,11 @@ test('blocked interactive panes report attention instead of task_complete', () =
   try {
     relay.setCliReady(true);
     assignTask(relay, 'ct-blocked');
+    // #5281: an unattended question now gets ONE autonomy reminder first. The
+    // guarantee this test exists for is unchanged and asserted below -- never a
+    // completion, task stays active -- but it is now the SECOND tick that
+    // reports it, once the one-shot budget is spent.
+    relay.__crashTick();
     relay.__crashTick();
 
     assert.ok(!relay.__sent.some(m => m.type === 'task_complete'),
@@ -1584,6 +1636,10 @@ test('goose elicitation form is reported as blocked, never as task_complete (#28
   try {
     relay.setCliReady(true);
     assignTask(relay, 'ct-elicit');
+    // #5281: one autonomy reminder first (a form is a question), then today's
+    // report from the second tick on. The never-a-completion guarantee below is
+    // what this test is for and is unchanged.
+    relay.__crashTick();
     relay.__crashTick();
 
     assert.ok(!relay.__sent.some(m => m.type === 'task_complete'),
@@ -1592,6 +1648,275 @@ test('goose elicitation form is reported as blocked, never as task_complete (#28
     assert.ok(progress, `expected blocked_on_human progress, got: ${JSON.stringify(relay.__sent)}`);
     assert.strictEqual(progress.attention, true, 'blocked status must request human attention');
     assert.ok(relay.getCurrentTask(), 'the task must remain active while the form is unanswered');
+  } finally { teardown(relay); }
+});
+
+// ---------------------------------------------------------------------------
+// kubestellar/hive#5281 — an unattended agent that stops to ask a question gets
+// one reminder to proceed on its own.
+//
+// Detection without recovery was the gap: the relay already SAW the question
+// and raised `attention`, but an attention flag only helps someone watching,
+// and a contributor run by a user who never attaches to tmux is a supported way
+// to run one. For that user every question cost 20-30 minutes and a failed
+// task, even though the task prompt had already told the agent to decide for
+// itself.
+//
+// The dangerous half is telling a question apart from a prompt only a person
+// can answer. Typing "proceed autonomously" into a /login flow, or submitting
+// it as a password, is worse than waiting — so those panes are vetoed, and the
+// veto is asked of the whole recent window rather than just the cursor line.
+// ---------------------------------------------------------------------------
+
+const QUESTION_PANE = 'Should I open a pull request for this change?\n> \n';
+
+function nudges(relay, from = 0) {
+  return relay.__tmuxSends().slice(from).filter(c => c.includes(relay.AUTONOMY_NUDGE_MESSAGE));
+}
+
+test('#5281 an unattended question gets exactly one autonomy reminder', () => {
+  const relay = loadRelay({ backend: 'goose', cliStates: [QUESTION_PANE, QUESTION_PANE], attachedClients: false });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-question');
+    const before = relay.__tmuxSends().length;
+
+    relay.__crashTick();
+    assert.strictEqual(nudges(relay, before).length, 1, 'the first tick reminds it to proceed');
+    assert.strictEqual(relay.__sent.filter(m => m.status === 'blocked_on_human').length, 0,
+      'nobody is attached to be blocked on, so the first tick does not raise attention');
+
+    relay.__crashTick();
+    assert.strictEqual(nudges(relay, before).length, 1,
+      'a question re-asked after the reminder is one the agent cannot answer — do not loop');
+    const blocked = relay.__sent.filter(m => m.status === 'blocked_on_human');
+    assert.strictEqual(blocked.length, 1, 'from the second tick on, behaviour is exactly today\'s');
+    assert.strictEqual(blocked[0].attention, true);
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 0,
+      'a blocked pane must never be booked as a completion, nudged or not');
+    assert.ok(relay.getCurrentTask(), 'the task stays active');
+  } finally { teardown(relay); }
+});
+
+test('#5281 the budget is per task, not per process', () => {
+  // Driven through the REAL lifecycle — ask, finish, get assigned again —
+  // rather than by calling the reset directly, so that a change which dropped
+  // resetAutonomyNudgeState() from the task-start path would fail here.
+  const DONE_PANE = [
+    '● Done — opened https://github.com/kubestellar/hive/pull/9999',
+    '',
+    '✻ Cogitated for 3m 30s',
+    '',
+    '❯ ',
+    '  ⏵⏵ auto mode on (shift+tab to cycle)',
+  ].join('\n');
+  let pane = QUESTION_PANE;
+  const relay = loadRelay({ backend: 'claude', paneText: () => pane, attachedClients: false });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-first');
+    const before = relay.__tmuxSends().length;
+    relay.__crashTick();
+    relay.__crashTick();
+    assert.strictEqual(nudges(relay, before).length, 1, 'one reminder for the first task');
+
+    pane = DONE_PANE;
+    // #5376: DONE_PANE is chrome only — no HIVE_VERDICT line — so it takes the
+    // grace-window fallback rather than completing on the first tick.
+    graceTicks(relay, () => relay.__crashTick());
+    assert.ok(!relay.getCurrentTask(), 'the first task should have completed');
+
+    // A fresh task must get its own reminder — a previous task's spent budget
+    // denying this one is the same bug #5094 fixed for the retry budget.
+    pane = QUESTION_PANE;
+    assignTask(relay, 't-second');
+    const mid = relay.__tmuxSends().length;
+    relay.__crashTick();
+    assert.strictEqual(nudges(relay, mid).length, 1, 'the next task gets its own one-shot');
+  } finally { teardown(relay); }
+});
+
+test('#5281 an attached pane is never nudged', () => {
+  const relay = loadRelay({ backend: 'goose', cliStates: [QUESTION_PANE, QUESTION_PANE], attachedClients: true });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-attached-question');
+    const before = relay.__tmuxSends().length;
+    relay.__crashTick();
+    assert.strictEqual(nudges(relay, before).length, 0,
+      'someone is there to answer — do not type over them');
+    const blocked = relay.__sent.filter(m => m.status === 'blocked_on_human');
+    assert.strictEqual(blocked.length, 1, 'and the attention report is unchanged');
+    assert.strictEqual(blocked[0].attention, true);
+  } finally { teardown(relay); }
+});
+
+test('#5281 a login pane is never nudged, even when it is phrased as a question', () => {
+  // #4400: only a human can log in, so typing the reminder here would put the
+  // literal string into a /login flow.
+  //
+  // The second case is the one that makes the explicit login veto load-bearing
+  // rather than decorative. A bare 401 pane is already not a question, so the
+  // reason classifier alone would refuse it; a 401 whose next line ASKS
+  // something classifies as a perfectly ordinary question, and only the
+  // paneShowsLoginRequiredError check stops it being nudged.
+  const cases = {
+    'bare 401': '● Please run /login · API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired"}}\n\n❯ \n',
+    '401 phrased as a question': [
+      '● Please run /login · API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired"}}',
+      'Would you like to log in now?',
+      '❯ ',
+    ].join('\n'),
+  };
+  for (const [name, loginPane] of Object.entries(cases)) {
+    const relay = loadRelay({ backend: 'claude', paneText: loginPane, attachedClients: false });
+    try {
+      assert.strictEqual(relay.classifyTmuxPane(loginPane), relay.PANE_STATE_BLOCKED_ON_HUMAN, name);
+      relay.setCliReady(true);
+      assignTask(relay, `t-login-${name.replace(/\W+/g, '-')}`);
+      const before = relay.__tmuxSends().length;
+      relay.__crashTick();
+      assert.strictEqual(nudges(relay, before).length, 0, `${name} must never be nudged`);
+      assert.strictEqual(relay.__sent.filter(m => m.status === 'blocked_on_human').length, 1, name);
+    } finally { teardown(relay); }
+  }
+});
+
+test('#5281 human-required prompts are never nudged', () => {
+  // Each of these is a pane where typing prose is actively harmful: it would be
+  // submitted as a credential, or would answer a trust/permission decision the
+  // agent is not entitled to make.
+  const panes = {
+    'credential entry': 'Paste your API key to continue:\n> \n',
+    'folder trust': 'Do you trust this folder?\n> \n',
+    'permission prompt': 'Allow Claude to run this command?\n> \n',
+    'consent': 'This action requires your approval before continuing.\n> \n',
+  };
+  for (const [name, pane] of Object.entries(panes)) {
+    const relay = loadRelay({ backend: 'goose', cliStates: [pane, pane], attachedClients: false });
+    try {
+      assert.strictEqual(relay.classifyBlockedOnHumanReason(pane), relay.BLOCKED_REASON_HUMAN_REQUIRED,
+        `${name} must classify as human-required`);
+      relay.setCliReady(true);
+      assignTask(relay, `t-${name.replace(/\s+/g, '-')}`);
+      const before = relay.__tmuxSends().length;
+      relay.__crashTick();
+      assert.strictEqual(nudges(relay, before).length, 0, `${name} must never be nudged`);
+      assert.strictEqual(relay.__sent.filter(m => m.status === 'blocked_on_human').length, 1,
+        `${name} must still report blocked_on_human`);
+    } finally { teardown(relay); }
+  }
+});
+
+test('#5281 the human-required veto beats a trailing question mark anywhere in the window', () => {
+  // The precedence rule, and the reason the veto reads the whole recent window:
+  // a trust dialog renders its heading a few lines up while the cursor line is
+  // an innocent-looking question. Classifying on the cursor line alone would
+  // nudge it.
+  const pane = [
+    'Confirm folder trust',
+    'This folder has not been opened before.',
+    '',
+    'Do you want to proceed?',
+    '> ',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'goose', cliStates: [pane, pane], attachedClients: false });
+  try {
+    assert.strictEqual(relay.classifyBlockedOnHumanReason(pane), relay.BLOCKED_REASON_HUMAN_REQUIRED,
+      'when in doubt, human-required — waiting is cheaper than a wrong answer');
+    relay.setCliReady(true);
+    assignTask(relay, 't-trust-question');
+    const before = relay.__tmuxSends().length;
+    relay.__crashTick();
+    assert.strictEqual(nudges(relay, before).length, 0);
+  } finally { teardown(relay); }
+});
+
+test('#5281 a numbered menu is left in today\'s behaviour, deliberately', () => {
+  // Pinned rather than implemented: a menu TUI may read typed text as a
+  // selection filter rather than as chat input, so nudging one needs Escape
+  // handling this version does not attempt. If that changes, this test is the
+  // thing that should be rewritten, not deleted.
+  // Worded to match the shipping hasNumberedMenu detector: a choose/select
+  // lead-in, a menu-shaped line above the prompt, and two or more numbered
+  // options.
+  const menuPane = [
+    'Please choose how to continue:',
+    '',
+    '❯ 1. Rebase onto main',
+    '  2. Merge main in',
+    '  3. Leave it alone',
+    '',
+    '> ',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'goose', cliStates: [menuPane, menuPane], attachedClients: false });
+  try {
+    assert.strictEqual(relay.classifyBlockedOnHumanReason(menuPane), relay.BLOCKED_REASON_MENU);
+    relay.setCliReady(true);
+    assignTask(relay, 't-menu');
+    const before = relay.__tmuxSends().length;
+    relay.__crashTick();
+    assert.strictEqual(nudges(relay, before).length, 0, 'menus are out of scope for the nudge');
+    assert.strictEqual(relay.__sent.filter(m => m.status === 'blocked_on_human').length, 1,
+      'and they keep reporting exactly as they do today');
+  } finally { teardown(relay); }
+});
+
+test('#5281 an elicitation form and a y/N both count as questions', () => {
+  const cases = {
+    'elicitation form': 'Extension needs some information to proceed:\n\n  Project name: my-service\n  Region:       us-east-1\n\n> Enter to send\n',
+    'y/N confirmation': 'Overwrite the existing branch? [y/N]\n> \n',
+  };
+  for (const [name, pane] of Object.entries(cases)) {
+    const relay = loadRelay({ backend: 'goose', cliStates: [pane, pane], attachedClients: false });
+    try {
+      assert.strictEqual(relay.classifyBlockedOnHumanReason(pane), relay.BLOCKED_REASON_QUESTION, name);
+      relay.setCliReady(true);
+      assignTask(relay, `t-${name.replace(/\W+/g, '-')}`);
+      const before = relay.__tmuxSends().length;
+      relay.__crashTick();
+      assert.strictEqual(nudges(relay, before).length, 1, `${name} should be nudged`);
+    } finally { teardown(relay); }
+  }
+});
+
+test('#5281 an unblocked pane classifies as no reason at all', () => {
+  const relay = loadRelay({ backend: 'goose' });
+  try {
+    assert.strictEqual(relay.classifyBlockedOnHumanReason('Done — opened a PR.\n> \n'), null);
+    assert.strictEqual(relay.classifyBlockedOnHumanReason(''), null);
+  } finally { teardown(relay); }
+});
+
+test('#5281 the reminder carries no shell metacharacters', () => {
+  // tmuxSendNudge interpolates this into a single-quoted `send-keys -l '...'`.
+  // A quote or a metacharacter here would be a command-injection shaped bug,
+  // not a typo, so the constraint is pinned rather than trusted.
+  const relay = loadRelay({ backend: 'goose' });
+  try {
+    assert.match(relay.AUTONOMY_NUDGE_MESSAGE, /^[A-Za-z0-9 ,.]+$/,
+      `the nudge text must stay trivially quotable, got: ${relay.AUTONOMY_NUDGE_MESSAGE}`);
+  } finally { teardown(relay); }
+});
+
+test('#5281 a failed send still spends the budget', () => {
+  // A send that throws has already disturbed the pane. Retrying it every tick
+  // is the loop the one-shot budget exists to prevent.
+  const relay = loadRelay({ backend: 'goose', cliStates: [QUESTION_PANE, QUESTION_PANE], attachedClients: false });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-send-fails');
+    const origWarn = console.error;
+    console.error = () => {};
+    try {
+      relay.__failNextNudge();
+      relay.__crashTick();
+      relay.__crashTick();
+    } finally { console.error = origWarn; }
+    assert.strictEqual(nudges(relay).length, 1,
+      'the send was attempted exactly once and not retried on the next tick');
+    assert.strictEqual(relay.__sent.filter(m => m.status === 'blocked_on_human').length, 2,
+      'both ticks fell through to today\'s report');
   } finally { teardown(relay); }
 });
 
@@ -1937,7 +2262,9 @@ test('buildHeadlessArgv maps each supported backend to its one-shot invocation',
     { backend: 'claude', tail: ['-p', PROMPT] },
     { backend: 'litellm', tail: ['-p', PROMPT] },
     { backend: 'copilot', tail: ['-p', PROMPT] },
-    { backend: 'codex', tail: ['exec', PROMPT] },
+    // --skip-git-repo-check: codex exec refuses a non-git cwd outright, and
+    // the task workspace root is not a repo until the agent clones into it.
+    { backend: 'codex', tail: ['exec', '--skip-git-repo-check', PROMPT] },
     // goose needs its `run` sub-command AND -t (whose VALUE is the prompt) —
     // two leading tokens, unlike every other entry (#2828).
     { backend: 'goose', tail: ['run', '--no-session', '-t', PROMPT] },
@@ -2024,7 +2351,7 @@ test('codex headless transports model and reasoning effort without affecting oth
     assert.ok(a.args.includes('gpt-5.6-luna'), `codex must receive the configured model: ${JSON.stringify(a.args)}`);
     assert.ok(a.args.includes('-c'), `codex must receive a config override: ${JSON.stringify(a.args)}`);
     assert.ok(a.args.includes('model_reasoning_effort="low"'), `codex must receive the configured effort: ${JSON.stringify(a.args)}`);
-    assert.deepStrictEqual(a.args.slice(-2), ['exec', 'review this'],
+    assert.deepStrictEqual(a.args.slice(-3), ['exec', '--skip-git-repo-check', 'review this'],
       'codex one-shot mode and prompt must remain at the tail');
   } finally { teardown(relay); }
 
@@ -3129,9 +3456,37 @@ test('#4267 redactTokens scrubs every GitHub token prefix', () => {
   try {
     for (const prefix of ['gho_', 'ghp_', 'ghs_', 'ghu_', 'ghr_', 'github_pat_']) {
       const out = relay.redactTokens(`token=${prefix}${TOKEN_BODY} end`);
-      assert.strictEqual(out, `token=${prefix}***REDACTED*** end`,
+      assert.strictEqual(out, 'token=[REDACTED] end',
         `${prefix} token must be redacted, got: ${out}`);
     }
+  } finally { teardown(relay); }
+});
+
+test('#5478 redactTokens matches the Go scrubber credential categories', () => {
+  const relay = loadRelay({});
+  const jwt = `eyJ${'a'.repeat(20)}.${'b'.repeat(20)}.${'c'.repeat(20)}`;
+  const cases = [
+    ['JWT', jwt],
+    ['AKIA access key', 'AKIA1234567890ABCDEF'],
+    ['ASIA access key', 'ASIA1234567890ABCDEF'],
+    ['Bearer value', 'Bearer abcdefghijklmnop'],
+    ['canary', `HIVE-CANARY-${'0123456789abcdef'.repeat(3)}`],
+    ['PEM key', '-----BEGIN RSA PRIVATE KEY-----\nkey-data\n-----END RSA PRIVATE KEY-----'],
+    ['encrypted PEM key', '-----BEGIN ENCRYPTED PRIVATE KEY-----\nkey-data\n-----END ENCRYPTED PRIVATE KEY-----'],
+    ['PGP key', '-----BEGIN PGP PRIVATE KEY BLOCK-----\nkey-data\n-----END PGP PRIVATE KEY BLOCK-----'],
+  ];
+  try {
+    for (const [name, secret] of cases) {
+      assert.strictEqual(relay.redactTokens(`secret=${secret} end`), 'secret=[REDACTED] end',
+        `${name} must use the shared placeholder`);
+    }
+  } finally { teardown(relay); }
+});
+
+test('#5478 redactTokens scrubs short and underscore-bearing GitHub token bodies', () => {
+  const relay = loadRelay({});
+  try {
+    assert.strictEqual(relay.redactTokens('token=gho_ab_cdEF1234 end'), 'token=[REDACTED] end');
   } finally { teardown(relay); }
 });
 
@@ -3139,9 +3494,9 @@ test('#4267 redactTokens scrubs tokens embedded in JSON and URLs', () => {
   const relay = loadRelay({});
   try {
     const json = `{"auth":"gho_${TOKEN_BODY}","other":1}`;
-    assert.strictEqual(relay.redactTokens(json), `{"auth":"gho_***REDACTED***","other":1}`);
+    assert.strictEqual(relay.redactTokens(json), `{"auth":"[REDACTED]","other":1}`);
     const url = `https://x-access-token:ghs_${TOKEN_BODY}@github.com/o/r.git`;
-    assert.strictEqual(relay.redactTokens(url), 'https://x-access-token:ghs_***REDACTED***@github.com/o/r.git');
+    assert.strictEqual(relay.redactTokens(url), 'https://x-access-token:[REDACTED]@github.com/o/r.git');
   } finally { teardown(relay); }
 });
 
@@ -3150,7 +3505,7 @@ test('#4267 redactTokens scrubs multiple tokens in one string', () => {
   try {
     const out = relay.redactTokens(`a gho_${TOKEN_BODY} b ghp_${TOKEN_BODY} c gho_${TOKEN_BODY}`);
     assert.ok(!out.includes(TOKEN_BODY), `a token body survived: ${out}`);
-    assert.strictEqual((out.match(/\*\*\*REDACTED\*\*\*/g) || []).length, 3);
+    assert.strictEqual((out.match(/\[REDACTED\]/g) || []).length, 3);
   } finally { teardown(relay); }
 });
 
@@ -3171,7 +3526,7 @@ test('#4267 redactTokens scrubs the WHOLE body of a longer-than-36-char token', 
   try {
     const long = TOKEN_BODY + 'Zz19';
     const out = relay.redactTokens(`log: gho_${long}.`);
-    assert.strictEqual(out, 'log: gho_***REDACTED***.',
+    assert.strictEqual(out, 'log: [REDACTED].',
       `tail of a long token leaked: ${out}`);
   } finally { teardown(relay); }
 });
@@ -3181,6 +3536,21 @@ test('#4267 redactTokens redacts a token even when glued to a preceding word', (
   try {
     const out = relay.redactTokens(`x=Xgho_${TOKEN_BODY}`);
     assert.ok(!out.includes(TOKEN_BODY), `boundary-glued token leaked: ${out}`);
+    assert.strictEqual(out, 'x=X[REDACTED]');
+  } finally { teardown(relay); }
+});
+
+test('#5478 captureTmuxLines scrubs multiline private keys before splitting the pane', () => {
+  const paneText = [
+    'before',
+    '-----BEGIN PRIVATE KEY-----',
+    'sensitive-pane-key-material',
+    '-----END PRIVATE KEY-----',
+    'after',
+  ].join('\n');
+  const relay = loadRelay({ paneText });
+  try {
+    assert.deepStrictEqual(relay.captureTmuxLines(20), ['before', '[REDACTED]', 'after']);
   } finally { teardown(relay); }
 });
 
@@ -3323,6 +3693,13 @@ test('#4267 detectNoWorkVerdict extracts the verdict and reason', () => {
     // Codex bullet chrome and indentation are presentation, not content.
     const b = relay.detectNoWorkVerdict(['  • HIVE_VERDICT: no_work_needed - gated on maintainer decision']);
     assert.strictEqual(b.reason, 'gated on maintainer decision');
+    // Claude Code renders assistant lines with ● (U+25CF), not codex's •
+    // (U+2022). The glyph was missing from the scanner until a live claude
+    // pane driven by bin/test_backend_smoke.sh showed the sentinel being
+    // printed and missed — every interactive claude completion degraded to
+    // the chrome_idle fallback.
+    const c = relay.detectNoWorkVerdict(['● HIVE_VERDICT: no_work_needed — backend smoke']);
+    assert.deepStrictEqual(c, { verdict: 'no_work_needed', reason: 'backend smoke' });
     // Case-insensitive, empty reason allowed.
     assert.strictEqual(relay.detectNoWorkVerdict(['hive_verdict: NO_WORK_NEEDED']).verdict, 'no_work_needed');
   } finally { teardown(relay); }
@@ -3867,7 +4244,8 @@ test('#5094 a completed turn whose summary mentions a quota phrase is still comp
     assert.strictEqual(relay.classifyTmuxPane(pane), relay.PANE_STATE_IDLE_COMPLETE);
     relay.setCliReady(true);
     assignTask(relay, 't-prose');
-    relay.__crashTick();
+    // #5376: chrome-only completion, so it needs the grace window.
+    graceTicks(relay, () => relay.__crashTick());
     assert.strictEqual(relay.__sent.filter(m => m.type === 'task_failed').length, 0,
       'a completed turn must not be failed over a quota phrase in its own prose');
     assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 1);
@@ -3933,6 +4311,201 @@ test('#5094 with a human attached the relay asks for attention instead of typing
     assert.strictEqual(blocked.length, 1, 'the human should be told the agent needs them');
     assert.strictEqual(blocked[0].attention, true);
     assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 0);
+  } finally { teardown(relay); }
+});
+
+
+// ---------------------------------------------------------------------------
+// kubestellar/hive#5277 — "a client is attached" is not "a human is here".
+//
+// The #5094 guard above is right to refuse to type over someone, but it tested
+// connection rather than presence. bin/ttyd-tmux.sh attaches a client with
+// `tmux attach-session`, and the dashboard's browser terminal proxies to it, so
+// a tab someone opened an hour ago and walked away from was indistinguishable
+// from a person mid-keystroke — and disabled API-error auto-retry for the whole
+// 30-minute task ceiling. Observed live: a contributor hit a connection-lost
+// error, no `try again` was ever typed, and a human hand-typed the recovery.
+//
+// The fix is a recency test on tmux's own `client_activity`. Everything the
+// guard used to protect is still protected; only the abandoned tab changes.
+// ---------------------------------------------------------------------------
+
+test('#5277 a dashboard tab left open no longer disables auto-retry', () => {
+  // The incident, exactly: attached the whole time, idle the whole time.
+  const relay = loadRelay({
+    backend: 'claude', paneText: CLAUDE_API_ERROR_PANE,
+    attachedClients: true, attachedIdleMs: 60 * 60 * 1000,
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-idle-tab');
+    const before = relay.__tmuxSends().length;
+    relay.__crashTick();
+    assert.ok(relay.__tmuxSends().slice(before).some(c => c.includes(relay.TRANSIENT_API_ERROR_NUDGE_MESSAGE)),
+      'an hour-idle client is a left-open tab, not a person — the retry must be typed');
+    assert.strictEqual(relay.__sent.filter(m => m.status === 'blocked_on_human').length, 0,
+      'nobody is there to be blocked on');
+    assert.strictEqual(relay.getTransientNudgeCount(), 1);
+  } finally { teardown(relay); }
+});
+
+test('#5277 a client that typed a moment ago still owns the pane', () => {
+  // The control. Without it the fix could pass by simply never checking.
+  const relay = loadRelay({
+    backend: 'claude', paneText: CLAUDE_API_ERROR_PANE,
+    attachedClients: true, attachedIdleMs: 30 * 1000,
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-active');
+    const before = relay.__tmuxSends().length;
+    relay.__crashTick();
+    assert.ok(!relay.__tmuxSends().slice(before).some(c => c.includes(relay.TRANSIENT_API_ERROR_NUDGE_MESSAGE)),
+      'someone who typed 30 seconds ago is still someone');
+    const blocked = relay.__sent.filter(m => m.status === 'blocked_on_human');
+    assert.strictEqual(blocked.length, 1, 'and they should be told the agent needs them');
+    assert.strictEqual(blocked[0].attention, true);
+  } finally { teardown(relay); }
+});
+
+test('#5277 presence is decided by the idle threshold, not by the connection', () => {
+  // Both sides of the boundary, read straight off the helper. The 5s margins
+  // clear the stub's whole-second quantisation.
+  const idle = (ms) => {
+    const relay = loadRelay({ backend: 'claude', attachedClients: true, attachedIdleMs: ms });
+    try { return relay.tmuxSessionHumanPresence(); } finally { teardown(relay); }
+  };
+  const threshold = loadRelay({ backend: 'claude' }).HUMAN_PRESENCE_IDLE_MS;
+
+  const justActive = idle(threshold - 5000);
+  assert.strictEqual(justActive.attached, true);
+  assert.strictEqual(justActive.active, true, 'just inside the threshold is still a person');
+
+  const justIdle = idle(threshold + 5000);
+  assert.strictEqual(justIdle.attached, true, 'the client is still connected');
+  assert.strictEqual(justIdle.active, false, 'but it is no longer evidence of a person');
+  assert.ok(justIdle.idleMs >= threshold, `idleMs ${justIdle.idleMs} should report the real age`);
+});
+
+test('#5277 the query asks tmux for client_activity, not just for a client list', () => {
+  // The whole fix rests on tmux being ASKED for the timestamp. A refactor that
+  // dropped the -F would leave every other test passing — the stub would answer
+  // with epoch seconds regardless — while the real tmux returned a pts line and
+  // silently restored the bug as "activity unknown, assume present".
+  const relay = loadRelay({ backend: 'claude', attachedClients: true });
+  try {
+    relay.tmuxSessionHumanPresence();
+    const query = relay.__commands.filter(c => /list-clients/.test(c)).pop();
+    assert.ok(query, 'the presence check must actually ask tmux');
+    assert.ok(query.includes('client_activity'),
+      `presence must be asked as a recency question, got: ${query}`);
+  } finally { teardown(relay); }
+});
+
+test('#5277 nobody attached reports neither attached nor active', () => {
+  const relay = loadRelay({ backend: 'claude', attachedClients: false });
+  try {
+    assert.deepStrictEqual(relay.tmuxSessionHumanPresence(), { attached: false, active: false, idleMs: null });
+  } finally { teardown(relay); }
+});
+
+test('#5277 a tmux failure still counts as someone present', () => {
+  // Fail closed, unchanged: not being able to ask must never license typing.
+  const relay = loadRelay({
+    backend: 'claude', paneText: CLAUDE_API_ERROR_PANE, listClientsThrows: true,
+  });
+  try {
+    assert.deepStrictEqual(relay.tmuxSessionHumanPresence(), { attached: true, active: true, idleMs: null });
+    relay.setCliReady(true);
+    assignTask(relay, 't-tmux-broken');
+    const before = relay.__tmuxSends().length;
+    relay.__crashTick();
+    assert.ok(!relay.__tmuxSends().slice(before).some(c => c.includes(relay.TRANSIENT_API_ERROR_NUDGE_MESSAGE)),
+      'a tmux hiccup must not be read as an empty room');
+    assert.strictEqual(relay.__sent.filter(m => m.status === 'blocked_on_human').length, 1);
+  } finally { teardown(relay); }
+});
+
+test('#5277 an activity value tmux did not give us counts as someone present', () => {
+  // An older tmux whose client_activity is not an epoch integer: attached is
+  // known, recency is not, so recency is assumed.
+  const relay = loadRelay({
+    backend: 'claude', paneText: CLAUDE_API_ERROR_PANE, attachedClients: true,
+    clientActivityRaw: '/dev/pts/3: 0 [200x50 xterm-256color] (utf8)\n',
+  });
+  try {
+    const presence = relay.tmuxSessionHumanPresence();
+    assert.strictEqual(presence.attached, true);
+    assert.strictEqual(presence.active, true);
+    assert.strictEqual(presence.idleMs, null, 'an unknown age must read as unknown, not as zero');
+    relay.setCliReady(true);
+    assignTask(relay, 't-unparseable');
+    const before = relay.__tmuxSends().length;
+    relay.__crashTick();
+    assert.ok(!relay.__tmuxSends().slice(before).some(c => c.includes(relay.TRANSIENT_API_ERROR_NUDGE_MESSAGE)));
+  } finally { teardown(relay); }
+});
+
+test('#5277 a client clock ahead of ours counts as someone present', () => {
+  // A future timestamp clamps to "just now" rather than wrapping to a huge
+  // idle age, which would hand the pane away on a clock skew.
+  const relay = loadRelay({ backend: 'claude', attachedClients: true, attachedIdleMs: -10 * 60 * 1000 });
+  try {
+    const presence = relay.tmuxSessionHumanPresence();
+    assert.strictEqual(presence.active, true, 'skew must not read as an abandoned tab');
+    assert.strictEqual(presence.idleMs, 0);
+  } finally { teardown(relay); }
+});
+
+test('#5277 the newest client decides — one active client protects the pane', () => {
+  // Two clients: a stale dashboard tab and a person who just typed. The person
+  // wins, so the tab cannot drag presence down to "nobody home".
+  const stale = Math.floor((Date.now() - 60 * 60 * 1000) / 1000);
+  const fresh = Math.floor(Date.now() / 1000);
+  const relay = loadRelay({
+    backend: 'claude', attachedClients: true,
+    clientActivityRaw: `${stale}\n${fresh}\n`,
+  });
+  try {
+    assert.strictEqual(relay.tmuxSessionHumanPresence().active, true);
+  } finally { teardown(relay); }
+});
+
+test('#5277 a suppressed nudge still consumes no retry budget', () => {
+  const relay = loadRelay({
+    backend: 'claude', paneText: CLAUDE_API_ERROR_PANE,
+    attachedClients: true, attachedIdleMs: 10 * 1000,
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-budget');
+    for (let i = 0; i < 5; i++) {
+      relay.__clearTransientNudgeCooldown();
+      relay.__crashTick();
+    }
+    assert.strictEqual(relay.getTransientNudgeCount(), 0,
+      'refusing to type must not spend a retry the agent never got');
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_failed').length, 0,
+      'and it must not exhaust the budget into a failure either');
+  } finally { teardown(relay); }
+});
+
+test('#5277 the idle-client retry is still bounded and still fails honestly', () => {
+  const relay = loadRelay({
+    backend: 'claude', paneText: CLAUDE_API_ERROR_PANE,
+    attachedClients: true, attachedIdleMs: 45 * 60 * 1000,
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-idle-bounded');
+    for (let i = 0; i <= relay.TRANSIENT_API_ERROR_MAX_NUDGES; i++) {
+      relay.__clearTransientNudgeCooldown();
+      relay.__crashTick();
+    }
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 0);
+    const failures = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failures.length, 1, 'an exhausted budget hands the task back exactly once');
+    assert.strictEqual(failures[0].failure_kind, 'environment');
   } finally { teardown(relay); }
 });
 
@@ -4132,6 +4705,1028 @@ test('#5145 the needs-authentication banner prints the resolved command', () => 
     assert.ok(!lines.some(l => /docker exec/.test(l)),
       `the banner still hardcodes a docker exec line; captured:\n${lines.join('\n')}`);
   } finally { teardown(relay); }
+});
+
+// --- #5321: the max-duration deadline bounds HANGS, not DURATION -----------
+//
+// The deadline used to be a flat wall-clock kill armed once per task and never
+// re-armed. Live on 2026-08-31 it killed an agent that had already committed
+// and pushed and was waiting on a green test suite; the hub booked the task
+// `failed` 57 seconds before that task's own PR (#5320) was opened. Any task
+// whose honest duration exceeded MAX_TASK_DURATION_MS was not slow, it was
+// impossible.
+//
+// These pin the corrected contract: output renews the lease, silence spends it,
+// an absolute backstop still terminates a truly wedged task, and neither
+// ceiling is booked as the agent's fault.
+
+test('#5321 the max-duration ceiling is a progress LEASE, not a wall-clock budget', () => {
+  // The structural claim, independent of any timing: the absolute ceiling must
+  // be strictly larger than the lease. If a regression collapses them back into
+  // one constant, "long but live" becomes unrepresentable again.
+  const relay = loadRelay({ backend: 'agy' });
+  try {
+    assert.ok(relay.ABSOLUTE_TASK_DEADLINE_MS > relay.MAX_TASK_DURATION_MS,
+      `the absolute backstop (${relay.ABSOLUTE_TASK_DEADLINE_MS}) must exceed the progress lease ` +
+      `(${relay.MAX_TASK_DURATION_MS}) — collapsing them restores the flat wall-clock kill`);
+    // And it must be far enough above the working range to be a backstop rather
+    // than a second deadline: a full test suite is the long pole this repo has.
+    assert.ok(relay.ABSOLUTE_TASK_DEADLINE_MS >= 2 * 60 * 60 * 1000,
+      'the absolute backstop must sit well above the honest working range');
+  } finally { teardown(relay); }
+});
+
+test('#5321 a task producing output past MAX_TASK_DURATION_MS is NOT failed', () => {
+  // The acceptance criterion, driven through the real tick loop: the pane keeps
+  // changing, the lease keeps being renewed, and the expiry callback — invoked
+  // directly, as the timer would — declines to kill a live agent.
+  let n = 0;
+  const relay = loadRelay({
+    backend: 'agy',
+    // A fresh line every capture: this is what "the agent is working" looks
+    // like. No idle prompt, so the pane never classifies as IDLE_COMPLETE.
+    paneText: () => `running the full test suite, still going, tick ${n++}`,
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-live');
+
+    // Simulate the task running well past the old 30-minute wall: many ticks,
+    // each producing new output, with the assignment clock aged accordingly.
+    for (let i = 0; i < 5; i++) {
+      relay.__stallTick();
+      relay.__ageTaskAssignedAt(relay.MAX_TASK_DURATION_MS / 2);
+      // Fire the deadline callback exactly as the timer would. On a live pane
+      // it must renew, not kill.
+      relay.onTaskProgressLeaseExpired();
+    }
+
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_failed').length, 0,
+      'a task whose pane keeps producing output must never be failed on duration — ' +
+      'this is the #5321 regression that booked a shipped PR as a failure');
+    assert.ok(relay.getCurrentTask(), 'the task must still be held');
+    assert.ok(relay.__sent.some(m => m.type === 'task_progress' && m.status === 'working'),
+      'and the relay must still be reporting it as working, so the hub renews its lease');
+  } finally { teardown(relay); }
+});
+
+test('#5321 a silent pane still spends the lease, and is blamed on the environment', () => {
+  const relay = loadRelay({
+    backend: 'agy',
+    paneText: 'a frozen pane with no idle prompt and nothing happening',
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-silent');
+    relay.__stallTick();               // records the fingerprint
+
+    // No new output since; age the pane clock past the lease window so the
+    // expiry callback sees genuine silence.
+    relay.__agePaneStallClock(relay.MAX_TASK_DURATION_MS + 1);
+    relay.onTaskProgressLeaseExpired();
+
+    const failures = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failures.length, 1, 'a pane silent for the whole lease window must be given back');
+    assert.strictEqual(failures[0].failure_kind, 'environment',
+      'a runtime ceiling is not the agent failing its work — #5321 defect 1 was that this ' +
+      'path passed no opts at all, so the kind was undefined');
+  } finally { teardown(relay); }
+});
+
+test('#5321 the absolute backstop terminates a task that never stops printing', () => {
+  // The case the lease deliberately does not cover: output forever (a retry
+  // loop redrawing a spinner is output) must not buy unbounded time.
+  let n = 0;
+  const relay = loadRelay({
+    backend: 'agy',
+    paneText: () => `spinning forever ${n++}`,
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-forever');
+    relay.__stallTick();
+
+    // Live pane, but past the absolute ceiling.
+    relay.__ageTaskAssignedAt(relay.ABSOLUTE_TASK_DEADLINE_MS + 1);
+    relay.onTaskProgressLeaseExpired();
+
+    const failures = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failures.length, 1,
+      'past the absolute deadline, forward progress must no longer renew the lease');
+    assert.strictEqual(failures[0].failure_kind, 'environment',
+      'the backstop firing is a statement about this runtime, not about the work');
+    assert.match(failures[0].reason, /absolute deadline/i,
+      `the reason must name the backstop, not the lease; got: ${failures[0].reason}`);
+  } finally { teardown(relay); }
+});
+
+test('#5321 paneChangedSince is a PURE read — it must not consume the stall clock', () => {
+  // Load-bearing: progressTick() calls paneChangedSince() first and
+  // paneStalled() (via paneStallConfirmed) later in the SAME tick. paneStalled()
+  // is destructive — it records the fingerprint. If paneChangedSince() also
+  // recorded, the stall detector would see an already-consumed change on every
+  // tick and could never accumulate a stall, silently disabling the hang
+  // detector this fix relies on to cover the case the wall used to.
+  const relay = loadRelay({ backend: 'agy' });
+  try {
+    relay.resetPaneStallClock();
+    // Nothing recorded yet: a fresh task has drawn nothing, which is not
+    // evidence of progress.
+    assert.strictEqual(relay.paneChangedSince(['first']), false,
+      'with no recorded fingerprint there is no change to report');
+
+    relay.paneStalled(['first']);      // records 'first'
+    assert.strictEqual(relay.paneChangedSince(['second']), true, 'new content is a change');
+    // Repeated reads must keep reporting the change — proof nothing was consumed.
+    assert.strictEqual(relay.paneChangedSince(['second']), true,
+      'paneChangedSince must be idempotent; a second read seeing false means it recorded');
+    assert.strictEqual(relay.paneChangedSince(['first']), false, 'identical content is not a change');
+    // An empty capture is a missing pane, and paneStalled() refuses to read it
+    // as a stall; symmetrically it must not be read as progress.
+    assert.strictEqual(relay.paneChangedSince([]), false,
+      'an empty capture must never be credited as forward progress');
+
+    // And the stall clock is still intact after all those reads.
+    relay.__agePaneStallClock(relay.PANE_STALL_TIMEOUT_MS + 1);
+    assert.strictEqual(relay.paneStalled(['first']), true,
+      'the stall detector must still trip — paneChangedSince did not disturb its clock');
+  } finally { teardown(relay); }
+});
+
+test('#5321 a genuinely hung agent is still terminated by the stall detector', () => {
+  // The other half of the acceptance criteria: relaxing the wall must not have
+  // relaxed the hang case. The stall detector fires at 20 minutes, sooner than
+  // the lease, and is unaffected by the new progress-credit call.
+  const relay = loadRelay({
+    backend: 'agy',
+    paneText: 'a frozen pane with no idle prompt and nothing happening',
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-hung');
+    relay.__stallTick();
+    for (let i = 0; i < relay.PANE_STALL_CONFIRM_TICKS; i++) {
+      relay.__agePaneStallClock(relay.PANE_STALL_TIMEOUT_MS + 1);
+      relay.__stallTick();
+    }
+    const failures = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failures.length, 1, 'a frozen pane must still be given back');
+    assert.match(failures[0].reason, /no pane activity/i,
+      `the stall detector, not the duration ceiling, must be the one to fire; got: ${failures[0].reason}`);
+  } finally { teardown(relay); }
+});
+
+test('#5321 the deadline timer is re-armed on progress, not left as a one-shot', () => {
+  // Mechanism-level: the original bug was a handle set once at :2501 and never
+  // re-set. Pin that a tick observing new output installs a NEW handle.
+  let n = 0;
+  const relay = loadRelay({
+    backend: 'agy',
+    paneText: () => `working ${n++}`,
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-rearm');
+    relay.__stallTick();                       // records the first fingerprint
+    const first = relay.getTaskTimeoutHandle();
+    assert.ok(first, 'a task must hold a deadline handle');
+    relay.__stallTick();                       // new output -> must re-arm
+    const second = relay.getTaskTimeoutHandle();
+    assert.ok(second, 'the deadline handle must still exist after a progress tick');
+    assert.notStrictEqual(second, first,
+      'a tick that observed new pane output must have re-armed the deadline — ' +
+      'an unchanged handle is the #5321 one-shot timer');
+  } finally { teardown(relay); }
+});
+
+test('#5321 a headless one-shot is no longer capped at the old 30-minute wall', () => {
+  // The headless path has no pane to scrape, so it cannot use the lease; it
+  // gets the absolute bound instead. Before the fix it aliased
+  // MAX_TASK_DURATION_MS and killed long-but-live runs for the same reason.
+  const relay = loadRelay({ backend: 'agy' });
+  try {
+    assert.strictEqual(relay.HEADLESS_TASK_TIMEOUT_MS, relay.ABSOLUTE_TASK_DEADLINE_MS,
+      'the headless ceiling must be the absolute backstop, not the progress lease');
+    assert.ok(relay.HEADLESS_TASK_TIMEOUT_MS > relay.MAX_TASK_DURATION_MS,
+      'a headless run must not be killed at the old wall-clock deadline');
+  } finally { teardown(relay); }
+});
+
+// ---------------------------------------------------------------------------
+// kubestellar/hive#5353 cause B — ending a task must stop the agent.
+//
+// Reporting task_complete or task_failed tells the hub to revoke the lease,
+// book a cooldown and offer the issue to somebody else. Before this, only five
+// of the twelve task-exit paths touched the pane, so the other seven left the
+// original agent running in the same pane on the same context with a live
+// repo-scoped token — and it would go on to open a PR against work the hub had
+// already reassigned.
+//
+// Every assertion below is on OBSERVABLE state: the token file is gone, and
+// the pane received the two Ctrl-Cs that actually exit a CLI followed by a
+// relaunch. None of them assert that a particular function was called.
+// ---------------------------------------------------------------------------
+
+// An IDLE_COMPLETE pane for copilot/claude — the ready chrome the classifier
+// matches, with no "esc cancel" working marker.
+const IDLE_PANE = '/ commands for help\n';
+
+// Plant a task-scoped token exactly where injectGhToken puts it, so a test can
+// watch it survive or not survive a task exit.
+function plantTaskToken(relay) {
+  fs.mkdirSync(path.dirname(relay.GH_TOKEN_CACHE), { recursive: true });
+  fs.writeFileSync(relay.GH_TOKEN_CACHE, 'gho_task_scoped_token', { mode: 0o600 });
+  assert.ok(fs.existsSync(relay.GH_TOKEN_CACHE), 'test setup: token cache was not planted');
+}
+
+// The two Ctrl-Cs that exit a live CLI, followed by the launch command. One
+// Ctrl-C only cancels a claude/codex/agy turn and leaves the CLI running, so
+// "stopped" means at least two, and they must PRECEDE the relaunch or the
+// launch command is typed into the CLI as a chat message (#2203).
+function assertAgentStopped(sends, backend) {
+  const launchIdx = sends.findIndex(c => new RegExp(backend).test(c));
+  assert.ok(launchIdx >= 0, `expected a relaunch of ${backend}: ${JSON.stringify(sends)}`);
+  const ctrlCs = sends.slice(0, launchIdx).filter(c => /C-c\s*$/.test(c)).length;
+  assert.ok(ctrlCs >= 2,
+    `a live CLI needs two Ctrl-Cs before the relaunch; saw ${ctrlCs} in ${JSON.stringify(sends)}`);
+}
+
+test('#5353 a reported completion stops the agent and drops its token', () => {
+  // The headline case. The pane reads idle, the relay books a completion, the
+  // hub reassigns the issue — and the agent that "finished" must not still be
+  // sitting in the pane with a valid credential.
+  // #5376: completion now comes from the agent's own sentinel rather than the
+  // idle chrome, so the pane carries one. What this test is about is unchanged:
+  // whatever ended the task, the agent must be stopped and its token gone.
+  const relay = loadRelay({ backend: 'copilot', paneText: `HIVE_VERDICT: complete — shipped it\n${IDLE_PANE}` });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-complete');
+    plantTaskToken(relay);
+    const before = relay.__tmuxSends().length;
+    relay.__stallTick();
+
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1, 'setup: expected exactly one completion');
+    assert.ok(!fs.existsSync(relay.GH_TOKEN_CACHE),
+      'a completed task left its repo-scoped GitHub token on disk, valid for the rest of wsTokenTTL');
+    assertAgentStopped(relay.__tmuxSends().slice(before), 'copilot');
+  } finally { teardown(relay); }
+});
+
+test('#5353 the completion report still carries the AGENT output, not the relaunch chrome', () => {
+  // Stopping the agent must not cost the evidence: tmux_output is captured
+  // before the quit, so the hub still sees the pane the verdict was read from
+  // (and detectPRURL still finds the PR the agent opened).
+  const relay = loadRelay({
+    backend: 'copilot',
+    paneText: 'Pull request opened: https://github.com/foo/bar/pull/909\n/ commands for help\nHIVE_VERDICT: complete — PR is open\n',
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-evidence');
+    relay.__stallTick();
+    const completed = relay.__sent.find(m => m.type === 'task_complete');
+    assert.ok(completed, 'expected a completion');
+    assert.strictEqual(completed.pr_url, 'https://github.com/foo/bar/pull/909',
+      'the PR the agent shipped must survive the stop');
+    assert.ok(completed.tmux_output.join('\n').includes('Pull request opened'),
+      `tmux_output must be the agent's pane, not launch chrome: ${JSON.stringify(completed.tmux_output)}`);
+  } finally { teardown(relay); }
+});
+
+test('#5353 a progress-lease expiry stops the agent and drops its token', () => {
+  // "No observed progress" is a verdict about a pane, not about a process. The
+  // CLI is still running and still authorized until something stops it.
+  const relay = loadRelay({ backend: 'agy', paneText: 'still chewing on it' });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-lease');
+    plantTaskToken(relay);
+    const before = relay.__tmuxSends().length;
+    relay.__agePaneStallClock(relay.MAX_TASK_DURATION_MS + 1);
+    relay.onTaskProgressLeaseExpired();
+
+    const failedMsgs = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failedMsgs.length, 1, `expected one failure: ${JSON.stringify(relay.__sent.map(m => m.type))}`);
+    assert.ok(!fs.existsSync(relay.GH_TOKEN_CACHE),
+      'a lease-expired task left its GitHub token on disk');
+    assertAgentStopped(relay.__tmuxSends().slice(before), 'agy');
+  } finally { teardown(relay); }
+});
+
+test('#5353 the absolute deadline stops the agent and drops its token', () => {
+  const relay = loadRelay({ backend: 'agy', paneText: 'printing forever' });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-deadline');
+    plantTaskToken(relay);
+    const before = relay.__tmuxSends().length;
+    relay.__ageTaskAssignedAt(relay.ABSOLUTE_TASK_DEADLINE_MS + 1);
+    relay.onTaskProgressLeaseExpired();
+
+    const failedMsgs = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failedMsgs.length, 1);
+    assert.match(failedMsgs[0].reason, /absolute deadline/);
+    assert.ok(!fs.existsSync(relay.GH_TOKEN_CACHE),
+      'a task killed at the absolute deadline left its GitHub token on disk');
+    assertAgentStopped(relay.__tmuxSends().slice(before), 'agy');
+  } finally { teardown(relay); }
+});
+
+test('#5353 a fatal API error stops the agent and drops its token', () => {
+  // An authorization refusal or exhausted quota ends the TASK. The CLI is
+  // still up, and on some backends will happily continue once the operator
+  // fixes the cause — on an issue the hub has already given to someone else.
+  const relay = loadRelay({
+    backend: 'claude',
+    paneText: 'API Error: 403 {"type":"error","error":{"type":"permission_error","message":"denied"}}\n',
+  });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-fatal');
+    plantTaskToken(relay);
+    const before = relay.__tmuxSends().length;
+    relay.__stallTick();
+
+    const failedMsgs = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failedMsgs.length, 1, `expected a fatal-API failure: ${JSON.stringify(relay.__sent.map(m => m.type))}`);
+    assert.ok(!fs.existsSync(relay.GH_TOKEN_CACHE),
+      'a fatally-failed task left its GitHub token on disk');
+    assertAgentStopped(relay.__tmuxSends().slice(before), 'claude');
+  } finally { teardown(relay); }
+});
+
+test('#5353 a task exit relaunches the CLI exactly once — no nested double launch', () => {
+  // quitLiveCLI + relaunch paths already existed; routing every exit through
+  // one helper must not stack a second launch on top of an in-flight one. The
+  // confirmed pane stall is the case that already stopped the CLI itself.
+  const relay = loadRelay({ backend: 'agy', paneText: 'a frozen pane, nothing happening' });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-once');
+    plantTaskToken(relay);
+    const before = relay.__tmuxSends().length;
+    relay.__stallTick();
+    relay.__agePaneStallClock(relay.PANE_STALL_TIMEOUT_MS + 1);
+    relay.__stallTick();                                   // confirmation 1
+    relay.__agePaneStallClock(relay.PANE_STALL_TIMEOUT_MS + 1);
+    relay.__stallTick();                                   // confirmation 2 -> exit
+    const sends = relay.__tmuxSends().slice(before);
+    const launches = sends.filter(c => /agy --allow-all/.test(c)).length;
+    assert.strictEqual(launches, 1,
+      `exactly one relaunch per task exit; saw ${launches} in ${JSON.stringify(sends)}`);
+    assert.ok(!fs.existsSync(relay.GH_TOKEN_CACHE), 'the stall path must also drop the token');
+  } finally { teardown(relay); }
+});
+
+test('#5353 a CLI that already died is not Ctrl-C\'d at a bare shell, but still loses its token', () => {
+  // The deliberate exception. This branch's premise is that the process is
+  // GONE and the pane is a shell; quitting there would only fire Ctrl-Cs at
+  // bash and race this path's own relaunch. The credential still goes.
+  const relay = loadRelay({ backend: 'copilot', procAlive: false });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-dead');
+    plantTaskToken(relay);
+    relay.__crashTick();   // reading 1 — not yet confirmed
+    const before = relay.__tmuxSends().length;
+    relay.__crashTick();   // reading 2 — confirmed death
+
+    const failedMsgs = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.ok(failedMsgs.length >= 1, 'a dead CLI must still hand the task back');
+    assert.ok(!fs.existsSync(relay.GH_TOKEN_CACHE),
+      'a task whose CLI died left its GitHub token on disk');
+    const launches = relay.__tmuxSends().slice(before).filter(c => /copilot --allow-all/.test(c)).length;
+    assert.strictEqual(launches, 1,
+      'the crash path owns its own single relaunch — the exit helper must not add another');
+  } finally { teardown(relay); }
+});
+
+test('#5353 a headless one-shot drops its token on completion as well as on revoke', () => {
+  // Headless already killed the child on revoke but kept the credential on a
+  // clean exit-0 completion, which is the same outlived-credential shape.
+  const relay = loadRelay({ backend: 'pi', mode: 'headless', model: 'openai/gpt-5', cliVersion: 'pi 0.73.1' });
+  try {
+    const task = { task_id: 'h-done', task_gen: 4, kind: 'issue', repo: 'x/y', number: 7, title: 'headless' };
+    relay.setCurrentTask(task);
+    plantTaskToken(relay);
+    relay.runHeadlessTask(task);
+    assert.ok(relay.__sent.some(m => m.type === 'task_complete'), 'setup: expected a headless completion');
+    assert.ok(!fs.existsSync(relay.GH_TOKEN_CACHE),
+      'a completed headless task left its GitHub token on disk for the rest of wsTokenTTL');
+  } finally { teardown(relay); }
+});
+
+test('#5353 task_revoke keeps its exact behaviour after the refactor', () => {
+  // The path that was already correct is the one the helper was factored out
+  // of, so it is also the regression risk: the token must still go, the CLI
+  // must still be stopped and relaunched, and the revoke-specific readiness
+  // latch must still be armed so the relay re-advertises when it comes back.
+  const relay = loadRelay({ backend: 'claude' });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-revoke');
+    plantTaskToken(relay);
+    const before = relay.__tmuxSends().length;
+    relay.handleMessage(JSON.stringify({ type: 'task_revoke', task_id: 't-revoke', reason: 'operator stop' }));
+
+    assert.strictEqual(relay.getCurrentTask(), null, 'revoke must clear the active task');
+    assert.ok(!fs.existsSync(relay.GH_TOKEN_CACHE), 'revoke must still drop the token');
+    assert.strictEqual(relay.getCliReady(), false, 'revoke must clear the readiness latch');
+    assertAgentStopped(relay.__tmuxSends().slice(before), 'claude');
+  } finally { teardown(relay); }
+});
+
+test('#5353 declining an assignment touches neither the pane nor an unrelated token', () => {
+  // Three task_assign paths answer task_failed for work that was never
+  // started. There is no agent of ours to stop, and the running task's own
+  // credential must not be collateral damage — this is the exception the
+  // uniform treatment would have broken.
+  const relay = loadRelay({ backend: 'copilot', paneText: 'esc cancel\n' });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-first', 1);
+    plantTaskToken(relay);
+    const before = relay.__tmuxSends().length;
+    relay.handleMessage(JSON.stringify({
+      type: 'task_assign', task_id: 't-second', kind: 'issue', repo: 'foo/bar', number: 2, title: 'second',
+    }));
+
+    const declined = relay.__sent.filter(m => m.type === 'task_failed' && m.task_id === 't-second');
+    assert.strictEqual(declined.length, 1, 'the second assignment must be declined');
+    assert.ok(fs.existsSync(relay.GH_TOKEN_CACHE),
+      'declining a NEW task must not delete the token of the task still being worked');
+    assert.strictEqual(relay.getCurrentTask().task_id, 't-first',
+      'declining must not disturb the active task');
+    const ctrlCs = relay.__tmuxSends().slice(before).filter(c => /C-c\s*$/.test(c)).length;
+    assert.strictEqual(ctrlCs, 0,
+      'declining an assignment must never interrupt the agent working the previous one');
+  } finally { teardown(relay); }
+});
+
+// ---------------------------------------------------------------------------
+// The completion signal (kubestellar/hive#5376).
+//
+// THE CLASS THIS SECTION EXISTS TO CATCH. Task completion in the interactive
+// relay used to be inferred entirely from tmux rendering chrome — per-backend
+// regexes over the last fifteen lines of the pane. Thirteen issues (#1566,
+// #4026, #4064, #4067, #4078, #4080, #4128, #4182, #4265, #5094, #5121, #5156,
+// #5162) are one defect repeating: a CLI restyled its cosmetic output in a
+// patch release and completion broke, in one direction or the other.
+//
+// The tests below are written so that they hold whatever any vendor does to
+// its chrome. The bar, stated plainly:
+//
+//   1. A task completes on the SENTINEL, whatever the pane renders around it —
+//      including chrome that classifyTmuxPane reads as busy, and chrome from a
+//      backend nobody has written a branch for.
+//   2. A task does NOT complete on chrome alone in a single tick, which is what
+//      the whole history consists of.
+//
+// A future backend restyle can still move a pane between WORKING and
+// IDLE_COMPLETE. What it can no longer do is decide, on its own and instantly,
+// that a task finished.
+// ---------------------------------------------------------------------------
+
+// A pane whose chrome classifyTmuxPane reads as BUSY for claude — "esc to
+// interrupt" is its in-flight marker — but which carries the agent's own
+// completion sentinel. This is the shape the thirteen issues kept getting
+// wrong from the other side: a real completion the classifier called WORKING,
+// which the stall backstop then failed with the PR already open (#4127, #4181,
+// #4259). The sentinel must win.
+const VERDICT_UNDER_BUSY_CHROME = [
+  '● Opened https://github.com/foo/bar/pull/4242',
+  'HIVE_VERDICT: complete — PR is open and ready for review',
+  '',
+  '✻ Cogitating… (esc to interrupt)',
+].join('\n');
+
+test('#5376 a task completes on the sentinel even while the chrome says the CLI is busy', () => {
+  const relay = loadRelay({ backend: 'claude', paneText: VERDICT_UNDER_BUSY_CHROME });
+  try {
+    // The classifier is unchanged and still reads this pane as working — that
+    // is the point. Its verdict about the pane is no longer the task's verdict.
+    assert.strictEqual(relay.classifyTmuxPane(VERDICT_UNDER_BUSY_CHROME), relay.PANE_STATE_WORKING,
+      'setup: the chrome must still classify as busy, or this test proves nothing');
+
+    relay.setCliReady(true);
+    assignTask(relay, 't-verdict-busy');
+    relay.__crashTick();
+
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1,
+      `the agent said it was done; the chrome must not overrule it: ${JSON.stringify(relay.__sent.map(m => m.type))}`);
+    assert.strictEqual(completed[0].completion_signal, 'verdict');
+    assert.strictEqual(completed[0].pr_url, 'https://github.com/foo/bar/pull/4242');
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_failed').length, 0);
+  } finally { teardown(relay); }
+});
+
+test('#5376 the sentinel completes a task through chrome no backend branch has ever seen', () => {
+  // The generalisation of the class. Every one of the thirteen issues was
+  // fixed by teaching classifyTmuxPane about some CLI's new rendering. This
+  // asserts the property that makes the fourteenth unnecessary: completion
+  // holds for chrome invented right here, that no branch and no pattern in the
+  // relay has any knowledge of.
+  const ALIEN_CHROME = [
+    '╭───────────────────────────────────────╮',
+    '│  ⟡⟡⟡  nobody has ever shipped this UI  │',
+    '╰───────────────────────────────────────╯',
+    'HIVE_VERDICT: complete — did the thing',
+    '⟿ ⟿ ⟿',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'claude', paneText: ALIEN_CHROME });
+  try {
+    assert.notStrictEqual(relay.classifyTmuxPane(ALIEN_CHROME), relay.PANE_STATE_IDLE_COMPLETE,
+      'setup: unrecognised chrome must not classify as complete on its own');
+    relay.setCliReady(true);
+    assignTask(relay, 't-alien');
+    relay.__crashTick();
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1,
+      'a restyled CLI must not be able to break completion once the agent states it');
+    assert.strictEqual(completed[0].completion_signal, 'verdict');
+  } finally { teardown(relay); }
+});
+
+test('#5376 chrome alone does NOT complete a task on a single tick', () => {
+  // The other half of the bar, and the demotion itself. IDLE_COMPLETE chrome
+  // with no sentinel must report progress and WAIT — the momentary misreads
+  // behind the thirteen issues (a duration summary printed mid-turn, a status
+  // row between tool calls) resolve inside this window by the pane simply
+  // carrying on.
+  const IDLE_CHROME_NO_VERDICT = [
+    '● Summary: looked at the tests',
+    '✻ Cogitated for 4m 10s',
+    '❯ ',
+    '  ⏵⏵ auto mode on (shift+tab to cycle)',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'claude', paneText: IDLE_CHROME_NO_VERDICT });
+  try {
+    assert.strictEqual(relay.classifyTmuxPane(IDLE_CHROME_NO_VERDICT), relay.PANE_STATE_IDLE_COMPLETE,
+      'setup: this is exactly the chrome that used to complete a task by itself');
+    relay.setCliReady(true);
+    assignTask(relay, 't-chrome-only');
+    relay.__crashTick();
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 0,
+      'one frame of idle chrome must no longer end a task');
+    assert.ok(relay.getCurrentTask(), 'the task is still held while the relay waits for a verdict');
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_progress' && m.status === 'working').length, 1,
+      'the relay must keep reporting the task as working, not silently do nothing');
+  } finally { teardown(relay); }
+});
+
+test('#5376 a pane that resumes work inside the grace window is never completed', () => {
+  // The misread, modelled. The pane shows a duration summary and idle chrome
+  // mid-turn; the CLI then carries on. Under the old contract that first frame
+  // WAS the completion, and the hub reassigned an issue whose agent was still
+  // working on it. The grace window has to actually absorb this, and the
+  // counter has to RESET rather than merely pause.
+  const MIDTURN_IDLE_FRAME = [
+    '✻ Cogitated for 1m 02s',
+    '❯ ',
+    '  ⏵⏵ auto mode on (shift+tab to cycle)',
+  ].join('\n');
+  const BACK_TO_WORK = [
+    '● Bash(go test ./...)',
+    '✻ Cogitating… (esc to interrupt)',
+  ].join('\n');
+  let pane = MIDTURN_IDLE_FRAME;
+  const relay = loadRelay({ backend: 'claude', paneText: () => pane });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-midturn');
+    // Every tick of the window but the last.
+    for (let i = 0; i < relay.CHROME_IDLE_GRACE_TICKS - 1; i++) relay.__crashTick();
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 0);
+    // The turn was never over.
+    pane = BACK_TO_WORK;
+    relay.__crashTick();
+    assert.strictEqual(relay.getChromeIdleTicks(), 0,
+      'resumed work must RESET the grace counter, not leave it primed to fire on the next idle frame');
+    // And a single later idle frame must not cash in the earlier ticks.
+    pane = MIDTURN_IDLE_FRAME;
+    relay.__crashTick();
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 0,
+      'one idle frame after a reset must not complete the task');
+    assert.ok(relay.getCurrentTask(), 'the task is still held');
+  } finally { teardown(relay); }
+});
+
+test('#5376 a non-compliant agent still completes — via the bounded chrome-idle fallback', () => {
+  // The fallback decision, pinned. Option (a) — hold until the progress lease
+  // expires — was rejected because a non-compliant agent that genuinely
+  // finished draws nothing more, so the lease is never renewed and the task
+  // dies as an `environment` FAILURE with its PR already open. This asserts
+  // the choice that was made instead: bounded grace, then complete, labelled
+  // so the non-compliance is visible.
+  const IDLE_NO_VERDICT = [
+    '● Opened https://github.com/foo/bar/pull/777',
+    '✻ Cogitated for 9m 24s',
+    '❯ ',
+    '  ⏵⏵ auto mode on (shift+tab to cycle)',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'claude', paneText: IDLE_NO_VERDICT });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-noncompliant');
+    graceTicks(relay, () => relay.__crashTick());
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1,
+      'an agent that never emits the sentinel must still be able to finish a task');
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_failed').length, 0,
+      'the fallback must never turn a finished task into a failure');
+    assert.strictEqual(completed[0].completion_signal, 'chrome_idle',
+      'the weaker signal must be labelled, so per-backend non-compliance is measurable');
+    assert.strictEqual(completed[0].pr_url, 'https://github.com/foo/bar/pull/777');
+  } finally { teardown(relay); }
+});
+
+test('#5376 an idle pane awaiting its verdict is not handed to the stall backstop', () => {
+  // The trap in the fallback. An idle pane is byte-for-byte identical frame to
+  // frame, so if the grace window merely declined to complete and fell through
+  // to the stall detector, a finished task would be handed back as an
+  // `environment` failure — the #4127/#4182 shape, reintroduced by the very
+  // change meant to end it. The stall clock is aged past its timeout on every
+  // tick here to prove the IDLE_COMPLETE branch owns the pane throughout.
+  const IDLE_NO_VERDICT = [
+    '✻ Cogitated for 9m 24s',
+    '❯ ',
+    '  ⏵⏵ auto mode on (shift+tab to cycle)',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'claude', paneText: IDLE_NO_VERDICT });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-idle-stall');
+    graceTicks(relay, () => {
+      relay.__agePaneStallClock(relay.PANE_STALL_TIMEOUT_MS + 1);
+      relay.__stallTick();
+    });
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_failed').length, 0,
+      'waiting for a verdict must never be charged to the stall backstop');
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 1);
+  } finally { teardown(relay); }
+});
+
+test('#5376 a verdict does NOT launder an API error into a completion', () => {
+  // A stale sentinel from earlier in the transcript, sitting above a turn that
+  // ended in an authorization refusal. The verdict path must not be able to
+  // report this as a success — that is #5094 and #4400 in a new coat, and
+  // those branches own this pane.
+  const VERDICT_ABOVE_FATAL_ERROR = [
+    'HIVE_VERDICT: complete — finished the previous piece',
+    '● Continuing with the next part…',
+    'API Error: 403 Forbidden',
+    '❯ ',
+    '  ⏵⏵ auto mode on (shift+tab to cycle)',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'claude', paneText: VERDICT_ABOVE_FATAL_ERROR });
+  try {
+    assert.strictEqual(relay.classifyTmuxPane(VERDICT_ABOVE_FATAL_ERROR), relay.PANE_STATE_FATAL_API_ERROR,
+      'setup: this pane must classify as a fatal API error');
+    relay.setCliReady(true);
+    assignTask(relay, 't-verdict-vs-error');
+    relay.__crashTick();
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 0,
+      'a turn that ended in an API failure shipped nothing and must not be booked complete');
+    const failed = relay.__sent.filter(m => m.type === 'task_failed');
+    assert.strictEqual(failed.length, 1, 'it must be handed back honestly');
+    assert.strictEqual(failed[0].failure_kind, 'environment');
+  } finally { teardown(relay); }
+});
+
+test('#5376 the grace window does not carry across tasks', () => {
+  // Idle ticks accumulated while the previous task wound down must never count
+  // toward ending the next one — the same per-task scoping bug #5094 fixed for
+  // the retry budget and #5281 for the autonomy nudge.
+  const IDLE_NO_VERDICT = ['✻ Cogitated for 1m', '❯ ', '  ⏵⏵ auto mode on (shift+tab to cycle)'].join('\n');
+  const relay = loadRelay({ backend: 'claude', paneText: IDLE_NO_VERDICT });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-one');
+    graceTicks(relay, () => relay.__crashTick());
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete').length, 1, 'setup: first task completes');
+
+    assignTask(relay, 't-two');
+    assert.strictEqual(relay.getChromeIdleTicks(), 0, 'a new task starts with a clean grace counter');
+    relay.__crashTick();
+    assert.strictEqual(relay.__sent.filter(m => m.type === 'task_complete' && m.task_id === 't-two').length, 0,
+      'the second task must earn its own grace window, not inherit the first one\'s');
+  } finally { teardown(relay); }
+});
+
+// --- detectCompletionVerdict / detectHiveVerdict (#5376) ---------------------
+
+test('#5376 detectCompletionVerdict accepts complete and no_work_needed, and nothing else', () => {
+  const relay = loadRelay({});
+  try {
+    const c = relay.detectCompletionVerdict(['work happened', 'HIVE_VERDICT: complete — shipped PR #1']);
+    assert.strictEqual(c.verdict, 'complete');
+    assert.strictEqual(c.reason, 'shipped PR #1');
+
+    // no_work_needed IS a completion: it is the agent concluding the task with
+    // nothing to ship. Requiring a second line after it would make a compliant
+    // agent look non-compliant.
+    assert.strictEqual(relay.detectCompletionVerdict(['HIVE_VERDICT: no_work_needed — gated']).verdict,
+      'no_work_needed');
+
+    // Codex's leading bullet is presentation chrome, not part of the verdict.
+    assert.strictEqual(relay.detectCompletionVerdict(['  • HIVE_VERDICT: complete - done']).verdict, 'complete');
+    // Case-insensitive, as the no_work_needed marker has always been.
+    assert.strictEqual(relay.detectCompletionVerdict(['hive_verdict: COMPLETE']).verdict, 'complete');
+
+    // An invented verdict is not a completion.
+    assert.strictEqual(relay.detectCompletionVerdict(['HIVE_VERDICT: probably_fine — eh']), null);
+  } finally { teardown(relay); }
+});
+
+test('#5376 the completion sentinel inherits the anti-false-positive guards, not a second parser', () => {
+  // These are the guards #3987/#4265 built for no_work_needed. Extending the
+  // family must not have created a weaker parser alongside the hardened one —
+  // if it had, the prompt's own echo would read as the agent finishing before
+  // it started.
+  const relay = loadRelay({});
+  try {
+    // The prompt's placeholder, wrapped by tmux to a visual line start.
+    assert.strictEqual(relay.detectCompletionVerdict(['HIVE_VERDICT: complete — <short reason>']), null,
+      'the prompt echo must never read as a completion');
+    // Quoted mid-sentence — the prompt instruction itself.
+    assert.strictEqual(
+      relay.detectCompletionVerdict(["print a line of the exact form 'HIVE_VERDICT: complete — <reason>'"]), null,
+      'an unanchored match would complete every task the moment the prompt was typed');
+    // Prose that merely begins with the verdict word.
+    assert.strictEqual(relay.detectCompletionVerdict(['HIVE_VERDICT: completely_wrong']), null);
+    // Junk in, null out — every caller is on a best-effort terminal-capture path.
+    assert.strictEqual(relay.detectCompletionVerdict([]), null);
+    assert.strictEqual(relay.detectCompletionVerdict('not-an-array'), null);
+    assert.strictEqual(relay.detectCompletionVerdict(['ordinary output']), null);
+  } finally { teardown(relay); }
+});
+
+test('#5376 the newest verdict wins, so a stale one cannot end a later turn', () => {
+  const relay = loadRelay({});
+  try {
+    const v = relay.detectCompletionVerdict([
+      'HIVE_VERDICT: no_work_needed — nothing here',
+      'actually, on reflection, there was work',
+      'HIVE_VERDICT: complete — opened PR #2',
+    ]);
+    assert.strictEqual(v.verdict, 'complete');
+    assert.strictEqual(v.reason, 'opened PR #2');
+  } finally { teardown(relay); }
+});
+
+test('#5376 no_work_needed detection is unchanged by the shared parser', () => {
+  // detectNoWorkVerdict feeds the hub's long offer-suppression window (#3987)
+  // and the HEADLESS completion path, neither of which this change touches.
+  // It must not have started matching `complete`.
+  const relay = loadRelay({});
+  try {
+    assert.strictEqual(relay.detectNoWorkVerdict(['HIVE_VERDICT: complete — shipped']), null,
+      'a completion verdict is not a no_work_needed verdict');
+    assert.strictEqual(relay.detectNoWorkVerdict(['HIVE_VERDICT: no_work_needed — gated']).verdict,
+      'no_work_needed');
+  } finally { teardown(relay); }
+});
+
+test('#5376 a no_work_needed verdict still completes the task and reports the verdict', () => {
+  // End to end on the interactive path: the #3987 contract must survive the
+  // demotion — and, now, complete on the sentinel rather than waiting out the
+  // grace window for chrome to agree.
+  const NO_WORK_PANE = [
+    'HIVE_VERDICT: no_work_needed — remainder is gated on a maintainer decision',
+    '✻ Cogitating… (esc to interrupt)',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'claude', paneText: NO_WORK_PANE });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-nowork');
+    relay.__crashTick();
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1, 'no_work_needed is a completion');
+    assert.strictEqual(completed[0].verdict, 'no_work_needed');
+    assert.strictEqual(completed[0].verdict_reason, 'remainder is gated on a maintainer decision');
+    assert.strictEqual(completed[0].completion_signal, 'verdict');
+  } finally { teardown(relay); }
+});
+
+test('#5376 a shipped PR still overrides a no_work_needed claim', () => {
+  // #3987: a visible PR contradicts "nothing shippable", so the verdict is not
+  // reported (the hub would override it with "shipped" anyway). The task still
+  // completes — on the sentinel.
+  const PANE = [
+    'Opened https://github.com/foo/bar/pull/31',
+    'HIVE_VERDICT: no_work_needed — I thought there was nothing to do',
+    '✻ Cogitating… (esc to interrupt)',
+  ].join('\n');
+  const relay = loadRelay({ backend: 'claude', paneText: PANE });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-nowork-with-pr');
+    relay.__crashTick();
+    const completed = relay.__sent.filter(m => m.type === 'task_complete');
+    assert.strictEqual(completed.length, 1);
+    assert.strictEqual(completed[0].pr_url, 'https://github.com/foo/bar/pull/31');
+    assert.strictEqual(completed[0].verdict, undefined,
+      'a visible PR contradicts no_work_needed, so the claim must not be forwarded');
+  } finally { teardown(relay); }
+});
+
+test('#5376 classifyTmuxPane keeps every one of its stall/liveness branches', () => {
+  // The demotion removed the classifier's AUTHORITY over completion, not its
+  // patterns. Those forty-odd patterns are still correct for "is this pane
+  // moving", which is what the stall backstop and the blocked/error branches
+  // read. Deleting them would blind those paths.
+  const relay = loadRelay({ backend: 'claude' });
+  try {
+    assert.strictEqual(relay.classifyTmuxPane('✻ Cogitating… (esc to interrupt)'), relay.PANE_STATE_WORKING);
+    assert.strictEqual(
+      relay.classifyTmuxPane('✻ Cogitated for 4m\n❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)'),
+      relay.PANE_STATE_IDLE_COMPLETE,
+      'IDLE_COMPLETE still exists — it is a liveness reading now, not a completion');
+  } finally { teardown(relay); }
+});
+
+test('#5376 recordChromeIdleTick fires only after the full consecutive window', () => {
+  const relay = loadRelay({});
+  try {
+    relay.resetChromeIdleGrace();
+    for (let i = 1; i < relay.CHROME_IDLE_GRACE_TICKS; i++) {
+      assert.strictEqual(relay.recordChromeIdleTick(true), false, `tick ${i} must not fire`);
+    }
+    assert.strictEqual(relay.recordChromeIdleTick(true), true, 'the last tick of the window fires');
+    // Consecutive, not cumulative.
+    relay.resetChromeIdleGrace();
+    relay.recordChromeIdleTick(true);
+    assert.strictEqual(relay.recordChromeIdleTick(false), false);
+    assert.strictEqual(relay.getChromeIdleTicks(), 0, 'a non-idle tick resets the window');
+  } finally { teardown(relay); }
+});
+
+// ---------------------------------------------------------------------------
+// kubestellar/hive#5447 — a failed re-mint must be visible to the relay, and
+// token_expires_at must actually be read.
+//
+// Both halves were plumbing that carried no effect: maybeRefreshToken() logged
+// hub-side and told the relay nothing, so a stale credential first showed up as
+// a push failing about an hour into a long task; and tokenExpiresAt was
+// assigned in two places and never compared against anything.
+//
+// These assert OBSERVABLE behaviour (#5388): that a simulated mint failure
+// produces relay-visible output naming the condition, and that the expiry check
+// actually fires on a stale token rather than merely being reachable.
+// ---------------------------------------------------------------------------
+
+// Drives a token_refresh carrying an expiry, so a test starts from a relay that
+// genuinely holds a credential with a known lifetime.
+function refreshToken(relay, expiresInMs) {
+  relay.handleMessage(JSON.stringify({
+    type: 'token_refresh',
+    github_token: 'ghs_fake_test_token',
+    token_expires_at: new Date(Date.now() + expiresInMs).toISOString(),
+  }));
+}
+
+test('#5447 a hub-reported refresh failure is logged against the task, not swallowed', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  const origError = console.error;
+  const errors = [];
+  console.error = (...args) => { errors.push(args.join(' ')); };
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-refresh-fail');
+    refreshToken(relay, 55 * 60 * 1000);
+    relay.handleMessage(JSON.stringify({
+      type: 'token_refresh_failed',
+      reason: 'mint failed, will retry on the next heartbeat',
+    }));
+    // The whole point of the issue: the relay must name the CREDENTIAL as the
+    // problem. Before this change nothing was emitted at all — the message type
+    // fell through handleMessage's switch unhandled.
+    const named = errors.find(e => e.includes('token refresh FAILED'));
+    assert.ok(named, 'a failed re-mint produced no relay-visible signal');
+    assert.ok(named.includes('foo/bar#421'), 'the failure was not logged against the task it belongs to');
+    assert.ok(named.includes('mint failed'), 'the hub-supplied reason did not reach the log');
+  } finally {
+    console.error = origError;
+    teardown(relay);
+  }
+});
+
+test('#5447 a refresh failure for a task we do not own is ignored', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  try {
+    relay.setCliReady(true);
+    // No active task: the message must not be recorded against nothing.
+    relay.handleMessage(JSON.stringify({ type: 'token_refresh_failed', reason: 'mint failed' }));
+    assert.strictEqual(relay.tokenLifetimeStatus().refreshFailed, false,
+      'a refresh failure with no active task was recorded anyway');
+  } finally { teardown(relay); }
+});
+
+test('#5447 a later successful refresh clears the failure condition', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-refresh-recover');
+    refreshToken(relay, 55 * 60 * 1000);
+    relay.handleMessage(JSON.stringify({ type: 'token_refresh_failed', reason: 'mint failed' }));
+    assert.strictEqual(relay.tokenLifetimeStatus().refreshFailed, true,
+      'the failure was not recorded in the first place');
+    refreshToken(relay, 55 * 60 * 1000);
+    assert.strictEqual(relay.tokenLifetimeStatus().refreshFailed, false,
+      'a delivered credential must resolve the earlier renewal failure');
+  } finally { teardown(relay); }
+});
+
+test('#5447 tokenExpiresAt is actually read — a stale token warns', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  const origWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => { warnings.push(args.join(' ')); };
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-expiry');
+    // A credential that lapsed ten minutes ago. Before this change the relay
+    // held this number and never compared it to anything.
+    refreshToken(relay, -10 * 60 * 1000);
+    const msg = relay.warnOnTokenExpiry();
+    assert.ok(msg, 'an expired token produced no warning — token_expires_at is still unread');
+    assert.ok(/expired/.test(msg), `expected an expiry warning, got: ${msg}`);
+    assert.ok(warnings.some(w => /expired/.test(w)), 'the expiry warning never reached the log');
+    const status = relay.tokenLifetimeStatus();
+    assert.strictEqual(status.expired, true);
+    assert.strictEqual(status.known, true);
+  } finally {
+    console.warn = origWarn;
+    teardown(relay);
+  }
+});
+
+test('#5447 a healthy token neither warns nor reports expiry', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-healthy');
+    refreshToken(relay, 50 * 60 * 1000);
+    assert.strictEqual(relay.warnOnTokenExpiry(), null,
+      'a token with 50 minutes left must not warn — that would be noise on every task');
+    const status = relay.tokenLifetimeStatus();
+    assert.strictEqual(status.expired, false);
+    assert.strictEqual(status.expiring, false);
+  } finally { teardown(relay); }
+});
+
+test('#5447 the warning fires inside the window, before the first push can fail', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-window');
+    // Still valid, but inside the warning window: the operator should hear
+    // about it BEFORE the credential lapses, not afterwards.
+    refreshToken(relay, Math.floor(relay.TOKEN_EXPIRY_WARN_MS / 2));
+    const status = relay.tokenLifetimeStatus();
+    assert.strictEqual(status.expired, false, 'this token has not expired yet');
+    assert.strictEqual(status.expiring, true, 'a token inside the warning window must be flagged as expiring');
+    const msg = relay.warnOnTokenExpiry();
+    assert.ok(msg && /expires in/.test(msg), `expected a pre-expiry warning, got: ${msg}`);
+  } finally { teardown(relay); }
+});
+
+test('#5447 the expiry warning is throttled, not emitted every tick', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-throttle');
+    refreshToken(relay, -10 * 60 * 1000);
+    assert.ok(relay.warnOnTokenExpiry(), 'the first warning must fire');
+    assert.strictEqual(relay.warnOnTokenExpiry(), null,
+      'a second immediate warning would spam the log on every progress tick');
+  } finally { teardown(relay); }
+});
+
+test('#5447 an expired token still does NOT refuse the work (clock skew)', () => {
+  const relay = loadRelay({ backend: 'claude' });
+  const origWarn = console.warn;
+  console.warn = () => {};
+  try {
+    relay.setCliReady(true);
+    assignTask(relay, 't-no-refusal');
+    refreshToken(relay, -60 * 60 * 1000);
+    relay.handleMessage(JSON.stringify({ type: 'token_refresh_failed', reason: 'mint failed' }));
+    relay.progressTick();
+    // Deliberate: tokenExpiresAt is the HUB's wall clock read on OURS, so a
+    // skewed machine would abandon work on a perfectly good credential.
+    // Warning is the ceiling here; failing the task is not.
+    assert.ok(!relay.__sent.some(m => m.type === 'task_failed'),
+      'an expired-looking token must not fail the task — clock skew would destroy live work');
+    assert.strictEqual(relay.getCurrentTask() ? relay.getCurrentTask().task_id : null, 't-no-refusal',
+      'the task must still be held');
+  } finally {
+    console.warn = origWarn;
+    teardown(relay);
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -670,12 +670,31 @@ type SaaSHive struct {
 	// reporting the code branch actually running.
 	TrackedChannel string `json:"tracked_channel,omitempty"`
 
-	// Forge names the forge FAMILY this hive runs against: "" / "github" /
-	// "github-enterprise" (the GitHub App path), or "gitlab" / "gitea" (the
-	// pkg/forge adapter path, PRIVATE-TOKEN auth — no GitHub App). Empty means
-	// GitHub, preserving every existing hive. The spoke uses this to pick which
-	// pkg/forge adapter to execute against; it is delivered over the heartbeat
-	// alongside the host. GitLab/Gitea carry no PendingAppConfig (no App).
+	// Forge names the forge FAMILY this hive is recorded as running against:
+	// "" / "github" / "github-enterprise" (the GitHub App path), or "gitlab" /
+	// "gitea". Empty means GitHub, preserving every existing hive. GitLab/Gitea
+	// carry no PendingAppConfig (no App).
+	//
+	// WHAT THIS FIELD ACTUALLY DOES TODAY: it is hub-side bookkeeping only. It
+	// is written by handleForgeSwitch (forge.go) and read by hub code to
+	// classify a hive — e.g. saas.go excludes non-"github" hives from
+	// github.com-scoped sweeps. It is NOT delivered to any spoke: no heartbeat
+	// struct carries a forge field, and HeartbeatResponse has no way to convey
+	// one, so the value never reaches a spoke at all.
+	//
+	// NO SPOKE SELECTS AN ADAPTER FROM THIS. The pkg/forge adapter package has
+	// zero non-test importers anywhere in the tree — nothing constructs a
+	// GitLab or Gitea adapter in any running code path. Setting this to
+	// "gitlab" or "gitea" changes hub classification and what the dashboard
+	// displays; it does not change what any agent executes against. See
+	// src/docs/forge-app-setup.md for the verified support matrix.
+	//
+	// FOR THE ADAPTER-SELECTION PATH TO EXIST, three things would have to be
+	// built: (1) a forge field on HeartbeatResponse (and the hub code to
+	// populate it), (2) a spoke-side consumer that reads it and constructs the
+	// matching pkg/forge adapter, and (3) CreateIssue/CreatePR on the
+	// pkg/forge.Forge interface — it has neither today, so even a fully wired
+	// adapter could comment and label but could not file the work.
 	Forge string `json:"forge,omitempty"`
 
 	// PendingAppConfig is a GitHub App identity queued for delivery to the
@@ -735,6 +754,30 @@ type SaaSHive struct {
 	// an upgrade that already went out at 17:01. Empty for instant-mode hives,
 	// which are never gated and never record a date.
 	AutoUpgradeLastFired string `json:"auto_upgrade_last_fired,omitempty"`
+
+	// AutoUpgradePendingTarget / AutoUpgradePendingSince / AutoUpgradeCollapsed
+	// are the merge-driven upgrade DEBOUNCE state (#5391): the newest SHA seen
+	// while waiting for the branch to go quiet, when that target was first
+	// observed, and how many earlier targets it superseded.
+	//
+	// They live on the PVC rather than in memory for one reason: a hub restart
+	// inside the quiet window must not DROP a pending upgrade. Dropping one
+	// silently is a worse failure than rolling too often, which is the whole
+	// thing this debounce exists to reduce. On restart the window resumes from
+	// the stored AutoUpgradePendingSince, so the wait is neither lost nor
+	// restarted.
+	//
+	// All three are omitempty and absent on every existing record, which reads
+	// as "nothing pending" — so meta.json stays byte-identical for the fleet
+	// until a hive actually has an upgrade waiting.
+	// AutoUpgradePendingFirst is when the hive FIRST fell behind and began
+	// waiting. Unlike AutoUpgradePendingSince it survives re-arming, and it is
+	// what the max-hold cap is measured against — on a branch that never goes
+	// quiet it is the only clock that does not reset.
+	AutoUpgradePendingTarget string    `json:"auto_upgrade_pending_target,omitempty"`
+	AutoUpgradePendingSince  time.Time `json:"auto_upgrade_pending_since,omitempty"`
+	AutoUpgradePendingFirst  time.Time `json:"auto_upgrade_pending_first,omitempty"`
+	AutoUpgradeCollapsed     int       `json:"auto_upgrade_collapsed,omitempty"`
 
 	// GitHubBaseURL / GitHubAPIURL pin this hive's GitHub host. The GitHub
 	// host is a property of the HIVE (where its org/repos live), not the
@@ -884,7 +927,7 @@ func resolveProvisionAppID(reqAppID string, h *SaaSHive, cluster *ClusterConfig)
 // A hive's GitHubHost is otherwise only ever set from an explicitly pasted
 // org URL at assign time. Placeholders provisioned BEFORE their cluster gained
 // github_base_url/github_api_url therefore keep GitHubHost == "" forever, and
-// projectConfigForHiveID pushes gheAPIURLForHost("") == "" on every heartbeat
+// projectConfigForHiveID pushes forgeAPIURLForHost("", "") == "" on every heartbeat
 // — which the spoke reads as "leave mine alone". The result is a hive on a GHE
 // cluster still pointing at api.github.com with the public app_id (observed on
 // the heartbeat-only cluster: a hosted-available hive in org "katamari" has base_url: "",

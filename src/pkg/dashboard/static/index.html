@@ -793,6 +793,44 @@
     }
     .terminal-copy-hint-dismiss:hover { color: var(--text); }
     .terminal-copy-hint-dismiss:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    /* #5327: the ⇧-drag / Ctrl+Shift+C advice used to be a full sentence on
+       every agent card. It is now this one small affordance carrying the
+       advice in its tooltip, so the row costs a few characters instead of a
+       line of permanent chrome. */
+    .terminal-copy-hint-help {
+      padding: 0; border: 0; background: transparent; color: var(--muted);
+      cursor: help; font: inherit; text-decoration: underline dotted;
+      text-underline-offset: 2px;
+    }
+    .terminal-copy-hint-help:hover { color: var(--text); }
+    .terminal-copy-hint-help:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    /* Sits after the message and before the ×, so the working control is the
+       last thing read before the dismissal. margin-left:auto pushes it right
+       when the hint text has been dismissed and it is the only child. */
+    .terminal-copy-url-btn {
+      margin-left: auto; flex: none; padding: 2px 8px;
+      border: 1px solid color-mix(in srgb, var(--text) 20%, transparent);
+      border-radius: var(--radius); background: var(--panel);
+      color: var(--text); cursor: pointer; font: inherit; white-space: nowrap;
+    }
+    .terminal-copy-url-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .terminal-copy-url-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    /* The × must stay rightmost even though the button also claims auto. */
+    .terminal-copy-url-btn + .terminal-copy-hint-dismiss { margin-left: 0; }
+    /* The operator's copy surface inside the login-URL toast (#5327): shown
+       first, not as a fallback, because a programmatic write is blocked in
+       any non-secure context. */
+    .terminal-copy-url-fallback {
+      display: block; width: 100%; margin-top: 8px; padding: 4px 6px;
+      border: 1px solid color-mix(in srgb, var(--text) 25%, transparent);
+      border-radius: var(--radius); background: var(--bg-soft);
+      color: var(--text); font-family: var(--font-mono); font-size: 0.72rem;
+    }
+    /* Reports whether the automatic clipboard write also landed. Secondary to
+       the field above it, which always works. */
+    .terminal-copy-url-note {
+      margin-top: 6px; font-size: 0.7rem; line-height: 1.4; opacity: 0.85;
+    }
     .cli-login-btn { border: none; padding: 2px 10px; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 0.75rem; display: inline-flex; align-items: center; gap: 4px; }
     .cli-login-btn.claude { background: #d97706; color: #fff; }
     .cli-login-btn.claude:hover { background: #f59e0b; }
@@ -1009,6 +1047,15 @@
     /* Last upstream/launch error — stacked below .agent-state, never under the
        working-indicator dot, so a retry in progress cannot hide it (#3604). */
     .agent-error { font-size: 0.72rem; color: var(--red); margin-top: 4px; text-align: right; word-break: break-word; }
+    .agent-blockers { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 2px 6px; font-size: 0.68rem; margin-top: 4px; color: var(--muted); }
+    .agent-blockers .ab-key { opacity: 0.65; margin-right: 3px; }
+    .agent-blockers .ab-seg { white-space: nowrap; }
+    .agent-blockers .ab-sep { opacity: 0.35; }
+    .agent-blockers .ab-ok { color: var(--green); }
+    .agent-blockers .ab-bad { color: var(--red); font-weight: 600; }
+    .oc-detail-blockers { margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .never-scheduled-chip { font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--yellow); background: none; border: 1px solid var(--yellow); border-radius: 3px; padding: 1px 5px; margin-left: 6px; cursor: pointer; vertical-align: middle; white-space: nowrap; }
+    .never-scheduled-chip:hover { background: color-mix(in srgb, var(--yellow) 18%, transparent); }
     .agent-name { font-size: 1.1rem; font-weight: 700; margin-bottom: 8px; }
     .agent-name .dot {
       display: inline-block; width: 8px; height: 8px;
@@ -1203,6 +1250,16 @@
     .repo-pr-pill .pill-num { font-weight: 700; white-space: nowrap; }
     .repo-pr-pill .pill-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .repo-pr-pill .pill-merge-icon { font-size: 0.6rem; margin-left: 1px; }
+    /* needs-human: the escalation ledger (pkg/escalation) applies the
+       `needs-human` GitHub label to a PR once automated fix attempts are
+       exhausted. The pill turns status-alert orange (NOT brand amber) and a
+       compact companion badge names the state, so parked PRs stand out
+       instead of blending into the purple PR list — nine escalated PRs were
+       invisible to the operator for a week without this. */
+    .repo-pr-pill.needs-human { --pill-c: var(--orange); }
+    .pill-needs-human-badge { flex: 0 0 auto; font-weight: 600; white-space: nowrap; }
+    /* Section-header counter: "· N need human review" next to the host badge. */
+    .repos-needs-human-count { display: none; font-size: 0.62em; font-weight: 600; vertical-align: middle; margin-left: 6px; color: var(--orange); }
 
     /* Sparklines */
     .sparkline { display: inline-block; vertical-align: middle; margin-left: 6px; flex-shrink: 0; }
@@ -3181,7 +3238,7 @@
   <div class="cost-usage" id="cost-panel" style="margin-bottom: 24px;"></div>
 
   <div class="repos" id="repos-section">
-    <h2 class="section-header-toggle" data-action="toggleSection" data-arg0="repos-section"><span class="section-chevron">▼</span> Repositories <span id="repos-host-badge" title="Every repo in this hive is on this single GitHub host" style="font-size:0.62em;font-weight:600;vertical-align:middle;padding:2px 7px;border-radius:10px;margin-left:6px"></span> <button class="config-gear" data-action="gh1" data-stop="1" title="Manage monitored repositories" style="font-size:0.7em;vertical-align:middle">⚙️</button></h2>
+    <h2 class="section-header-toggle" data-action="toggleSection" data-arg0="repos-section"><span class="section-chevron">▼</span> Repositories <span id="repos-host-badge" title="Every repo in this hive is on this single GitHub host" style="font-size:0.62em;font-weight:600;vertical-align:middle;padding:2px 7px;border-radius:10px;margin-left:6px"></span> <span id="repos-needs-human" class="repos-needs-human-count" title="Open PRs labeled needs-human: automated fix attempts exhausted — operator review required"></span> <button class="config-gear" data-action="gh1" data-stop="1" title="Manage monitored repositories" style="font-size:0.7em;vertical-align:middle">⚙️</button></h2>
     <div class="section-body">
       <!-- Read-only view of project.issue_filter: which issues agents may
            initiate work on, by label. Hidden unless a filter is configured;
@@ -4375,14 +4432,24 @@
         // button would otherwise persist until the user navigates away.
         const fastToggle = detail.querySelector('.oc-detail-actions .btn-toggle');
         if (fastToggle && !isOnDemand) {
-          fastToggle.className = `btn-toggle ${isPaused ? 'paused' : isOff ? 'off' : 'running'}`;
-          fastToggle.textContent = isPaused ? '▶ resume' : isOff ? '▶ start' : '⏸ pause';
-          fastToggle.dataset.paused = String(isPaused);
-          fastToggle.title = isPaused ? 'Resume this agent — it will start running on its configured cadence' : isOff ? 'Start this agent — it is currently off in this governor mode' : 'Pause this agent — stops governor from kicking it until resumed';
+          if (isPaused) {
+            // Paused gets the full combined-action rebuild — '▶ start &
+            // resume' when the session is also down — so data-action tracks
+            // the session state too, not just the label (#5594 follow-up).
+            fastToggle.outerHTML = pausedAgentActionHtml(a);
+          } else {
+            fastToggle.className = `btn-toggle ${isOff ? 'off' : 'running'}`;
+            fastToggle.textContent = isOff ? '▶ start' : '⏸ pause';
+            fastToggle.dataset.action = 'toggleAgent';
+            fastToggle.dataset.paused = 'false';
+            fastToggle.title = agentToggleTitle(a, false, isOff);
+          }
         }
-        // Same for the stat fields and indicators — they live outside the
-        // scroll region, so replacing them wholesale cannot cause the scroll
-        // jumps the fast path exists to prevent.
+        // Same for the blockers line, the stat fields and the indicators — they
+        // live outside the scroll region, so replacing them wholesale cannot
+        // cause the scroll jumps the fast path exists to prevent.
+        const blockersEl = detail.querySelector('.oc-detail-blockers');
+        if (blockersEl) blockersEl.innerHTML = agentBlockerLineHtml(a) + neverScheduledChipHtml(a, a.name);
         const fieldsEl = detail.querySelector('.oc-detail-fields');
         if (fieldsEl) fieldsEl.outerHTML = ocDetailFieldsHtml(a, isPaused, isOff, isOnDemand);
         const indEl = detail.querySelector('.oc-detail-indicators');
@@ -4482,7 +4549,9 @@
             ? '<button class="btn-toggle on-demand" title="On-demand agent — kicked manually, not by governor cadence">⚡ on demand</button>'
             : !dashboardRoleAtLeast(window._hiveRole || 'read', 'owner')
             ? ''
-            : `<button class="btn-toggle ${isPaused ? 'paused' : isOff ? 'off' : 'running'}" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="${isPaused}" title="${isPaused ? 'Resume this agent — it will start running on its configured cadence' : isOff ? 'Start this agent — it is currently off in this governor mode' : 'Pause this agent — stops governor from kicking it until resumed'}">${isPaused ? '▶ resume' : isOff ? '▶ start' : '⏸ pause'}</button>`}
+            : isPaused
+            ? pausedAgentActionHtml(a)
+            : `<button class="btn-toggle ${isOff ? 'off' : 'running'}" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="false" title="${esc(agentToggleTitle(a, false, isOff))}">${isOff ? '▶ start' : '⏸ pause'}</button>`}
           ${sessionChip(a, '▶ terminal', `<a href="${terminalUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" data-action="openTerminal" data-agent="${esc(a.name)}" title="Open the live tmux terminal session for this agent in a new tab">▶ terminal</a>`)}
           ${sessionChip(a, '📄 full log', `<a href="${fullLogUrl(a.name, false)}" target="_blank" rel="noopener" class="terminal-link" title="Open the full retained log of this agent's latest run as selectable, searchable text in a new tab">📄 full log</a>`)}
           ${sessionChip(a, '⬇ log', `<a href="${fullLogUrl(a.name, true)}" download class="terminal-link" title="Download the full retained log of this agent's latest run as a text file">⬇ log</a>`)}
@@ -4499,7 +4568,8 @@
             ${modelOptionsHtml(a.cli, a.model)}
           </select>
         </div>
-        ${terminalCopyHintHtml(needsLoginDown, agentSessionUnavailable(a))}
+        <div class="oc-detail-blockers">${agentBlockerLineHtml(a)}${neverScheduledChipHtml(a, a.name)}</div>
+        ${terminalCopyHintHtml(needsLoginDown, agentSessionUnavailable(a), a.name)}
         ${ocDetailFieldsHtml(a, isPaused, isOff, isOnDemand)}
         <div class="oc-detail-indicators">${agentIndicators(a.name)}</div>
         <div class="oc-detail-summary-wrap">
@@ -4552,11 +4622,18 @@
       const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' } };
       if (prompt) opts.body = JSON.stringify({ prompt });
       try {
-        const res = await fetch('/api/kick/' + name, opts);
-        const data = await res.json();
+        const data = await postJSON('/api/kick/' + name, opts);
         if (!data.ok) { showToast('Kick failed: ' + (data.error || 'unknown'), 'error'); return; }
-        showToast(prompt ? 'Sent to ' + name : 'Kicked ' + name, 'success');
         input.value = '';
+        if (data.status === 'in-flight') {
+          showToast('A kick is already being delivered to ' + name, 'info');
+          return;
+        }
+        // 202 means queued, not delivered (#5325). Hold a persistent toast and
+        // rewrite it once the poll settles, so the card never claims success
+        // the server has not confirmed — nor failure it has not observed.
+        const toast = showToast((prompt ? 'Sending to ' : 'Kicking ') + name + '...', 'info', true);
+        await reportKickOutcome(name, toast, 'Queued for ' + name);
       } catch (e) { showToast('Kick failed: ' + e.message, 'error'); }
     }
 
@@ -6060,20 +6137,208 @@
     /* ttyd 1.7.7 does not handle OSC52 writes in its browser client, while
        tmux mouse mode owns ordinary drag selection. Put the escape hatch next
        to the terminal control rather than in a first-open toast that is gone
-       by the time it matters. A login prompt always wins over the persisted
-       baseline dismissal because it predicts an OAuth URL must be copied. */
-    function terminalCopyHintHtml(needsLogin, sessionUnavailable) {
+       by the time it matters.
+
+       #5327: the ⇧-drag / Ctrl+Shift+C advice is useful the first time and
+       pure noise on every agent card thereafter, so the baseline row is now a
+       single small "keyboard copy" affordance carrying the advice in its
+       tooltip, dismissible for good. The login-blocked row keeps its full
+       sentence — that one predicts an OAuth URL must be copied right now, so
+       it earns the space and always wins over the persisted dismissal. */
+    const TERMINAL_KEYBOARD_COPY_HINT = 'Selecting text in the terminal: hold ⇧ (Shift) while dragging — tmux mouse mode owns an ordinary drag. Then Ctrl+Shift+C copies and Ctrl+Shift+V pastes.';
+    function terminalCopyHintHtml(needsLogin, sessionUnavailable, agentName) {
       if (sessionUnavailable) return '';
-      if (!needsLogin && terminalCopyHintDismissed()) return '';
-      const message = needsLogin
-        ? 'You’ll be copying a URL: hold <strong>Shift</strong> while selecting · <strong>Ctrl+Shift+V</strong> pastes. Wrapped URLs may copy with line breaks — check before submitting.'
-        : 'Terminal copy: <strong>⇧-drag</strong> to select · <strong>Ctrl+Shift+C / Ctrl+Shift+V</strong>';
-      const dismiss = needsLogin ? '' : '<button type="button" class="terminal-copy-hint-dismiss" data-action="dismissTerminalCopyHint" aria-label="Dismiss terminal copy hint" title="Don’t show this hint again">×</button>';
-      return `<div class="terminal-copy-hint${needsLogin ? ' needs-login' : ''}" role="note">${message}${dismiss}</div>`;
+      /* #5327: the copy control is for a LOGIN link. It is rendered only
+         where one is expected — see terminalCopyUrlButtonHtml — rather than
+         standing on every card offering whatever URL the pane happens to
+         hold. */
+      if (!needsLogin) {
+        /* Dismissed means gone. Before #5327 the row survived dismissal to
+           keep the copy button alive; now that button only exists on a
+           login-blocked card, which never reaches this branch, so there is
+           nothing left to preserve. */
+        if (terminalCopyHintDismissed()) return '';
+        const help = `<button type="button" class="terminal-copy-hint-help" data-action="showTerminalKeyboardHint" title="${esc(TERMINAL_KEYBOARD_COPY_HINT)}" aria-label="How to copy text out of this terminal">⌨ keyboard copy</button>`;
+        const dismiss = '<button type="button" class="terminal-copy-hint-dismiss" data-action="dismissTerminalCopyHint" aria-label="Dismiss terminal copy hint" title="Don’t show this hint again">×</button>';
+        return `<div class="terminal-copy-hint" role="note">${help}${dismiss}</div>`;
+      }
+      const copyBtn = terminalCopyUrlButtonHtml(agentName, needsLogin);
+      const message = 'This agent is waiting on a login. The URL is on its terminal — use the button to copy it whole (wrapped lines are rejoined), or hold <strong>Shift</strong> while selecting.';
+      return `<div class="terminal-copy-hint needs-login" role="note">${message}${copyBtn}</div>`;
+    }
+    /* The tooltip is the primary surface; this is the click-through for
+       touch and keyboard users, who never get a hover. */
+    function showTerminalKeyboardHint() {
+      showToast(TERMINAL_KEYBOARD_COPY_HINT, 'info');
     }
     function dismissTerminalCopyHint() {
       try { localStorage.setItem(TERMINAL_COPY_HINT_LS_KEY, '1'); } catch {}
+      /* Remove the baseline row, matching what terminalCopyHintHtml renders
+         on the next full re-render — the two paths must agree or the hint
+         reappears on the next poll. The :not(.needs-login) selector is what
+         protects the login-blocked row, which carries the copy control and is
+         never dismissible. */
       document.querySelectorAll('.terminal-copy-hint:not(.needs-login)').forEach(el => el.remove());
+    }
+
+    /* Copies the LOGIN URL off the agent's pane. The capture is server-side
+       with `capture-pane -J`, which rejoins terminal-wrapped lines, so a
+       wrapped OAuth URL comes back whole — Shift-drag cannot do that, it
+       copies the wrap's newlines along with the URL, which is the failure
+       mode that makes a pasted login URL silently invalid.
+
+       #5327: rendered ONLY when a login is actually in flight. needsLogin is
+       the pane poller's own observation that a login prompt is on screen (see
+       _agentNeedsLogin), which is the same condition that paints the 🔑 badge
+       — so the control appears exactly when there is a login URL worth
+       offering, and is absent (not merely disabled) the rest of the time.
+       Naming the case rather than the mechanism is the other half: an
+       operator who sees "Copy login URL" beside a 🔑 agent does not have to
+       hover a tooltip to find out what it is for. */
+    function terminalCopyUrlButtonHtml(agentName, needsLogin) {
+      if (!agentName || !needsLogin) return '';
+      return `<button type="button" class="terminal-copy-url-btn" data-action="copyTerminalUrl" data-agent="${esc(agentName)}" title="Show this agent\u2019s sign-in URL, captured whole from its terminal — wrapped lines are rejoined so the OAuth link is not broken by the wrap">🔑 Copy login URL</button>`
+        + `<button type="button" class="terminal-copy-url-btn" data-action="submitLoginCode" data-agent="${esc(agentName)}" title="Paste the authorization code the sign-in page gave you. It is typed into the agent\u2019s terminal by the server, so the browser terminal cannot mangle it.">↩ Submit login code</button>`;
+    }
+
+    /* Writes text to the clipboard, reporting honestly when it cannot.
+       navigator.clipboard exists only in a secure context, and a hive reached
+       over plain http:// on a LAN address is not one — which is exactly how
+       self-hosted hives are usually reached, so this is the common case, not
+       the edge case. The execCommand fallback works there; when BOTH fail the
+       caller gets false and must say so rather than pretend it copied. */
+    async function writeClipboardText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        try { await navigator.clipboard.writeText(text); return true; } catch {}
+      }
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      // Off-screen but still focusable: execCommand('copy') ignores a hidden
+      // or display:none element.
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      let ok = false;
+      try {
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        ok = document.execCommand('copy');
+      } catch { ok = false; }
+      ta.remove();
+      return ok;
+    }
+
+    /* The write-side twin of copyTerminalUrl.
+
+       Copying OUT of the dashboard terminal is broken (#5188) and this is the
+       same defect in the other direction: an operator who has opened the
+       sign-in URL must paste a code BACK, and ttyd/xterm.js over tmux mangles
+       it. Without this the only route left is a host shell and `tmux
+       send-keys`, which is not an answer for an operator whose interface is a
+       web dashboard.
+
+       The code goes to the server, which types it into the pane — the browser
+       terminal is never involved. It is refused rather than sanitised if it
+       carries whitespace or control characters, so a value that could submit a
+       second command into the agent's shell cannot be typed at all; the reason
+       is surfaced verbatim rather than as a generic failure. */
+    async function submitLoginCode(agentName) {
+      if (!agentName) return;
+      const code = prompt(`Paste the authorization code for "${agentName}".\n\nIt is sent to the server and typed into the agent's terminal, so the browser terminal cannot corrupt it.`);
+      if (code === null) return;
+      if (!code.trim()) { showToast('No code entered', 'error'); return; }
+      try {
+        const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/login-code`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: code.trim() }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { showToast(d.error || `Could not submit the code (HTTP ${r.status})`, 'error'); return; }
+        showToast(`Code submitted to ${agentName}`, 'success');
+      } catch (err) {
+        showToast(`Could not submit the code: ${err && err.message ? err.message : err}`, 'error');
+      }
+    }
+
+    async function copyTerminalUrl(agentName) {
+      let urls = [];
+      try {
+        const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/terminal-urls`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        /* #5327: authUrls is the sign-in subset. The unfiltered `urls` list
+           is deliberately NOT used as a fallback — offering "the newest URL
+           on the pane" under a button labelled "Copy login URL" is precisely
+           the mislabelling being fixed. */
+        urls = Array.isArray(d.authUrls) ? d.authUrls : [];
+      } catch (e) {
+        showToast(`Could not read ${agentName}'s terminal: ${e.message || e}`, 'error');
+        return;
+      }
+      if (!urls.length) {
+        showToast(`No login URL on ${agentName}'s terminal right now`, 'info');
+        return;
+      }
+      /* #5327: lead with the pre-selected field rather than a programmatic
+         write. A self-hosted hive is routinely reached over plain http:// on
+         a LAN address, which is not a secure context, so the write is BLOCKED
+         more often than it succeeds here — and a blocked write spends the
+         operator's click and returns instructions. Showing the URL, selected
+         and ready for one Cmd/Ctrl+C, always works; the automatic write is
+         still attempted underneath, and when it lands the panel just says so.
+         Either way the operator ends the click holding the URL. */
+      showTerminalUrlPanel(agentName, urls[0]);
+    }
+
+    /* Presents the login URL in a selectable, pre-selected input and reports
+       whether the clipboard write also succeeded. This is the PRIMARY surface
+       (#5327), not a last resort: it is the only path that works in every
+       browser context this dashboard is served from. */
+    async function showTerminalUrlPanel(agentName, url) {
+      const toast = showToast(`Login URL from ${agentName}'s terminal — press Cmd/Ctrl+C to copy the selected text.`, 'info');
+      /* An info toast self-dismisses on a timer, which would take the URL
+         away mid-read. Stick it explicitly: this panel is the operator's copy
+         surface and closes only when they say so. Sticking it directly rather
+         than raising the toast to 'error' keeps it from reading as a failure
+         — in the common path nothing failed. */
+      if (toast) makeToastSticky(toast);
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.readOnly = true;
+      input.value = url;
+      input.className = 'terminal-copy-url-fallback';
+      input.setAttribute('aria-label', `Login URL from ${agentName}'s terminal`);
+      /* An error toast is made sticky, and makeToastSticky puts a
+         dismiss-on-click listener on the WHOLE toast. Without this the first
+         click into the input — the one action this panel exists to invite —
+         would close the toast and take the URL with it. */
+      input.addEventListener('click', e => e.stopPropagation());
+      if (toast) toast.appendChild(input);
+      else document.body.appendChild(input);
+      input.focus();
+      input.select();
+
+      /* Try the clipboard too, but only report the OUTCOME — never let a
+         refused write become the whole result of the click. */
+      const ok = await writeClipboardText(url);
+      // Re-select: the off-screen textarea execCommand uses steals the
+      // selection, which would leave the operator's Cmd/Ctrl+C copying
+      // nothing if the write was refused.
+      input.focus();
+      input.select();
+      if (!toast || !toast.isConnected) return;
+      const note = document.createElement('div');
+      note.className = 'terminal-copy-url-note';
+      note.textContent = ok
+        ? '✓ Also copied to your clipboard.'
+        : (window.isSecureContext
+          ? 'This browser blocked the automatic clipboard write, so copy it by hand above.'
+          : 'Automatic copying needs HTTPS or localhost and this hive is served over plain http, so copy it by hand above.');
+      note.addEventListener('click', e => e.stopPropagation());
+      toast.appendChild(note);
     }
 
     async function openTerminal(agentName, href) {
@@ -6143,6 +6408,108 @@
       return down && a.authKnown === true && a.authAvailable !== true;
     }
 
+    /* Agent blockers (#5594). THREE orthogonal flags decide whether an agent
+       will ever do work: is its session up, has an operator paused it, and is
+       a cadence configured at all. The card used to reveal them one at a
+       time — a single action button cleared the first, which uncovered the
+       second, and the third (no cadence in any mode) was not on the card at
+       all — so operators walked a serial treasure hunt and still ended up
+       with an agent that never ran.
+
+       These read the RAW server flags rather than the mutually-exclusive
+       display state (isPaused/isOff/isStopped, which deliberately suppress
+       one another for styling), so every live blocker is legible BEFORE the
+       first click. agentSchedulingBlockers returns them in the order an
+       operator must clear them; empty means the governor really will kick
+       this agent. */
+    function agentSchedulingBlockers(a) {
+      const out = [];
+      if (a.paused === true) out.push('paused');
+      if (a.offByCadence === true) {
+        const mode = (window._lastStatus?.governor?.mode || '').toLowerCase();
+        out.push(mode ? `off in ${mode} mode` : 'off in this governor mode');
+      }
+      if (a.noCadence === true) out.push('never scheduled');
+      return out;
+    }
+    function agentToggleTitle(a, isPaused, isOff) {
+      if (isPaused) {
+        const rest = [];
+        if (a.state !== 'running') rest.push('its session is down (use \u21bb restart)');
+        if (a.offByCadence === true) rest.push('its cadence for the current governor mode is off (\u2699\uFE0F \u2192 Cadences)');
+        if (a.noCadence === true) rest.push('no governor mode gives it a cadence (\u2699\uFE0F \u2192 Cadences)');
+        const base = 'Resume this agent \u2014 it will start running on its configured cadence';
+        if (rest.length === 0) return base;
+        return `${base}. Resuming alone is NOT enough: ${rest.join('; ')}.`;
+      }
+      if (isOff) return 'Start this agent \u2014 it is currently off in this governor mode';
+      return 'Pause this agent \u2014 stops governor from kicking it until resumed';
+    }
+    /* Combined primary action for a PAUSED agent \u2014 the follow-up to
+       resume-leads (#5594). Resume-leads guarantees the pause is never
+       hidden, and its tooltip names the session as a blocker resuming will
+       not clear; this removes that residual two-step dance: when the session
+       is ALSO down, the one button reads '\u25b6 start & resume' and clears both
+       flags in a single click via startResumeAgent (a client-side chain of
+       the two existing endpoints \u2014 resume, then restart \u2014 no new backend
+       surface). A session-up paused agent keeps the plain '\u25b6 resume' with
+       agentToggleTitle's blocker-naming tooltip. Every render site (card
+       grid, detail panel, detail fast path) builds the paused action here,
+       which is the single place that guarantees a paused agent never shows
+       a bare Start. */
+    function pausedAgentActionHtml(a) {
+      if (a.state === 'running') {
+        return `<button class="btn-toggle paused" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="true" title="${esc(agentToggleTitle(a, true, false))}">\u25b6 resume</button>`;
+      }
+      const rest = [];
+      if (a.offByCadence === true) rest.push('its cadence for the current governor mode is off (\u2699\ufe0f \u2192 Cadences)');
+      if (a.noCadence === true) rest.push('no governor mode gives it a cadence (\u2699\ufe0f \u2192 Cadences)');
+      let title = 'This agent is paused AND its session is down \u2014 one click resumes it and asks the supervisor to start the session. No second Resume step.';
+      if (rest.length > 0) title += ` Still not enough on its own: ${rest.join('; ')}.`;
+      return `<button class="btn-toggle paused" data-action="startResumeAgent" data-agent="${esc(a.name)}" data-paused="true" title="${esc(title)}">\u25b6 start &amp; resume</button>`;
+    }
+    function neverScheduledChipHtml(a, configTarget) {
+      if (a.noCadence !== true) return '';
+      const who = a.displayName || a.name;
+      const tip = `${who} is enabled but NO governor mode gives it a cadence, and it has never been kicked \u2014 it will sit idle forever. Click to set cadences.`;
+      return `<button class="never-scheduled-chip" data-action="openConfigDialog" data-config-type="agent" data-agent="${esc(configTarget)}" data-tab="Cadences" title="${esc(tip)}">\u23F1 never scheduled \u2014 set cadences</button>`;
+    }
+    function agentBlockerLineHtml(a) {
+      const onDemand = a.onDemand === true;
+      let session = 'up', sessionCls = 'ab-ok';
+      let sessionTip = 'The tmux session is alive.';
+      if (agentIsDisabled(a)) {
+        session = 'disabled'; sessionCls = 'ab-bad';
+        sessionTip = 'Disabled in config \u2014 the governor never starts this agent. Enable it with \u2699\uFE0F.';
+      } else if (a.state !== 'running') {
+        session = 'down'; sessionCls = 'ab-bad';
+        sessionTip = 'No live tmux session \u2014 \u21bb restart asks the supervisor to respawn it.';
+      }
+      const blockers = agentSchedulingBlockers(a);
+      let sched = a.cadence || '\u2014', schedCls = 'ab-ok';
+      let schedTip = 'Governor cadence for the current mode.';
+      if (onDemand) {
+        sched = 'on demand'; schedCls = '';
+        schedTip = 'On-demand agent \u2014 kicked manually, never by governor cadence.';
+      } else if (blockers.length > 0) {
+        sched = blockers.join(' + '); schedCls = 'ab-bad';
+        schedTip = `EVERY reason the governor will not kick ${a.displayName || a.name} right now \u2014 all of them must be cleared: ${blockers.join('; ')}.`;
+      }
+      let next = a.nextKickIn ? `in ${a.nextKickIn}` : (a.nextKick || '\u2014');
+      let nextCls = '';
+      if (onDemand) next = 'on demand';
+      else if (blockers.length > 0) { next = 'never'; nextCls = 'ab-bad'; }
+      const nextTip = (!onDemand && blockers.length === 0 && a.nextKick)
+        ? `Next governor kick at ${a.nextKick}.`
+        : 'Nothing is scheduled to kick this agent.';
+      return `<div class="agent-blockers">`
+        + `<span class="ab-seg ${sessionCls}" title="${esc(sessionTip)}"><span class="ab-key">session</span>${esc(session)}</span>`
+        + `<span class="ab-sep">\u00B7</span>`
+        + `<span class="ab-seg ${schedCls}" title="${esc(schedTip)}"><span class="ab-key">scheduling</span>${esc(sched)}</span>`
+        + `<span class="ab-sep">\u00B7</span>`
+        + `<span class="ab-seg ${nextCls}" title="${esc(nextTip)}"><span class="ab-key">next kick</span>${esc(next)}</span>`
+        + `</div>`;
+    }
     function renderAgents(agents) {
       const el = document.getElementById('agents');
       // Preserve custom prompt input values across re-renders
@@ -6177,12 +6544,22 @@
         const dotState = isOff ? 'off-healthy' : dotCls;
         const canToggle = a.beadRole !== 'supervisor';
         const canPauseToggle = canToggle && dashboardRoleAtLeast(window._hiveRole || 'read', 'owner');
-        const toggleBtn = canToggle ? (isOff
+        /* RESUME LEADS (#5594). A paused agent's card offers its pause toggle
+           FIRST and unconditionally; the governor-cadence gear must never take
+           the slot, or the pause stays hidden until the gear's blocker is
+           cleared and a second button appears. isOff already excludes isPaused
+           today, so this renders identically — stating the order here is what
+           keeps it true if that derivation ever changes. The remaining
+           blockers ride in the tooltip and on the blockers line below, so the
+           operator learns them before the click, not after. */
+        const toggleBtn = canToggle ? (isPaused && canPauseToggle
+          ? pausedAgentActionHtml(a)
+          : isOff
           ? `<button class="btn-toggle off" data-action="openConfigDialog" data-config-type="agent" data-agent="${esc(a.name)}" title="Agent is off in this governor mode — click to configure per-mode cadences">⚙ off</button>`
           : isOnDemand
           ? `<button class="btn-toggle on-demand" title="On-demand agent — kicked manually, not by governor cadence">⚡ on demand</button>`
           : canPauseToggle
-          ? `<button class="btn-toggle ${isPaused ? 'paused' : 'running'}" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="${isPaused}" title="${isPaused ? 'Resume this agent — it will start running on its configured cadence' : 'Pause this agent — stops governor from kicking it until resumed'}">${isPaused ? '▶ resume' : '⏸ pause'}</button>`
+          ? `<button class="btn-toggle running" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="false" title="${esc(agentToggleTitle(a, false, false))}">⏸ pause</button>`
           : '') : '';
         // liveSummary is pushed via SSE every 5s — no separate fetch needed
         let summaryEl = '';
@@ -6209,8 +6586,8 @@
         const disabledBadge = agentIsDisabled(a) ? ` <span class="status-badge disabled" title="Disabled in config — the governor never starts this agent. Configure it with the gear to enable.">disabled</span>` : '';
         return `<div class="agent-card ${cls}${compactCls}" data-agent="${esc(a.name)}">
           <span class="working-indicator"></span>
-          <div class="agent-name"><span class="dot ${dotState}"${isOff ? ` title="${esc(OFF_HEALTHY_TITLE)}"` : ''}></span>${a.emoji ? a.emoji + ' ' : ''}${esc(a.displayName || a.name)}${needsLogin ? ' <span title="CLI needs login">\uD83D\uDD11</span>' : ''}${a.sandboxed ? ' <span class="status-badge done" title="Sandboxed runner active">sandboxed</span>' : ''}${disabledBadge}${replicaBadge} ${toggleBtn} <button class="compact-toggle" data-action="toggleAgentCompact" data-arg0="${esc(a.name)}" data-stop="1" title="Toggle compact/expanded view for this agent card">${isAgentCompact(a.name) ? '&#9655; expand' : '&#9661; compact'}</button> ${sessionChip(a, '▶ terminal', `<a href="${terminalUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" data-action="openTerminal" data-agent="${esc(a.name)}" title="Open tmux session">▶ terminal</a>`)} ${sessionChip(a, '📄 full log', `<a href="${fullLogUrl(a.name, false)}" target="_blank" rel="noopener" class="terminal-link" title="Full log of the latest run as selectable, searchable text">📄 full log</a>`)} <a href="${kickHistoryUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" title="Archived logs of previous kicks — survives restarts and upgrades">🕘 past kicks</a> <button class="restart-btn" data-action="restartAgent" data-agent="${esc(a.name)}" title="Kill tmux session — supervisor will respawn with fresh context">↻ restart</button> <button class="config-gear" data-action="openConfigDialog" data-config-type="agent" data-agent="${esc(configTarget)}" title="Configure ${esc(a.replicaBase ? (a.replicaBase + ' (base for ' + a.name + ')') : (a.displayName || a.name))}">⚙️</button></div>
-          ${terminalCopyHintHtml(needsLogin, agentSessionUnavailable(a))}
+          <div class="agent-name"><span class="dot ${dotState}"${isOff ? ` title="${esc(OFF_HEALTHY_TITLE)}"` : ''}></span>${a.emoji ? a.emoji + ' ' : ''}${esc(a.displayName || a.name)}${needsLogin ? ' <span title="CLI needs login">\uD83D\uDD11</span>' : ''}${a.sandboxed ? ' <span class="status-badge done" title="Sandboxed runner active">sandboxed</span>' : ''}${disabledBadge}${replicaBadge} ${toggleBtn}${neverScheduledChipHtml(a, configTarget)} <button class="compact-toggle" data-action="toggleAgentCompact" data-arg0="${esc(a.name)}" data-stop="1" title="Toggle compact/expanded view for this agent card">${isAgentCompact(a.name) ? '&#9655; expand' : '&#9661; compact'}</button> ${sessionChip(a, '▶ terminal', `<a href="${terminalUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" data-action="openTerminal" data-agent="${esc(a.name)}" title="Open tmux session">▶ terminal</a>`)} ${sessionChip(a, '📄 full log', `<a href="${fullLogUrl(a.name, false)}" target="_blank" rel="noopener" class="terminal-link" title="Full log of the latest run as selectable, searchable text">📄 full log</a>`)} <a href="${kickHistoryUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" title="Archived logs of previous kicks — survives restarts and upgrades">🕘 past kicks</a> <button class="restart-btn" data-action="restartAgent" data-agent="${esc(a.name)}" title="Kill tmux session — supervisor will respawn with fresh context">↻ restart</button> <button class="config-gear" data-action="openConfigDialog" data-config-type="agent" data-agent="${esc(configTarget)}" title="Configure ${esc(a.replicaBase ? (a.replicaBase + ' (base for ' + a.name + ')') : (a.displayName || a.name))}">⚙️</button></div>
+          ${terminalCopyHintHtml(needsLogin, agentSessionUnavailable(a), a.name)}
           <div class="agent-state ${isOnDemand ? 'on-demand' : isPaused ? 'paused' : isOff ? 'off' : a.busy}">${isOnDemand ? 'on demand' : isPaused ? 'paused' : isOff ? 'off' : a.busy}${pauseInfoIcon(a)}${(() => {
             if (a.structuredStatus === 'BLOCKED') return '<span class="status-badge blocked" title="' + esc(a.statusEvidence) + '">blocked</span>';
             if (a.structuredStatus === 'NEEDS_CONTEXT') return '<span class="status-badge needs-context" title="' + esc(a.statusEvidence) + '">needs context</span>';
@@ -6219,6 +6596,7 @@
             if (isStale) return '<span class="status-badge needs-context">stale</span>';
             return '';
           })()}${agentSpendChip(a.name)}</div>
+          ${agentBlockerLineHtml(a)}
           ${(() => {
             // Last upstream/launch error stays on its own line below the state
             // badge, never behind the working-indicator dot — previously the
@@ -7255,6 +7633,22 @@
         badge.style.color = isPublic ? 'var(--green)' : 'var(--indigo)';
         badge.title = 'Every repo in this hive is on ' + hostLabel + (isPublic ? '' : ' (GitHub Enterprise)') + ' — this hive is single-host';
       }
+      // Section-header escalation counter: "· N need human review". Escalated
+      // PRs (needs-human label from the escalation ledger) previously had no
+      // section-level signal — nine parked PRs sat invisible to the operator
+      // for a week (kubestellar/console, 2026-09-01). Hidden at zero so a
+      // healthy hive shows nothing extra.
+      const needHumanTotal = repos.reduce((n, r) => n + (r.openPrs || []).filter(p => (p.labels || []).map(l => String(l)).includes('needs-human')).length, 0);
+      const nhEl = document.getElementById('repos-needs-human');
+      if (nhEl) {
+        if (needHumanTotal > 0) {
+          nhEl.textContent = '· ' + needHumanTotal + ' need' + (needHumanTotal === 1 ? 's' : '') + ' human review';
+          nhEl.style.display = 'inline';
+        } else {
+          nhEl.textContent = '';
+          nhEl.style.display = 'none';
+        }
+      }
       setIfChanged(el, repos.map(r => {
         const iSpark = sparkSvg(historyData.map(s => s.repos?.[r.name]?.issues ?? 0), 'var(--blue)');
         const pSpark = sparkSvg(historyData.map(s => s.repos?.[r.name]?.prs ?? 0), 'var(--purple)');
@@ -7279,17 +7673,34 @@
           const prAge = pillAge(p.created_at);
           const labels = (p.labels || []).map(l => String(l));
           const queued = labels.includes(window._hiveAutoMergeLabel || 'lgtm');
-          const prTip = (p.title || '') + (p.author ? ' — @' + p.author : '') + (prAge ? ' (' + prAge + ')' : '') + (p.mergeable ? ' (merge eligible)' : '') + (queued ? ' (queued for auto-merge)' : '');
+          // Escalated out of the automated fix lane: the escalation ledger
+          // (pkg/escalation) applies the `needs-human` label once automated
+          // fix attempts are exhausted. The label list is the single source
+          // of truth — the same signal the ledger writes to GitHub — so this
+          // view cannot drift from the ledger.
+          const needsHuman = labels.includes('needs-human');
+          const prTip = (p.title || '') + (p.author ? ' — @' + p.author : '') + (prAge ? ' (' + prAge + ')' : '') + (p.mergeable ? ' (merge eligible)' : '') + (queued ? ' (queued for auto-merge)' : '') + (needsHuman ? ' (needs human review)' : '');
           const canQueue = dashboardRoleAtLeast(window._hiveRole || 'read', 'merger') && (window._hiveUser || dashboardRoleAtLeast(window._hiveRole || 'read', 'owner')) && !(p.author && window._hiveUser && p.author.toLowerCase() === window._hiveUser.toLowerCase());
           const parts = (r.full || r.name || '').split('/');
           const owner = parts.length > 1 ? parts[0] : '';
           const repoName = parts.length > 1 ? parts.slice(1).join('/') : (r.name || '');
-          const queueBtn = canQueue
-            ? (queued
-                ? '<span class="repo-pr-pill mergeable" title="Already queued for Hive auto-merge on green CI">Queued</span>'
-                : `<button class="repo-pr-pill" style="cursor:pointer" data-action="queuePRAutoMerge" data-arg0="${esc(owner)}" data-arg1="${esc(repoName)}" data-arg2="${p.number}" data-arg-types="s,s,j,t" data-stop="1" data-prevent="1">Queue auto-merge</button>`)
-            : '';
-          return `<a class="repo-pr-pill${mergeClass}" href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(prTip)}"><span class="pill-num">#${p.number}</span><span class="pill-title">${esc(title)}</span>${mergeIcon}</a>${queueBtn}`;
+          // The action-chip slot after the PR pill. needs-human takes
+          // precedence over the Queue auto-merge action: an escalated PR is
+          // out of the automated lane by definition, so offering to queue it
+          // for auto-merge would contradict the escalation. Removing the
+          // needs-human label on GitHub returns the PR to the automated lane
+          // and brings the queue action back on the next refresh.
+          const queueBtn = needsHuman
+            ? '<span class="repo-pr-pill needs-human pill-needs-human-badge" title="Automated fix attempts exhausted — a human must review this PR. Remove the needs-human label after addressing the root cause to return it to the automated fix lane.">⚠ needs human</span>'
+            : (canQueue
+                ? (queued
+                    ? '<span class="repo-pr-pill mergeable" title="Already queued for Hive auto-merge on green CI">Queued</span>'
+                    : `<button class="repo-pr-pill" style="cursor:pointer" data-action="queuePRAutoMerge" data-arg0="${esc(owner)}" data-arg1="${esc(repoName)}" data-arg2="${p.number}" data-arg-types="s,s,j,t" data-stop="1" data-prevent="1">Queue auto-merge</button>`)
+                : '');
+          // needs-human wins the pill tint over mergeable green: a PR can be
+          // technically mergeable AND escalated, and the escalation is what
+          // the operator must see.
+          return `<a class="repo-pr-pill${needsHuman ? ' needs-human' : mergeClass}" href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(prTip)}"><span class="pill-num">#${p.number}</span><span class="pill-title">${esc(title)}</span>${mergeIcon}</a>${queueBtn}`;
         }).join('');
         const allPills = issuePills + prPills;
         const pillsHtml = allPills ? `<div class="repo-issues">${allPills}</div>` : '';
@@ -7566,7 +7977,7 @@
     // 'openrouter' is a first-class inference method (an OpenAI-compatible gateway
     // preset), so it appears in every backend/method picker even before a matching
     // Model Gateway is configured — the user picks it, then funds/configures it.
-    const KNOWN_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'codex', 'goose', 'aider', 'vllm', 'llm-d', 'litellm', 'openrouter', 'watsonx'];
+    const KNOWN_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'agy', 'codex', 'goose', 'aider', 'vllm', 'llm-d', 'litellm', 'openrouter', 'watsonx'];
     const FREE_BACKENDS = ['copilot', 'goose'];
     const INFERENCE_BACKENDS = ['vllm', 'llm-d', 'litellm', 'openrouter', 'watsonx'];
     // Names of Model Gateways configured under Settings → Model Gateways
@@ -7664,12 +8075,29 @@
     const BOB_CLI_MODELS = [
       { value: 'auto', label: 'Auto (bob picks)' },
     ];
+    // Google Antigravity exposes an account-aware catalog through `agy models`.
+    // This is the first-paint / failed-probe fallback, captured from agy 1.1.18
+    // on 2026-08-31 in the CLI's own order. Keep in sync with agyStaticModels
+    // in cli_models_agy.go.
+    const AGY_CLI_MODELS = [
+      { value: 'gemini-3.7-flash-high', label: 'Gemini 3.7 Flash (High)' },
+      { value: 'gemini-3.7-flash-medium', label: 'Gemini 3.7 Flash (Medium)' },
+      { value: 'gemini-3.7-flash-low', label: 'Gemini 3.7 Flash (Low)' },
+      { value: 'gemini-3.6-flash-high', label: 'Gemini 3.6 Flash (High)' },
+      { value: 'gemini-3.6-flash-medium', label: 'Gemini 3.6 Flash (Medium)' },
+      { value: 'gemini-3.6-flash-low', label: 'Gemini 3.6 Flash (Low)' },
+      { value: 'gemini-3.1-pro-high', label: 'Gemini 3.1 Pro (High)' },
+      { value: 'gemini-3.1-pro-low', label: 'Gemini 3.1 Pro (Low)' },
+      { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (Thinking)' },
+      { value: 'claude-opus-4-6-thinking', label: 'Claude Opus 4.6 (Thinking)' },
+      { value: 'gpt-oss-120b-medium', label: 'GPT-OSS 120B (Medium)' },
+    ];
     const KNOWN_MODELS = COPILOT_CLI_MODELS;
     // CLI_BACKENDS gates which /api/config/backends entries populate
-    // BACKEND_MODELS. bob is included so its server-served single-option list
-    // is honored; without it bob's entry would be dropped and modelsForBackend
-    // would fall through to the copilot catalog.
-    const CLI_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'goose', 'codex'];
+    // BACKEND_MODELS. Every CLI with a server-served inventory must appear
+    // here; otherwise its entry is dropped and modelsForBackend falls back to
+    // the pre-discovery catalog (or, for an omitted unknown CLI, Copilot's).
+    const CLI_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'agy', 'goose', 'codex'];
     // BACKEND_MODELS holds the live-discovered model list for every backend
     // (inference AND cli), keyed by backend id. INFERENCE_MODELS is kept as
     // an alias to the same object for backward compatibility with existing
@@ -7685,6 +8113,7 @@
       copilot: COPILOT_CLI_MODELS,
       bob: BOB_CLI_MODELS,
       gemini: COPILOT_CLI_MODELS,
+      agy: AGY_CLI_MODELS,
       goose: COPILOT_CLI_MODELS,
       codex: CODEX_CLI_MODELS,
     };
@@ -7692,6 +8121,7 @@
       // Configured gateways (e.g. openrouter) are inference/gateway backends,
       // so they carry the same ⚡ marker as vllm/llm-d/litellm.
       if (INFERENCE_BACKENDS.includes(b) || _configuredGateways.includes(b)) return b + ' ⚡';
+      if (b === 'agy') return 'Google Antigravity (agy)';
       return b;
     }
     // Auto-select sentinels: values meaning "let the CLI pick its own model"
@@ -7910,12 +8340,55 @@
     // when the model is observed available again.
     const _modelHealFired = {};
 
+    // Auto-heal HEAL TARGETS, per backend. Appearing in a discovery catalog is
+    // NOT proof the backend's CLI can run a model, and auto-heal pins an agent
+    // to its target for real work — so the target is drawn from a known-good
+    // set rather than from `available[0]` (#5338).
+    //
+    // The claude catalog is the strict case that motivated this: it is
+    // discovered from api.anthropic.com/v1/models, which enumerates what the
+    // ACCOUNT may call over the HTTP API — a superset of what the bundled
+    // `claude` CLI can drive. A model the CLI advertises but whose adapter
+    // cannot build a request still lists cleanly, and because /v1/models is
+    // newest-first, that model lands at available[0] — exactly the slot the
+    // old code auto-assigned. On the reporting hive that pinned the only
+    // write-capable agent to a model whose every call died in the CLI's
+    // request builder, and re-applied it at each boot, defeating config-file
+    // remediation.
+    //
+    // The bare aliases are the safe targets: `claude --model opus|sonnet|haiku`
+    // resolves through the CLI's OWN current-model mapping, so the CLI can only
+    // ever select something it can actually drive. They are also in
+    // claudeAlwaysIncludeModels (cli_models.go), so they are present in every
+    // served claude list — live-discovered or static fallback.
+    //
+    // Backends absent from this map keep the previous first-available
+    // behavior: this narrows the blast radius to the backend the failure was
+    // reported against rather than re-tuning heal targets fleet-wide.
+    const MODEL_HEAL_PREFERRED_TARGETS = {
+      claude: ['sonnet', 'opus', 'haiku'],
+    };
+
+    // healTargetFor picks the model auto-heal should switch an agent TO.
+    // Returns '' when no vetted target is available, which SUPPRESSES the heal
+    // — leaving a model that is merely absent from one catalog beats pinning
+    // the agent to one its CLI cannot run.
+    function healTargetFor(backend, available) {
+      const preferred = MODEL_HEAL_PREFERRED_TARGETS[backend];
+      if (!preferred) return available[0] || '';
+      for (const want of preferred) {
+        const hit = available.find(v => _modelIdMatches(v, want));
+        if (hit) return hit;
+      }
+      return '';
+    }
+
     function reconcileModelsAfterDiscovery(backend, models, fallback) {
       // Guard: only act on a genuinely successful discovery. Never switch
       // based on unverified static aliases or an empty list.
       if (fallback || !models || !models.length) return;
       const available = models.map(m => m.value);
-      const first = available[0];
+      const first = healTargetFor(backend, available);
       const isAvailable = (m) => available.some(v => _modelIdMatches(v, m));
       const now = Date.now();
 
@@ -7952,6 +8425,14 @@
         if (isAutoModelSentinel(backend, a.model)) return; // auto-select value — never a concrete id, never healed
         const key = `${backend}|${a.name}`;
         if (isAvailable(a.model)) { _markAvailable(key, a.model); return; } // still valid — leave untouched (idempotent)
+        // No vetted heal target for this backend — keep the current model.
+        // Checked BEFORE _confirmAbsent so the absence clock and the
+        // once-per-disappearance guard are not consumed by a heal that cannot
+        // fire; a target appearing later still gets its chance (#5338).
+        if (!first) {
+          console.warn(`model ${a.model} missing from ${backend} discovery but no vetted heal target is available — keeping selection`);
+          return;
+        }
         if (!_confirmAbsent(key, a.model)) return; // unconfirmed or already healed — no switch
         const label = a.displayName || a.name;
         const pinNote = (a.pinnedModel || a.pinnedBoth) ? ' (was pinned — model gone from provider)' : '';
@@ -7969,7 +8450,7 @@
         const defKey = `${backend}|__defaultModel__`;
         if (saved && isAvailable(saved)) {
           _markAvailable(defKey, saved);
-        } else if (saved && _confirmAbsent(defKey, saved)) {
+        } else if (saved && first && _confirmAbsent(defKey, saved)) {
           _configState.data.litellm.defaultModel = first;
           fetch('/api/config/governor/litellm', {
             method: 'PUT',
@@ -14012,6 +14493,7 @@ function burnAreaChart() {
       const agent = el.dataset.agent || '';
       switch (action) {
         case 'toggleAgent': toggleAgent(agent, el.dataset.paused === 'true'); break;
+        case 'startResumeAgent': startResumeAgent(agent); break;
         case 'restartAgent': restartAgent(agent); break;
         case 'openConfigDialog': { const ct = el.dataset.configType || el.dataset.arg0 || 'agent'; const tab = el.dataset.tab || el.dataset.arg2 || null; if (el.classList.contains('agent-link')) { closeConfigDialog(); setTimeout(() => openConfigDialog(ct, agent, tab), 100); } else { openConfigDialog(ct, agent || null, tab); } } break;
         case 'ocSendKick': ocSendKick(agent); break;
@@ -14019,6 +14501,9 @@ function burnAreaChart() {
         case 'kick': kick(agent); break;
         case 'kickEmpty': { const inp = document.getElementById('kick-prompt-' + agent); if (inp) inp.value = ''; kick(agent); } break;
         case 'openTerminal': e.preventDefault(); openTerminal(agent, el.href); break;
+        case 'copyTerminalUrl': e.stopPropagation(); copyTerminalUrl(agent); break;
+        case 'submitLoginCode': e.stopPropagation(); submitLoginCode(agent); break;
+        case 'showTerminalKeyboardHint': e.stopPropagation(); showTerminalKeyboardHint(); break;
         case 'togglePin': togglePin(agent, el.dataset.pinType, el.dataset.unpin === 'true'); break;
         case 'resetRestarts': resetRestarts(agent); break;
         case 'deleteAgentFromConfig': deleteAgentFromConfig(agent); break;
@@ -14204,6 +14689,75 @@ function burnAreaChart() {
       }
     }
 
+    // postJSON POSTs to an API endpoint and returns its decoded JSON body.
+    //
+    // The endpoints we control always answer JSON, but an intermediary need
+    // not: an auth proxy can answer a session-expiry redirect, an ingress can
+    // answer a 502/504, and both bodies are HTML. Calling res.json() on those
+    // throws a parser error ("Unexpected token '<'"), and the caller's catch
+    // then reports the parser's complaint instead of the actual failure —
+    // hiding whether the fix is "sign in again" or "the spoke is unreachable".
+    //
+    // So sniff the content type first and, when it is not JSON, throw an Error
+    // whose message names the real HTTP condition. Callers keep their existing
+    // catch and now surface something an operator can act on.
+    async function postJSON(url, opts) {
+      const res = await fetch(url, opts);
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        // 401/403 is the session-expiry case and has a specific remedy; every
+        // other non-JSON answer is reported by its status so a screenshot still
+        // carries the diagnosis.
+        throw new Error(res.status === 401 || res.status === 403
+          ? 'session expired — reload and sign in again'
+          : `server returned ${res.status} ${res.statusText || 'error'}`);
+      }
+      return await res.json();
+    }
+
+    // Kick delivery is asynchronous (#5325). POST /api/kick answers 202 as soon
+    // as the message is queued; whether it actually reached the CLI is read
+    // from GET /api/kick/{agent}/status. Poll that until it settles.
+    //
+    // The wait can legitimately run to the server's input-prompt timeout (120s)
+    // when a CLI is slow to present its prompt, so the ceiling here is above it
+    // — and running out of poll budget is reported as STILL PENDING, never as a
+    // failure. That distinction is the whole point of the issue: an
+    // indeterminate kick that gets rendered as failed is what made operators
+    // click Kick again and deliver the work twice.
+    const KICK_POLL_INTERVAL_MS = 2000;
+    const KICK_POLL_TIMEOUT_MS = 150000;
+
+    async function pollKickOutcome(agent) {
+      const deadline = Date.now() + KICK_POLL_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, KICK_POLL_INTERVAL_MS));
+        try {
+          const res = await fetch(`/api/kick/${agent}/status`);
+          const contentType = res.headers.get('content-type') || '';
+          if (!contentType.includes('application/json')) continue;
+          const data = await res.json();
+          if (data.status === 'delivered') return { settled: true, ok: true };
+          if (data.status === 'failed') return { settled: true, ok: false, error: data.error || 'unknown' };
+        } catch (e) {
+          // A transient poll failure says nothing about the kick. Keep polling.
+        }
+      }
+      return { settled: false };
+    }
+
+    // reportKickOutcome renders a queued kick's true result, or leaves the
+    // operator with an explicitly indeterminate message if it never settles.
+    async function reportKickOutcome(agent, toast, queuedMsg) {
+      const outcome = await pollKickOutcome(agent);
+      if (!outcome.settled) {
+        dismissToast(toast, `${queuedMsg} — still waiting for ${agent}'s CLI; check the terminal`, 'info');
+        return;
+      }
+      if (outcome.ok) { dismissToast(toast, `Kicked ${agent}`, 'success'); return; }
+      dismissToast(toast, 'Kick failed: ' + outcome.error, 'error');
+    }
+
     async function kick(agent) {
       const input = document.getElementById(`kick-prompt-${agent}`);
       const prompt = input ? input.value.trim() : '';
@@ -14215,11 +14769,14 @@ function burnAreaChart() {
       // request still surfaces feedback instead of silently doing nothing.
       const toast = showToast(`Kicking ${agent}...`, 'info', true);
       try {
-        const res = await fetch(`/api/kick/${agent}`, opts);
-        const data = await res.json();
+        const data = await postJSON(`/api/kick/${agent}`, opts);
         if (!data.ok) { dismissToast(toast, 'Kick failed: ' + (data.error || 'unknown'), 'error'); return; }
-        dismissToast(toast, `Kicked ${agent}`, 'success');
         if (input) input.value = '';
+        if (data.status === 'in-flight') {
+          dismissToast(toast, `A kick is already being delivered to ${agent}`, 'info');
+          return;
+        }
+        await reportKickOutcome(agent, toast, `Queued for ${agent}`);
       } catch (e) {
         dismissToast(toast, 'Kick failed: ' + e.message, 'error');
       }
@@ -14306,6 +14863,24 @@ function burnAreaChart() {
       // Update in-memory agent state so cadence table re-renders correctly
       const agentObj = (window._lastAgents || []).find(a => a.name === agent);
       if (agentObj) { agentObj.paused = nowPaused; }
+      // The blockers line and the toggle tooltip (#5594) both render from the
+      // agent object, so patch them from the SAME authoritative state. Left
+      // alone they would keep saying "paused" after a successful resume until
+      // the next poll — the stale-control bug this function already exists to
+      // prevent for the button label.
+      if (agentObj) {
+        document.querySelectorAll(`.agent-card[data-agent="${CSS.escape(agent)}"] .agent-blockers`)
+          .forEach(el => { el.outerHTML = agentBlockerLineHtml(agentObj); });
+        document.querySelectorAll(`.agent-card[data-agent="${CSS.escape(agent)}"] .btn-toggle`)
+          .forEach(el => {
+            // A just-paused agent gets the full combined-action rebuild —
+            // the combined start-and-resume button when its session is also
+            // down (#5594 follow-up); an unpaused one only needs its tooltip
+            // refreshed.
+            if (nowPaused) el.outerHTML = pausedAgentActionHtml(agentObj);
+            else el.title = agentToggleTitle(agentObj, false, false);
+          });
+      }
       // The focused agent-detail panel renders its own toggle button — the
       // .agent-card loop above never reaches it, so re-render it from the
       // just-updated state or the button stays stale until navigation.
@@ -14325,6 +14900,40 @@ function burnAreaChart() {
       } else {
         dismissToast(toast, `${agent} ${action}d`, 'success');
       }
+    }
+
+    // Combined start & resume for a paused agent whose session is also down
+    // (#5594 follow-up to resume-leads). Client-side chain of the two
+    // existing endpoints — resume FIRST so the pause is cleared before the
+    // supervisor spawns the session (a session started while still paused
+    // would just sit unkickable), then restart, which for a down session is
+    // simply "start". No confirm dialog: unlike restartAgent there is no
+    // live session to kill.
+    async function startResumeAgent(agent) {
+      const toast = showToast(`Starting & resuming ${agent}...`, 'info', true);
+      try {
+        const res = await fetch(`/api/resume/${agent}`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) { dismissToast(toast, `Resume failed: ${data.error || 'unknown'}`, 'error'); return; }
+        const res2 = await fetch(`/api/restart/${agent}`, { method: 'POST' });
+        const data2 = await res2.json();
+        if (!data2.ok) { dismissToast(toast, `Resumed, but session start failed: ${data2.error || 'unknown'}`, 'error'); return; }
+      } catch (e) {
+        dismissToast(toast, `Start & resume failed: ${e}`, 'error');
+        return;
+      }
+      // Same optimistic patch discipline as toggleAgent: the blockers line
+      // and the action button render from the agent object, so update it and
+      // repaint before the next poll confirms.
+      const agentObj = (window._lastAgents || []).find(x => x.name === agent);
+      if (agentObj) {
+        agentObj.paused = false;
+        document.querySelectorAll(`.agent-card[data-agent="${CSS.escape(agent)}"] .agent-blockers`)
+          .forEach(el => { el.outerHTML = agentBlockerLineHtml(agentObj); });
+      }
+      if (typeof ocRenderAgentDetail === 'function') ocRenderAgentDetail();
+      refreshStatus();
+      dismissToast(toast, `${agent} resumed — supervisor is starting the session`, 'success');
     }
 
     async function restartAgent(agent) {
@@ -15923,9 +16532,17 @@ function burnAreaChart() {
         const skipped = (data.skipped || []).length;
         const governorChanges = formatGovernorChanges(data.governor_changes);
         closeACMMDialog();
-        window._acmmOverride = { level: level, packAgents: data.packAgents || [] };
+        // Render the level the SERVER confirmed, never the one we asked for
+        // (#5492). We only reach here on a 2xx, so the write is committed; the
+        // body is authoritative. Falling back to `level` keeps an older spoke
+        // that omits the field working.
+        const confirmedLevel = (data && Number.isFinite(Number(data.level))) ? Number(data.level) : level;
+        // Drop any status snapshot built before this apply, so the async
+        // rebuild's predecessor cannot repaint the previous level (#4348).
+        noteStatusMutation(data.minStatusSeq);
+        window._acmmOverride = { level: confirmedLevel, packAgents: data.packAgents || [] };
         if (window._lastStatus) {
-          window._lastStatus.acmmLevel = level;
+          window._lastStatus.acmmLevel = confirmedLevel;
           window._lastStatus.acmmLevelConfigured = true;
           window._lastStatus.acmmPackAgents = data.packAgents || [];
           render(window._lastStatus);
@@ -15960,14 +16577,17 @@ function burnAreaChart() {
         }
         const governorChanges = formatGovernorChanges(data.governor_changes);
         closeACMMDialog();
-        window._acmmOverride = { level: level, packAgents: data.packAgents || [] };
+        // Server-confirmed level only — see applyACMMPack above (#5492).
+        const confirmedLevel = (data && Number.isFinite(Number(data.level))) ? Number(data.level) : level;
+        noteStatusMutation(data.minStatusSeq);
+        window._acmmOverride = { level: confirmedLevel, packAgents: data.packAgents || [] };
         if (window._lastStatus) {
-          window._lastStatus.acmmLevel = level;
+          window._lastStatus.acmmLevel = confirmedLevel;
           window._lastStatus.acmmLevelConfigured = true;
           window._lastStatus.acmmPackAgents = data.packAgents || [];
           render(window._lastStatus);
         }
-        showToast(`ACMM level set to L${level} (${name})` + (governorChanges ? ' — governor settings changed' : ''), governorChanges ? 'info' : 'success');
+        showToast(`ACMM level set to L${confirmedLevel} (${name})` + (governorChanges ? ' — governor settings changed' : ''), governorChanges ? 'info' : 'success');
         if (governorChanges) await hiveAlert(governorChanges, 'Governor settings changed');
         _acmmPacks = null;
       } catch (err) {
@@ -21707,6 +22327,10 @@ function burnAreaChart() {
           !(await ensureGatewayMethodConfigured(dirty.general.cliPinValue))) return;
       const base = _configState.type === 'governor' ? '/api/config/governor' : `/api/config/agent/${_configState.agent}`;
       let success = true;
+      // Set once a cadences section has been accepted by the server, so the
+      // success path knows to repaint the governor cadence matrix even when
+      // no `general` field changed (#5492).
+      let savedCadences = false;
       for (const [section, values] of Object.entries(dirty)) {
         try {
           if (_configState.type === 'governor' && section === 'general' && values.hiveId !== undefined) {
@@ -21781,6 +22405,19 @@ function burnAreaChart() {
               body: JSON.stringify(values)
             });
             if (!res.ok) throw new Error(await saveErrorMessage(res));
+            if (section === 'cadences') {
+              // A cadence write kicks an ASYNC status rebuild server-side, so
+              // the refetch below can be served the cached pre-write snapshot
+              // and repaint the OLD cadence — the operator waits for a later
+              // broadcast to see their own change (#5492). Raise the
+              // stale-snapshot floor from the write ack so any snapshot built
+              // before this mutation is discarded instead of rendered.
+              // Reached only after the !res.ok throw above, so a failed write
+              // never advances the floor.
+              const cadenceAck = await res.json().catch(() => ({}));
+              noteStatusMutation(cadenceAck.minStatusSeq);
+              savedCadences = true;
+            }
             if (_configState.type === 'governor' && section === 'litellm') {
               // Saving the LiteLLM tab auto-runs the live connection test
               // server-side; surface its result exactly like the Test
@@ -21837,8 +22474,48 @@ function burnAreaChart() {
           renderGovernor(lastData.governor || {}, lastData.cadenceMatrix || [], lastData);
           renderTokens(lastData.tokens || {});
         }
-        fetch('/api/status').then(r => r.json()).then(render).catch(() => {});
+        if (savedCadences) {
+          // A cadence-only save has no `general` block, so the optimistic
+          // block above is skipped entirely and nothing repaints the governor
+          // cadence matrix. The matrix is server-derived (cadenceMatrix), so
+          // there is no confirmed value to patch in locally — instead pull the
+          // post-mutation snapshot, which the raised floor guarantees is not a
+          // pre-write one (#5492).
+          refreshStatusUntilFresh();
+        } else {
+          fetch('/api/status').then(r => r.json()).then(render).catch(() => {});
+        }
       }
+    }
+
+    // Poll /api/status until a snapshot at or above the stale-snapshot floor
+    // arrives, then render it. The server rebuild kicked by a config write is
+    // asynchronous, so the first refetch usually still returns the cached
+    // pre-write snapshot; render() drops it via the floor guard and this
+    // retries briefly rather than leaving the panel stale until the next
+    // broadcast (#5492).
+    //
+    // This never invents a value: every render is a real server snapshot. If
+    // the rebuild never produces a fresh one, we simply stop retrying and the
+    // regular SSE stream repaints whenever it next delivers — the operator is
+    // never shown an unconfirmed value.
+    var STATUS_FRESH_RETRY_MS = 400;
+    var STATUS_FRESH_MAX_ATTEMPTS = 12;
+    function refreshStatusUntilFresh(attempt) {
+      const n = attempt || 0;
+      fetch('/api/status')
+        .then(r => r.json())
+        .then(data => {
+          // render() itself enforces the floor, but we need to know whether it
+          // took, so test the same condition here before delegating.
+          const seq = (data && data.statusSeq != null) ? Number(data.statusSeq) : null;
+          const stale = seq != null && seq < _statusSeqFloor;
+          if (!stale) { render(data); return; }
+          if (n + 1 < STATUS_FRESH_MAX_ATTEMPTS) {
+            setTimeout(() => refreshStatusUntilFresh(n + 1), STATUS_FRESH_RETRY_MS);
+          }
+        })
+        .catch(() => {});
     }
 
     // --- Chat rich formatting ---
