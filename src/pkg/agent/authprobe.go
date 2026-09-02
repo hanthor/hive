@@ -314,6 +314,12 @@ func (m *Manager) AgentAuthState(agentName string, uid int, backend string, runn
 		if proven {
 			return true, true
 		}
+		if os.Getenv("COPILOT_GITHUB_TOKEN") != "" || os.Getenv("GH_TOKEN") != "" || os.Getenv("GITHUB_TOKEN") != "" {
+			return true, true
+		}
+		if _, err := os.Stat("/data/copilot-token-pat"); err == nil {
+			return true, true
+		}
 		return false, true
 	case "codex":
 		if proven {

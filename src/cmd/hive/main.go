@@ -7551,6 +7551,7 @@ func watchdogAuthProbes(cfg *config.Config) map[string]watchdog.AuthProbe {
 		rotation.CodexProber{ThresholdPct: threshold},
 		rotation.AgyProber{ThresholdPct: threshold},
 		rotation.DeepSeekProber{},
+		rotation.CopilotProber{ThresholdPct: threshold},
 	}
 	out := make(map[string]watchdog.AuthProbe, len(probers))
 	for _, p := range probers {

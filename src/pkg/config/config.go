@@ -1464,6 +1464,37 @@ func (r RotationConfig) EffectiveHighVolumeCadenceS() int {
 	return defaultHighVolumeCadenceS
 }
 
+// DefaultRotationProviders returns the default provider configuration for rotation.
+func DefaultRotationProviders() map[string]ProviderRotationConfig {
+	return map[string]ProviderRotationConfig{
+		"anthropic": {Class: "subscription", Backends: []string{"claude", "pi"}},
+		"openai":    {Class: "subscription", Backends: []string{"codex"}},
+		"google":    {Class: "subscription", Backends: []string{"agy"}},
+		"github":    {Class: "subscription", Backends: []string{"copilot"}},
+		"deepseek":  {Class: "metered", Backends: []string{"litellm"}},
+	}
+}
+
+// EffectiveProviders returns the configured providers, or DefaultRotationProviders when empty.
+func (r RotationConfig) EffectiveProviders() map[string]ProviderRotationConfig {
+	if len(r.Providers) > 0 {
+		return r.Providers
+	}
+	return DefaultRotationProviders()
+}
+
+// HasBackend reports whether any provider in the rotation set fronts the given backend.
+func (r RotationConfig) HasBackend(backend string) bool {
+	for _, pc := range r.EffectiveProviders() {
+		for _, b := range pc.Backends {
+			if b == backend {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // WorkSourceConfig selects where hive reads work items (Step 01 of the loop).
 // Absent or type="" defaults to GitHub Issues — backward-compatible for all
 // existing hives.
@@ -5232,6 +5263,14 @@ func (c *Config) validate() error {
 		}
 		if err := validateConnections(name, agent.Connections); err != nil {
 			return err
+		}
+	}
+	// Verify that every agent in every ACMM pack has a rotation tier rung (failover visibility).
+	for _, pack := range ACMMPacks() {
+		for _, pa := range pack.Agents {
+			if pa.Backend != "" && !c.Governor.Rotation.HasBackend(pa.Backend) {
+				return fmt.Errorf("pack level %d agent %s: backend %q has no rotation tier rung", pack.Level, pa.Name, pa.Backend)
+			}
 		}
 	}
 	return nil
