@@ -1,5 +1,7 @@
 # Hive
 
+[![Deployment](https://img.shields.io/badge/deployment-hub.tunaos.org-6366f1?style=flat-square)](https://hub.tunaos.org)
+[![Tuna OS](https://img.shields.io/badge/website-tunaos.org-3b82f6?style=flat-square)](https://tunaos.org)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14261/badge)](https://www.bestpractices.dev/projects/14261)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -546,6 +548,25 @@ hivectl tui
 See [`hivectl tui` in the command reference](src/docs/hivectl.md#tui--live-terminal-dashboard)
 for keybindings, pane cadence, and v1 boundaries, and
 [the design record](src/docs/design/tui.md) for the reasoning behind it.
+
+## Tuna OS deployment
+
+Tuna OS runs this fork as a fleet of hives behind one hub. Each host below
+answered `curl` on 2026-09-10:
+
+| Host | Role | Check |
+| --- | --- | --- |
+| [hub.tunaos.org](https://hub.tunaos.org) | Hub. Its index page lists the hives. | `GET /` returns `200` |
+| [reef.tunaos.org](https://reef.tunaos.org) | Hive | `GET /api/health` returns `{"status":"ok"}` |
+| [school.tunaos.org](https://school.tunaos.org) | Hive | `GET /api/health` returns `{"status":"ok"}` |
+| [hive.tunaos.org](https://hive.tunaos.org) | Hive; the hub index does not list it | `GET /api/health` returns `{"status":"ok"}` |
+
+A hive answers `401` on `/` until you supply the dashboard token from the Quick
+Start, so use `/api/health` to see whether a hive is up.
+
+- Website: [tunaos.org](https://tunaos.org)
+- Organization: [github.com/tuna-os](https://github.com/tuna-os)
+- Fork scope and upstream: [FORK.md](FORK.md)
 
 ## Contribute to a Hive
 
