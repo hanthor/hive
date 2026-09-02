@@ -749,6 +749,19 @@ func (m *Manager) SetCopilotToken(token string) {
 func (m *Manager) CopilotToken() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.copilotTokenLocked()
+}
+
+// copilotTokenLocked is CopilotToken's resolution logic without taking m.mu
+// itself, for callers that already hold m.mu — such as agentEnvPairs, which
+// launchInTmux calls while Start holds m.mu.Lock() for the whole of Phase 3
+// (see the PHASE 3 comment above). Calling the locking CopilotToken() from
+// there RLocks a sync.RWMutex the same goroutine already holds for writing;
+// RWMutex is not reentrant, so that self-deadlocks (observed as
+// TestLaunchInTmux_CopilotDefaultMode hanging in Manager.CopilotToken's
+// RLock until the 10-minute test timeout). Callers must already hold m.mu
+// (Lock or RLock) before calling this.
+func (m *Manager) copilotTokenLocked() string {
 	if m.copilotAuthToken != "" {
 		return m.copilotAuthToken
 	}
@@ -9280,7 +9293,7 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 			vars = append(vars, agentEnvPair{v, "1", false})
 		}
 	}
-	if tok := m.CopilotToken(); tok != "" {
+	if tok := m.copilotTokenLocked(); tok != "" {
 		vars = append(vars, agentEnvPair{"COPILOT_GITHUB_TOKEN", tok, true})
 	}
 	// Point the GitHub MCP server at the App installation token so PRs, issue
