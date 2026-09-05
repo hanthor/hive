@@ -3,13 +3,13 @@ title: Hive — an autonomous cloud-native maintenance platform for open source
 date: 2026-07-29
 org_name: Hive
 org_team: Hive maintainers
-org_url: https://hive.kubestellar.io/
+org_url: https://hive.hivecommons.dev/
 org_logo_filename: images/hive.svg
 contact: Andy Anderson
 email: # optional — add if you want it listed publicly
 org_description: |
   Hive is an open-source, self-hostable system (part of the KubeStellar org,
-  github.com/kubestellar/hive) that runs a fleet of AI coding agents to
+  github.com/hivecommons/hive) that runs a fleet of AI coding agents to
   autonomously maintain software repositories — triaging issues, writing fixes,
   opening pull requests, and merging on green CI, all under human-controlled,
   technically-enforced guardrails. It runs as a cloud-native workload on
@@ -104,7 +104,7 @@ registry, a cross-hive leaderboard, and — where reachable — provisioning.
 Hive is built and operated by an open-source community as a standalone project.
 There is no separate commercial entity: the maintainers run production hives
 against their own repositories (the project dogfoods its own tool) and operate a
-hosted hub ([hive.kubestellar.io](https://hive.kubestellar.io)) so other
+hosted hub ([hive.hivecommons.dev](https://hive.hivecommons.dev)) so other
 open-source projects and individual contributors can register a spoke hive or
 donate compute to an existing one.
 

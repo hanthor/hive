@@ -50,7 +50,7 @@ name: Podman arm64 Lane
 #
 # THE PUBLISHED-IMAGE ROUTE DOES NOT EXIST FOR A PR. #5370 proposed probing a
 # per-SHA image built from the PR head. Per-SHA tags are real
-# (ghcr.io/kubestellar/hive:<7-char-sha>) but are created ONLY by docker.yml's
+# (ghcr.io/hivecommons/hive:<7-char-sha>) but are created ONLY by docker.yml's
 # `merge` job under push == 'true', and docker.yml (a) skips its `build` job
 # entirely on `pull_request` and (b) allow-lists pushes to LONG_LIVED branches
 # ("v2 v4 mk dd") only, so a PR branch's own push run builds as a compile gate
@@ -85,10 +85,18 @@ name: Podman arm64 Lane
 
 on:
   push:
+    paths:
+      - '.github/workflows/podman-arm64-lane.yml'
+      - 'src/deploy/**'
+      - 'justfile'
     branches:
       - v2
       - v4
   pull_request:
+    paths:
+      - '.github/workflows/podman-arm64-lane.yml'
+      - 'src/deploy/**'
+      - 'justfile'
     branches:
       - v2
       - v4
@@ -99,9 +107,9 @@ on:
         # defaults to that: when this input is empty the lane passes no
         # --image and probe_arm64_image_startup.sh falls back to
         # HIVE_STANDALONE_IMAGE_HIVE from src/deploy/standalone-images.sh,
-        # which is ghcr.io/kubestellar/hive:stable — the RELEASE CHANNEL tag,
+        # which is ghcr.io/hivecommons/hive:stable — the RELEASE CHANNEL tag,
         # further behind v4 tip than v4-latest is. Say what actually happens.
-        description: 'Image to probe. Empty = ghcr.io/kubestellar/hive:stable on a push, or the image built from the PR checkout on a pull request.'
+        description: 'Image to probe. Empty = ghcr.io/hivecommons/hive:stable on a push, or the image built from the PR checkout on a pull request.'
         type: string
         default: ''
 
@@ -136,8 +144,8 @@ jobs:
         env:
           RECORDED_PODMAN: '5.8.4'
         run: |
-          # shellcheck disable=SC2016 # the --format strings stay single-quoted:
-          # those are Go template braces for Podman, not shell expansions.
+          # shellcheck disable=SC2016 # the printf format strings below carry
+          # literal markdown backticks for the step summary, not expansions.
           set -euo pipefail
 
           if ! command -v podman >/dev/null 2>&1; then
@@ -145,13 +153,58 @@ jobs:
             exit 1
           fi
 
-          version="$(podman info --format '{{.Version.Version}}')"
-          arch="$(podman info --format '{{.Host.Arch}}')"
-          rootless="$(podman info --format '{{.Host.Security.Rootless}}')"
-          cgroups="$(podman info --format '{{.Host.CgroupsVersion}}')"
-          runtime="$(podman info --format '{{.Host.OCIRuntime.Name}}')"
-          backend="$(podman info --format '{{.Host.NetworkBackend}}')"
-          rootlessnet="$(podman info --format '{{.Host.RootlessNetworkCmd}}')"
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq is not installed on this runner; this step reads 'podman info --format json' with it"
+            exit 1
+          fi
+
+          # ONE JSON read, not per-field Go templates (#5678). A Go template
+          # hard-fails the whole `podman info` call (exit 125) the moment a
+          # field leaves Podman's info schema — which is exactly what happened
+          # when the runner image rolled a Podman without
+          # .Host.RootlessNetworkCmd, and a REPORT-ONLY field took this lane
+          # down on every PR. jq with `// "unknown"` degrades per field
+          # instead; the load-bearing assertions below still fail loudly on a
+          # bad value, so nothing this lane asserts got softer.
+          info="$(podman info --format json)"
+
+          version="$(jq -r '.version.Version // "unknown"' <<<"$info")"
+          arch="$(jq -r '.host.arch // "unknown"' <<<"$info")"
+          # Boolean, so NOT `// "unknown"`: jq's `//` treats false as falsy
+          # and would report a real rootless=false as "unknown". Type-check
+          # instead, so only a genuinely absent field degrades — and when it
+          # is absent, derive the property: podman invoked without sudo by a
+          # non-root user is rootless by definition. This flag gates the
+          # rootless-network assertion below, so "unknown" would silently
+          # soften that check.
+          rootless="$(jq -r '.host.security.rootless | if type == "boolean" then tostring else "unknown" end' <<<"$info")"
+          if [ "$rootless" = "unknown" ] && [ "$(id -u)" != "0" ]; then
+            echo "::notice::podman info no longer reports host.security.rootless; derived ROOTLESS from euid $(id -u) != 0"
+            rootless="true"
+          fi
+          cgroups="$(jq -r '.host.cgroupVersion // "unknown"' <<<"$info")"
+          runtime="$(jq -r '.host.ociRuntime.name // "unknown"' <<<"$info")"
+          backend="$(jq -r '.host.networkBackend // "unknown"' <<<"$info")"
+
+          # The rootless network provider. Newer Podman dropped the
+          # host.rootlessNetworkCmd summary string, so when it is absent the
+          # provider is derived from the pasta/slirp4netns tool entries. What
+          # this lane needs is the PROPERTY — rootless containers here get a
+          # network at all, which the startup probe below depends on — not
+          # whatever the summary field is called this release.
+          rootlessnet="$(jq -r '.host.rootlessNetworkCmd // empty' <<<"$info")"
+          if [ -z "$rootlessnet" ]; then
+            if [ -n "$(jq -r '.host.pasta.executable // empty' <<<"$info")" ]; then
+              rootlessnet="pasta"
+            elif [ -n "$(jq -r '.host.slirp4netns.executable // empty' <<<"$info")" ]; then
+              rootlessnet="slirp4netns"
+            fi
+          fi
+          if [ "$rootless" = "true" ] && [ -z "$rootlessnet" ]; then
+            echo "::error::podman info reports no rootless network provider (no rootlessNetworkCmd, no pasta, no slirp4netns) — rootless containers on this runner would start with no network, and the startup probe below needs one"
+            exit 1
+          fi
+          rootlessnet="${rootlessnet:-n/a (rootful)}"
 
           printf 'podman       %s (%s)\n' "$version" "$(command -v podman)"
           printf 'arch         %s (uname %s)\n' "$arch" "$(uname -m)"
@@ -224,7 +277,10 @@ jobs:
           # A build that silently produced another architecture would make the
           # probe below meaningless in the same way probing the published image
           # was meaningless.
-          built_arch="$(podman image inspect "${PR_IMAGE}" --format '{{.Architecture}}')"
+          # JSON + jq rather than a Go-template field read, for the same
+          # reason as the environment step: a schema rename must degrade to a
+          # failed VALUE comparison below, not an exit-125 template error.
+          built_arch="$(podman image inspect "${PR_IMAGE}" --format json | jq -r '.[0].Architecture // "unknown"')"
           if [ "$built_arch" != "arm64" ]; then
             echo "::error::built image is ${built_arch}, expected arm64"
             exit 1
@@ -234,7 +290,7 @@ jobs:
       # Selects what the probe actually runs against, so the choice is made in
       # ONE place and reported. On a pull request that is the image built
       # above; otherwise it is the caller's --image, or the probe's own default
-      # (ghcr.io/kubestellar/hive:stable) when that is empty too.
+      # (ghcr.io/hivecommons/hive:stable) when that is empty too.
       - name: Select the image to probe
         id: select
         env:
@@ -257,7 +313,7 @@ jobs:
           else
             image=""
             local_build="false"
-            why="probe default (ghcr.io/kubestellar/hive:stable) — the published image, which is the right target on a push"
+            why="probe default (ghcr.io/hivecommons/hive:stable) — the published image, which is the right target on a push"
           fi
 
           echo "image=${image}" >>"$GITHUB_OUTPUT"
@@ -265,7 +321,7 @@ jobs:
           printf 'probing: %s\n' "${image:-<probe default>}"
           printf 'reason:  %s\n' "$why"
           {
-            printf '\n**Image under test:** `%s`\n\n' "${image:-ghcr.io/kubestellar/hive:stable}"
+            printf '\n**Image under test:** `%s`\n\n' "${image:-ghcr.io/hivecommons/hive:stable}"
             printf '%s\n' "$why"
           } >>"$GITHUB_STEP_SUMMARY"
 

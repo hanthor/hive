@@ -13,8 +13,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/kubestellar/hive/pkg/tui/client"
-	"github.com/kubestellar/hive/pkg/tui/panes"
+	"github.com/hivecommons/hive/pkg/tui/client"
+	"github.com/hivecommons/hive/pkg/tui/panes"
 )
 
 // agentsFixture is the /api/agents body the poll tests serve. Three agents so
@@ -61,6 +61,21 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	if err := os.Setenv(client.TokenEnv, "test-token"); err != nil {
+		panic(err)
+	}
+	// Clear the session cookie for the same reason the two above are pinned:
+	// a developer with a real HIVE_DASHBOARD_COOKIE exported would otherwise
+	// have every fixture server in this package receive their live session,
+	// and the one test that asserts on the header would pass against their
+	// value rather than the one it set. Empty is the correct default here —
+	// New() omits the header entirely for it.
+	if err := os.Setenv(client.CookieEnv, ""); err != nil {
+		panic(err)
+	}
+	// Same containment for the terminal credential override: a developer
+	// with a real HIVE_TTYD_CREDENTIAL exported must not have the attach
+	// tests present it to their fixture servers.
+	if err := os.Setenv(client.TtydCredentialEnv, ""); err != nil {
 		panic(err)
 	}
 	os.Exit(m.Run())

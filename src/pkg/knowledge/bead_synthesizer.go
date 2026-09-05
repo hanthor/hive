@@ -15,7 +15,7 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
-	"github.com/kubestellar/hive/pkg/beads"
+	"github.com/hivecommons/hive/pkg/beads"
 )
 
 const (
@@ -831,6 +831,8 @@ func (e *PREnricher) parseRef(ref string) (string, string, int) {
 		n, _ := strconv.Atoi(m[1])
 		return e.org, "", n
 	}
+
+	ref = strings.TrimPrefix(ref, "gh-")
 
 	if m := repoRefPattern.FindStringSubmatch(ref); m != nil {
 		owner := m[1]

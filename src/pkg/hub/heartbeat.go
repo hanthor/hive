@@ -22,8 +22,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/tracing"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/inferencehealth"
+	"github.com/hivecommons/hive/pkg/tracing"
 )
 
 const (
@@ -355,6 +356,38 @@ type AgentSummary struct {
 	// unconfigured one, which is exactly the STUCK-vs-disabled ambiguity the
 	// fleet view exists to resolve.
 	Enabled bool `json:"enabled,omitempty"`
+	// StartBlockedReason is set when the spoke has given up relaunching this
+	// agent: it failed to start the same way N times running, and the spoke has
+	// backed off instead of recreating its session every few minutes (#5958).
+	// The value is the operator-facing reason — "copilot: not logged in",
+	// "bob: API key rejected", "backend/launch_cmd mismatch" — because the whole
+	// point is that "restart needed" was never actionable. Empty means not
+	// blocked, which is also what a legacy spoke that predates the field sends,
+	// so its absence is read as "no such fault", never as unknown.
+	StartBlockedReason string `json:"startBlockedReason,omitempty"`
+	// StartFailure* carries the current pre-threshold start failure too, so the
+	// hub can explain "starting failed ×N" before the spoke gives up.
+	StartFailureReason   string `json:"startFailureReason,omitempty"`
+	StartFailureCount    int    `json:"startFailureCount,omitempty"`
+	StartFailureLastAt   string `json:"startFailureLastAt,omitempty"`
+	StartBlocked         bool   `json:"startBlocked,omitempty"`
+	StartFailureExitCode *int   `json:"startFailureExitCode,omitempty"`
+	StartFailureSignal   string `json:"startFailureSignal,omitempty"`
+	// Restarts is the spoke's per-agent restart telemetry. Total is the
+	// lifetime/persisted counter, Last24h is the rolling recent count, and the
+	// last fields explain the newest restart. The hub may add ResetAt/ResetBy
+	// when rendering fleet rows after an operator reset.
+	Restarts AgentRestartTelemetry `json:"restarts,omitempty"`
+}
+
+type AgentRestartTelemetry struct {
+	Total         int    `json:"total,omitempty"`
+	Last24h       int    `json:"last_24h,omitempty"`
+	LastRestartAt string `json:"last_restart_at,omitempty"`
+	LastReason    string `json:"last_reason,omitempty"`
+	PodRestarts   int    `json:"pod_restarts,omitempty"`
+	ResetAt       string `json:"reset_at,omitempty"`
+	ResetBy       string `json:"reset_by,omitempty"`
 }
 
 // AgentActivity is the per-agent liveness evidence the spoke has and the hub
@@ -381,6 +414,15 @@ type AgentActivity struct {
 	CanMerge       bool
 	Backend        string
 	Enabled        bool
+	// StartBlockedReason — see the matching AgentSummary field.
+	StartBlockedReason   string
+	StartFailureReason   string
+	StartFailureCount    int
+	StartFailureLastAt   time.Time
+	StartBlocked         bool
+	StartFailureExitCode *int
+	StartFailureSignal   string
+	Restarts             AgentRestartTelemetry
 }
 
 // NewAgentSummary builds one AgentSummary from an agent's name, state, mode and
@@ -404,6 +446,14 @@ func NewAgentSummary(name, state, mode string, act AgentActivity) AgentSummary {
 		CanMerge:       act.CanMerge,
 		Backend:        act.Backend,
 		Enabled:        act.Enabled,
+		Restarts:       act.Restarts,
+
+		StartBlockedReason:   act.StartBlockedReason,
+		StartFailureReason:   act.StartFailureReason,
+		StartFailureCount:    act.StartFailureCount,
+		StartBlocked:         act.StartBlocked,
+		StartFailureExitCode: act.StartFailureExitCode,
+		StartFailureSignal:   act.StartFailureSignal,
 	}
 	if !act.PausedAt.IsZero() {
 		as.PausedAt = act.PausedAt.UTC().Format(time.RFC3339)
@@ -413,6 +463,9 @@ func NewAgentSummary(name, state, mode string, act AgentActivity) AgentSummary {
 	}
 	if !act.LastActivityAt.IsZero() {
 		as.LastActivityAt = act.LastActivityAt.UTC().Format(time.RFC3339)
+	}
+	if !act.StartFailureLastAt.IsZero() {
+		as.StartFailureLastAt = act.StartFailureLastAt.UTC().Format(time.RFC3339)
 	}
 	if act.KickInterval > 0 {
 		as.KickIntervalSec = int64(act.KickInterval / time.Second)
@@ -653,10 +706,18 @@ type HeartbeatPayload struct {
 	// refusal banner (distinct from hive-local governor budget). Empty means no
 	// signal or an old spoke. ProviderLimitRebuffs counts matched refused calls
 	// while latched, when known.
-	ProviderLimitReason  string         `json:"provider_limit_reason,omitempty"`
-	ProviderLimitRebuffs int            `json:"provider_limit_rebuffs,omitempty"`
-	Health               map[string]any `json:"health"`
-	DashboardURL         string         `json:"dashboard_url"`
+	ProviderLimitReason   string         `json:"provider_limit_reason,omitempty"`
+	ProviderLimitRebuffs  int            `json:"provider_limit_rebuffs,omitempty"`
+	ProviderLimitHiveWide bool           `json:"provider_limit_hive_wide,omitempty"`
+	ProviderLimitAgents   []string       `json:"provider_limit_agents,omitempty"`
+	Health                map[string]any `json:"health"`
+	DashboardURL          string         `json:"dashboard_url"`
+	// Output-freshness telemetry is optional and backward compatible: older
+	// spokes omit it, and the hub keeps the pre-existing no-write verdict.
+	LastWriteCapableKickAt string `json:"last_write_capable_kick_at,omitempty"`
+	LastKickDisposition    string `json:"last_kick_disposition,omitempty"`
+	LastKickSkipReason     string `json:"last_kick_skip_reason,omitempty"`
+	NotWritableQueued      int    `json:"not_writable_queued,omitempty"`
 	// PublicURLSelfCheck is the spoke's own end-to-end probe of the dashboard
 	// URL it is advertising to the hub. It exists because the hub's public
 	// network can be the wrong vantage point for private-network hives: a URL
@@ -681,7 +742,7 @@ type HeartbeatPayload struct {
 	// in-cluster from the Deployment spec. GitHash says which commit the
 	// BINARY was built from; ImageRef says which TAG the deployment tracks —
 	// and only the tag reveals a hive pinned to an immutable
-	// ghcr.io/kubestellar/hive:<sha> that can never receive a rolling upgrade.
+	// ghcr.io/hivecommons/hive:<sha> that can never receive a rolling upgrade.
 	// The hub cannot read this itself for firewalled spokes it reaches only by
 	// heartbeat, which is why it rides the payload. Empty when the spoke is
 	// not running in-cluster or the read failed — never a guess.
@@ -702,6 +763,8 @@ type HeartbeatPayload struct {
 	GitHubAppTokenStatus     string `json:"github_app_token_status,omitempty"`
 	GitHubAppTokenLastMintAt string `json:"github_app_token_last_mint_at,omitempty"`
 	GitHubAppTokenError      string `json:"github_app_token_error,omitempty"`
+	GitHubAppErrorClass      string `json:"github_app_error_class,omitempty"`
+	GitHubAppHTTPStatus      int    `json:"github_app_http_status,omitempty"`
 	// RepoTargetMisconfigured carries an operator-facing config-shape issue
 	// detected by the spoke. It is visibility only: the spoke keeps running and
 	// the hub does not rewrite the project fields.
@@ -857,7 +920,8 @@ type HeartbeatPayload struct {
 	//
 	// nil/empty means the spoke is too old to report (UNKNOWN, never "has
 	// none"), so an absent list must not be read as a failed delivery.
-	GatewayNames []string `json:"gateway_names,omitempty"`
+	GatewayNames  []string                        `json:"gateway_names,omitempty"`
+	GatewayHealth []inferencehealth.GatewayStatus `json:"gateway_health,omitempty"`
 	// GitHubAppKeyFingerprint is a NON-SECRET identifier for the GitHub App
 	// private key this spoke currently holds — "sha256:<hex>" over the DER
 	// public key derived from it (config.AppKeyFingerprint). It exists so the
@@ -1012,6 +1076,7 @@ type StatusCollector func() *HeartbeatPayload
 // RestartSpokeCallback handles a hub-requested rolling restart of this spoke
 // (HeartbeatResponse.RestartSpoke). The callback owns the uptime guard.
 type RestartSpokeCallback func()
+type AgentRestartResetCallback func(agent string)
 
 type UpgradeCallback func(targetSHA string)
 
@@ -1048,6 +1113,7 @@ func StartHeartbeat(ctx context.Context, hubURL string, collect StatusCollector,
 	var onProjectConfig ProjectConfigCallback
 	var onGatewayConfig GatewayConfigCallback
 	var onRestartSpoke RestartSpokeCallback
+	var onAgentRestartReset AgentRestartResetCallback
 	for _, cb := range callbacks {
 		switch fn := cb.(type) {
 		case UpgradeCallback:
@@ -1068,6 +1134,8 @@ func StartHeartbeat(ctx context.Context, hubURL string, collect StatusCollector,
 			onGatewayConfig = fn
 		case RestartSpokeCallback:
 			onRestartSpoke = fn
+		case AgentRestartResetCallback:
+			onAgentRestartReset = fn
 		}
 	}
 
@@ -1113,6 +1181,11 @@ func StartHeartbeat(ctx context.Context, hubURL string, collect StatusCollector,
 		}
 		if resp.RestartSpoke && onRestartSpoke != nil {
 			onRestartSpoke()
+		}
+		if onAgentRestartReset != nil {
+			for _, name := range resp.ResetAgentRestarts {
+				onAgentRestartReset(name)
+			}
 		}
 	}
 
@@ -2224,7 +2297,7 @@ type HeartbeatResponse struct {
 	LatestSHA  string `json:"latest_sha,omitempty"`
 	LatestTag  string `json:"latest_tag,omitempty"`
 	// SwitchToTag instructs the spoke to change its own deployment image to
-	// ghcr.io/kubestellar/hive:<SwitchToTag> and restart. Used for branch
+	// ghcr.io/hivecommons/hive:<SwitchToTag> and restart. Used for branch
 	// switches on clusters the hub can't reach over kubectl — the spoke has
 	// in-cluster RBAC (hive-self-upgrade role) to patch its own deployment.
 	SwitchToTag string `json:"switch_to_tag,omitempty"`
@@ -2236,10 +2309,11 @@ type HeartbeatResponse struct {
 	// so ALL instances reporting as this hive receive it; the spoke's own
 	// uptime guard keeps a freshly restarted process from acting on the same
 	// window twice.
-	RestartSpoke    bool                      `json:"restart_spoke,omitempty"`
-	GitHubAppConfig *HeartbeatGitHubAppConfig `json:"github_app_config,omitempty"`
-	HubBanner       *HubBanner                `json:"hub_banner,omitempty"`
-	IsPublic        *bool                     `json:"is_public,omitempty"`
+	RestartSpoke       bool                      `json:"restart_spoke,omitempty"`
+	ResetAgentRestarts []string                  `json:"reset_agent_restarts,omitempty"`
+	GitHubAppConfig    *HeartbeatGitHubAppConfig `json:"github_app_config,omitempty"`
+	HubBanner          *HubBanner                `json:"hub_banner,omitempty"`
+	IsPublic           *bool                     `json:"is_public,omitempty"`
 	// AuthorizedUsers is the hub's authoritative per-hive access list, as
 	// "username:role" entries. The hub can't reach heartbeat-only spokes (e.g.
 	// the heartbeat-only cluster) over kubectl, and those spokes authorize their own device-flow

@@ -2,13 +2,30 @@ package hub
 
 import (
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/inferencehealth"
 )
+
+const (
+	EnvAgentRestartProblemThreshold     = "HIVE_HUB_AGENT_RESTART_PROBLEM_THRESHOLD"
+	DefaultAgentRestartProblemThreshold = 5
+)
+
+func agentRestartProblemThreshold() int {
+	if raw := strings.TrimSpace(os.Getenv(EnvAgentRestartProblemThreshold)); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultAgentRestartProblemThreshold
+}
 
 // Fleet-divergence derivation.
 //
@@ -54,6 +71,8 @@ const (
 	runStuckAtLogin
 	// runQuotaExhausted — running but the provider/monthly quota is exhausted.
 	runQuotaExhausted
+	// runRestartStorm — the agent has restarted too often in the recent window.
+	runRestartStorm
 	// runSessionGone — the manager believes it runs, but the tmux session is
 	// gone (zombie).
 	runSessionGone
@@ -75,6 +94,8 @@ func (s agentRunState) String() string {
 		return "stuck-at-login"
 	case runQuotaExhausted:
 		return "quota-exhausted"
+	case runRestartStorm:
+		return "restart-storm"
 	case runSessionGone:
 		return "session-gone"
 	case runDead:
@@ -108,6 +129,9 @@ type hiveBlockers struct {
 	RepoTargetIssue         string
 	InferenceAuthError      string
 	ProviderLimitReason     string
+	ProviderLimitHiveWide   bool
+	ProviderLimitAgents     []string
+	GatewayHealth           []inferencehealth.GatewayStatus
 }
 
 // any reports whether any hive-level blocker is set.
@@ -116,7 +140,7 @@ func (b hiveBlockers) any() bool {
 		strings.TrimSpace(b.GitHubAppPermIssue) != "" ||
 		strings.TrimSpace(b.RepoTargetIssue) != "" ||
 		strings.TrimSpace(b.InferenceAuthError) != "" ||
-		strings.TrimSpace(b.ProviderLimitReason) != "" ||
+		(b.ProviderLimitHiveWide && strings.TrimSpace(b.ProviderLimitReason) != "") ||
 		blockingGitHubAppState(b.GitHubAppState)
 }
 
@@ -133,8 +157,8 @@ func (b hiveBlockers) reason() string {
 		return b.RepoTargetIssue
 	case b.RepoTargetMisconfigured:
 		return "repo target misconfigured"
-	case strings.TrimSpace(b.ProviderLimitReason) != "":
-		return b.ProviderLimitReason
+	case b.ProviderLimitHiveWide && strings.TrimSpace(b.ProviderLimitReason) != "":
+		return providerLimitBlockerReason("", b)
 	case strings.TrimSpace(b.InferenceAuthError) != "":
 		return b.InferenceAuthError
 	default:
@@ -215,6 +239,8 @@ func deriveAgentVerdict(a AgentSummary, blockers hiveBlockers, queuedWork int, n
 		v.RunState = runQuietByDesign
 	case a.QuotaExhausted:
 		v.RunState = runQuotaExhausted
+	case agentRestartStorm(a):
+		v.RunState = runRestartStorm
 	case kind == agentInactiveNeedsLogin:
 		// A login prompt outranks the off-schedule quiet branch below: a
 		// wedged interactive credential is a HIVE-wide fault (every kick to
@@ -271,9 +297,18 @@ func deriveAgentVerdict(a AgentSummary, blockers hiveBlockers, queuedWork int, n
 	}
 
 	loginBlocked := a.NeedsLogin && interactiveLoginBackend(a.Backend)
-	quotaBlocked := a.QuotaExhausted
+	quotaBlocked := a.QuotaExhausted ||
+		(blockers.ProviderLimitHiveWide && strings.TrimSpace(blockers.ProviderLimitReason) != "")
+	gwFault, gatewayBlocked := gatewayFaultForBackend(blockers.GatewayHealth, a.Backend)
 	hiveBlocked := blockers.any()
-	blocked := loginBlocked || quotaBlocked || hiveBlocked
+	// #5958: the spoke has given up relaunching this agent after repeated
+	// identical start failures. It is not running and cannot be made to run by
+	// anything the hive does on its own, so it can never be ABLE — counting it
+	// toward "K able" is the specific over-count that let a hive show agents
+	// green while none of them had started.
+	startFailureReason := startFailureBlockerReason(a, now)
+	startFailure := startFailureReason != ""
+	blocked := loginBlocked || quotaBlocked || gatewayBlocked || hiveBlocked || startFailure
 
 	// modeGrantsWrite: the agent's mode grants at least one write action (open
 	// PR or merge) beyond opening issues. An advisory issues-only agent does
@@ -308,10 +343,20 @@ func deriveAgentVerdict(a AgentSummary, blockers hiveBlockers, queuedWork int, n
 	// Reason + tier. An unblocked advisory-only agent carries NO reason: its
 	// lack of write capability is the ACMM level working as designed.
 	switch {
+	// First: the spoke has already diagnosed this one concretely, and its reason
+	// ("copilot: not logged in") beats every generic phrasing below — including
+	// "sitting at login prompt", which describes the same fault less usefully
+	// and without saying that relaunching has been given up on.
+	case startFailure:
+		v.BlockedReason = startFailureReason
 	case loginBlocked:
 		v.BlockedReason = "sitting at login prompt"
 	case quotaBlocked:
-		v.BlockedReason = "provider quota exhausted"
+		v.BlockedReason = providerLimitBlockerReason(a.Name, blockers)
+	case agentRestartStorm(a):
+		v.BlockedReason = agentRestartProblemReason(a)
+	case gatewayBlocked:
+		v.BlockedReason = inferencehealth.Reason(gwFault)
 	case hiveBlocked:
 		v.BlockedReason = blockers.reason()
 	}
@@ -324,12 +369,16 @@ func deriveAgentVerdict(a AgentSummary, blockers hiveBlockers, queuedWork int, n
 	//           mission is the digest — no GitHub write required).
 	//   amber — can still open issues, but a blocker takes away a WRITE its mode
 	//           would otherwise grant (partial: half its job works).
-	//   red   — cannot even open an issue despite its mode granting it (blocked
-	//           at the floor).
+	//   red   — cannot do its mission at all: the floor is blocked, or its
+	//           inference gateway cannot serve any turn.
 	switch {
 	case capable:
 		v.CapabilityTier = tierGreen
-	case a.CanOpenIssue && blocked && modeGrantsWrite:
+	case a.CanOpenIssue && blocked && modeGrantsWrite && !gatewayBlocked && !startFailure:
+		// Amber means "half its job works". An agent that never started does no
+		// half of its job, so it is excluded here for the same reason a dead
+		// gateway is — the badge must not read as partial capability when the
+		// CLI is not running at all.
 		v.CapabilityTier = tierAmber
 	default:
 		v.CapabilityTier = tierRed
@@ -348,9 +397,15 @@ func deriveAgentVerdict(a AgentSummary, blockers hiveBlockers, queuedWork int, n
 			// credential is hive-wide and the wire may omit expectedActive
 			// entirely (the EPM/alchemy case) — gating on it hid the fault.
 			v.Stuck = true
-		case runQuotaExhausted:
+		case runQuotaExhausted, runRestartStorm:
 			// Provider quota exhaustion is a hive/provider fault even if the
 			// schedule bit is absent on the wire.
+			v.Stuck = true
+		}
+		// An agent the spoke has stopped relaunching is stuck by definition, in
+		// whatever run-state the wire reports it (#5958). Set after the switch so
+		// it cannot be lost to a run-state the cases above do not name.
+		if startFailure {
 			v.Stuck = true
 		}
 		// IMPOTENT: running but not capable of its mission (blocked/gated). Uses
@@ -373,9 +428,76 @@ func deriveAgentVerdict(a AgentSummary, blockers hiveBlockers, queuedWork int, n
 	// runStuckAtLogin bypasses the expectedActive gate: the credential fault is
 	// real whether or not the wire carries the schedule bit (see the ACTUAL-leg
 	// ordering above).
-	v.Problem = (a.ExpectedActive || v.RunState == runStuckAtLogin || v.RunState == runQuotaExhausted) && !v.QuietByDesign && !v.Able
+	// A start-blocked agent is deliberately NOT given a bypass here, unlike
+	// runStuckAtLogin. A wedged interactive credential is hive-wide — every kick
+	// to that backend fails — so it is a fault whatever the schedule says. A
+	// failed start is one agent, and if the governor is not scheduling that
+	// agent in this mode, the operator has not asked it to run and must not be
+	// alarmed about it (#5958). It is still never ABLE: the quiet-by-design run
+	// state already denies that above, so the count stays honest without the
+	// alarm. When the mode next schedules the agent, ExpectedActive carries it
+	// into this gate on its own.
+	v.Problem = (a.ExpectedActive || v.RunState == runStuckAtLogin || v.RunState == runQuotaExhausted || v.RunState == runRestartStorm) && !v.QuietByDesign && !v.Able
 
 	return v
+}
+
+func agentRestartStorm(a AgentSummary) bool {
+	return a.Restarts.Last24h >= agentRestartProblemThreshold()
+}
+
+func agentRestartProblemReason(a AgentSummary) string {
+	if !agentRestartStorm(a) {
+		return ""
+	}
+	reason := strings.TrimSpace(a.Restarts.LastReason)
+	if reason == "" {
+		return fmt.Sprintf("agent restarts: %s ×%d/24h", a.Name, a.Restarts.Last24h)
+	}
+	return fmt.Sprintf("agent restarts: %s ×%d/24h (%s)", a.Name, a.Restarts.Last24h, reason)
+}
+
+func startFailureBlockerReason(a AgentSummary, now time.Time) string {
+	reason := strings.TrimSpace(a.StartFailureReason)
+	if reason == "" {
+		return strings.TrimSpace(a.StartBlockedReason)
+	}
+	count := a.StartFailureCount
+	if count <= 0 {
+		count = 1
+	}
+	out := fmt.Sprintf("starting failed ×%d: %s", count, reason)
+	if t, err := time.Parse(time.RFC3339, strings.TrimSpace(a.StartFailureLastAt)); err == nil && !t.IsZero() {
+		out += fmt.Sprintf(" (last %s ago)", shortDur(now.Sub(t)))
+	}
+	var extras []string
+	if a.StartFailureExitCode != nil {
+		extras = append(extras, fmt.Sprintf("exit %d", *a.StartFailureExitCode))
+	}
+	if sig := strings.TrimSpace(a.StartFailureSignal); sig != "" {
+		extras = append(extras, "signal "+sig)
+	}
+	if len(extras) > 0 {
+		out += " [" + strings.Join(extras, ", ") + "]"
+	}
+	return out
+}
+
+func providerLimitBlockerReason(agentName string, blockers hiveBlockers) string {
+	reason := strings.TrimSpace(blockers.ProviderLimitReason)
+	if reason == "" {
+		return "provider quota exhausted"
+	}
+	names := blockers.ProviderLimitAgents
+	if len(names) == 0 && strings.TrimSpace(agentName) != "" {
+		names = []string{agentName}
+	}
+	if len(names) == 0 {
+		return reason
+	}
+	cp := append([]string(nil), names...)
+	sort.Strings(cp)
+	return fmt.Sprintf("%s (affected: %s)", reason, strings.Join(cp, ", "))
 }
 
 // markUnknown sets the unknown/legacy capability tier and clears the derived
@@ -421,9 +543,13 @@ type agentFleetRollup struct {
 	// DeadOrGone is how many of the Problems have no live session at all
 	// (dead, or running-with-session-missing zombies). When every problem is
 	// in this class the verdict keeps the familiar "no agents running".
-	DeadOrGone int `json:"deadOrGone,omitempty"`
+	DeadOrGone         int    `json:"deadOrGone,omitempty"`
+	StartFailures      int    `json:"startFailures,omitempty"`
+	StartFailureReason string `json:"startFailureReason,omitempty"`
 	// QuotaExhausted is how many Problems are provider/monthly quota limited.
-	QuotaExhausted int `json:"quotaExhausted,omitempty"`
+	QuotaExhausted     int    `json:"quotaExhausted,omitempty"`
+	RestartStorms      int    `json:"restartStorms,omitempty"`
+	RestartStormReason string `json:"restartStormReason,omitempty"`
 	// Known is how many agents reported the new divergence signals (non-legacy).
 	// When Known==0 the whole hive is UNKNOWN (a spoke not yet rolled to this
 	// build) and its dot is gray, never green — absence of a problem we cannot
@@ -437,35 +563,41 @@ type agentFleetRollup struct {
 // capability, deltas). runState is a string so the frontend never re-derives
 // the state machine.
 type AgentVerdictJSON struct {
-	Name            string `json:"name"`
-	Backend         string `json:"backend,omitempty"`
-	Mode            string `json:"mode,omitempty"`
-	Enabled         bool   `json:"enabled"`
-	ExpectedActive  bool   `json:"expectedActive"`
-	KickIntervalSec int64  `json:"kickIntervalSec,omitempty"`
-	State           string `json:"state,omitempty"`
-	RunState        string `json:"runState"`
-	LastActivityAt  string `json:"lastActivityAt,omitempty"`
-	Paused          bool   `json:"paused,omitempty"`
-	PausedBy        string `json:"pausedBy,omitempty"`
-	PausedTrigger   string `json:"pausedTrigger,omitempty"`
-	PausedReason    string `json:"pausedReason,omitempty"`
-	PausedAt        string `json:"pausedAt,omitempty"`
-	QuotaExhausted  bool   `json:"quotaExhausted,omitempty"`
-	CanOpenIssue    bool   `json:"canOpenIssue"`
-	CanOpenPR       bool   `json:"canOpenPR"`
-	CanMerge        bool   `json:"canMerge"`
-	Able            bool   `json:"able"`
-	CapabilityTier  string `json:"capabilityTier"`
-	Stuck           bool   `json:"stuck,omitempty"`
-	Impotent        bool   `json:"impotent,omitempty"`
-	QuietByDesign   bool   `json:"quietByDesign,omitempty"`
+	Name                 string `json:"name"`
+	Backend              string `json:"backend,omitempty"`
+	Mode                 string `json:"mode,omitempty"`
+	Enabled              bool   `json:"enabled"`
+	ExpectedActive       bool   `json:"expectedActive"`
+	KickIntervalSec      int64  `json:"kickIntervalSec,omitempty"`
+	State                string `json:"state,omitempty"`
+	RunState             string `json:"runState"`
+	LastActivityAt       string `json:"lastActivityAt,omitempty"`
+	Paused               bool   `json:"paused,omitempty"`
+	PausedBy             string `json:"pausedBy,omitempty"`
+	PausedTrigger        string `json:"pausedTrigger,omitempty"`
+	PausedReason         string `json:"pausedReason,omitempty"`
+	PausedAt             string `json:"pausedAt,omitempty"`
+	QuotaExhausted       bool   `json:"quotaExhausted,omitempty"`
+	StartFailureReason   string `json:"startFailureReason,omitempty"`
+	StartFailureCount    int    `json:"startFailureCount,omitempty"`
+	StartFailureLastAt   string `json:"startFailureLastAt,omitempty"`
+	StartFailureExitCode *int   `json:"startFailureExitCode,omitempty"`
+	StartFailureSignal   string `json:"startFailureSignal,omitempty"`
+	CanOpenIssue         bool   `json:"canOpenIssue"`
+	CanOpenPR            bool   `json:"canOpenPR"`
+	CanMerge             bool   `json:"canMerge"`
+	Able                 bool   `json:"able"`
+	CapabilityTier       string `json:"capabilityTier"`
+	Stuck                bool   `json:"stuck,omitempty"`
+	Impotent             bool   `json:"impotent,omitempty"`
+	QuietByDesign        bool   `json:"quietByDesign,omitempty"`
 	// Problem is THE alarm: governor expects this agent on and it can't deliver.
 	Problem bool `json:"problem,omitempty"`
 	// Unknown means the spoke did not report the new divergence signals (legacy
 	// build). The frontend renders these rows as "unknown", never as off/✗.
-	Unknown       bool   `json:"unknown,omitempty"`
-	BlockedReason string `json:"blockedReason,omitempty"`
+	Unknown        bool   `json:"unknown,omitempty"`
+	BlockedReason  string `json:"blockedReason,omitempty"`
+	RestartProblem string `json:"restartProblem,omitempty"`
 }
 
 // buildAgentVerdicts derives the per-agent verdict rows for one hive, skipping
@@ -478,32 +610,38 @@ func buildAgentVerdicts(agents []AgentSummary, blockers hiveBlockers, queuedWork
 		}
 		v := deriveAgentVerdict(a, blockers, queuedWork, now)
 		out = append(out, AgentVerdictJSON{
-			Name:            a.Name,
-			Backend:         a.Backend,
-			Mode:            a.Mode,
-			Enabled:         a.Enabled,
-			ExpectedActive:  a.ExpectedActive,
-			KickIntervalSec: a.KickIntervalSec,
-			State:           a.State,
-			RunState:        v.RunState.String(),
-			LastActivityAt:  a.LastActivityAt,
-			Paused:          a.Paused,
-			PausedBy:        a.PausedBy,
-			PausedTrigger:   a.PausedTrigger,
-			PausedReason:    a.PausedReason,
-			PausedAt:        a.PausedAt,
-			QuotaExhausted:  a.QuotaExhausted,
-			CanOpenIssue:    v.CanOpenIssue,
-			CanOpenPR:       v.CanOpenPR,
-			CanMerge:        v.CanMerge,
-			Able:            v.Able,
-			CapabilityTier:  v.CapabilityTier,
-			Stuck:           v.Stuck,
-			Impotent:        v.Impotent,
-			QuietByDesign:   v.QuietByDesign,
-			Problem:         v.Problem,
-			Unknown:         v.CapabilityTier == tierGray,
-			BlockedReason:   v.BlockedReason,
+			Name:                 a.Name,
+			Backend:              a.Backend,
+			Mode:                 a.Mode,
+			Enabled:              a.Enabled,
+			ExpectedActive:       a.ExpectedActive,
+			KickIntervalSec:      a.KickIntervalSec,
+			State:                a.State,
+			RunState:             v.RunState.String(),
+			LastActivityAt:       a.LastActivityAt,
+			Paused:               a.Paused,
+			PausedBy:             a.PausedBy,
+			PausedTrigger:        a.PausedTrigger,
+			PausedReason:         a.PausedReason,
+			PausedAt:             a.PausedAt,
+			QuotaExhausted:       a.QuotaExhausted,
+			StartFailureReason:   a.StartFailureReason,
+			StartFailureCount:    a.StartFailureCount,
+			StartFailureLastAt:   a.StartFailureLastAt,
+			StartFailureExitCode: a.StartFailureExitCode,
+			StartFailureSignal:   a.StartFailureSignal,
+			CanOpenIssue:         v.CanOpenIssue,
+			CanOpenPR:            v.CanOpenPR,
+			CanMerge:             v.CanMerge,
+			Able:                 v.Able,
+			CapabilityTier:       v.CapabilityTier,
+			Stuck:                v.Stuck,
+			Impotent:             v.Impotent,
+			QuietByDesign:        v.QuietByDesign,
+			Problem:              v.Problem,
+			Unknown:              v.CapabilityTier == tierGray,
+			BlockedReason:        v.BlockedReason,
+			RestartProblem:       agentRestartProblemReason(a),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -624,29 +762,59 @@ func rollupAgents(agents []AgentSummary, blockers hiveBlockers, queuedWork int, 
 		}
 		if v.Problem {
 			r.Problems++
-			switch v.RunState {
-			case runStuckAtLogin:
-				r.LoginStuck++
-			case runIdleAtPrompt:
-				r.IdleWithWork++
-			case runQuotaExhausted:
-				r.QuotaExhausted++
-			case runDead, runSessionGone:
-				r.DeadOrGone++
-			case runWorking:
-				if v.BlockedReason == "sitting at login prompt" {
-					// Login prompts are actionable the moment the ABLE leg sees
-					// NeedsLogin on an interactive backend, even while the ACTUAL
-					// leg is still inside its 20-minute grace and therefore says
-					// runWorking. Live "placeholder/" and available-akswec2 pool
-					// hives hit this shape: Problems>0 but LoginStuck stayed zero,
-					// so /fleet hid the cause behind "N agent(s) blocked". Bucket
-					// by the blocked reason as a fallback so the hive chip tells
-					// the operator to re-login.
+			startReason := startFailureBlockerReason(a, now)
+			restartReason := agentRestartProblemReason(a)
+			switch {
+			case startReason != "":
+				r.StartFailures++
+				r.StartFailureReason = commonProblemReason(r.StartFailureReason, startReason)
+			case restartReason != "":
+				r.RestartStorms++
+				r.RestartStormReason = commonProblemReason(r.RestartStormReason, restartReason)
+			default:
+				switch v.RunState {
+				case runStuckAtLogin:
 					r.LoginStuck++
+				case runIdleAtPrompt:
+					r.IdleWithWork++
+				case runQuotaExhausted:
+					r.QuotaExhausted++
+				case runRestartStorm:
+					r.RestartStorms++
+				case runDead, runSessionGone:
+					r.DeadOrGone++
+				case runWorking:
+					if v.BlockedReason == "sitting at login prompt" {
+						// Login prompts are actionable the moment the ABLE leg sees
+						// NeedsLogin on an interactive backend, even while the ACTUAL
+						// leg is still inside its 20-minute grace and therefore says
+						// runWorking. Live "placeholder/" and available-akswec2 pool
+						// hives hit this shape: Problems>0 but LoginStuck stayed zero,
+						// so /fleet hid the cause behind "N agent(s) blocked". Bucket
+						// by the blocked reason as a fallback so the hive chip tells
+						// the operator to re-login.
+						r.LoginStuck++
+					} else if strings.Contains(v.BlockedReason, "provider") && strings.Contains(v.BlockedReason, "quota") ||
+						strings.Contains(v.BlockedReason, "provider spending limit") {
+						r.QuotaExhausted++
+					}
 				}
 			}
 		}
 	}
 	return r
+}
+
+func commonProblemReason(current, next string) string {
+	next = strings.TrimSpace(next)
+	if next == "" {
+		return current
+	}
+	if current == "" {
+		return next
+	}
+	if current == next {
+		return current
+	}
+	return "mixed"
 }

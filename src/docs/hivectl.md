@@ -6,19 +6,51 @@ operates it.
 
 ## Quick start
 
+### Getting the binary
+
+On a host installed with `bin/hive-podman-setup.sh` there is nothing to do:
+the installer extracts `hivectl` from the Hive image onto the host —
+`~/.local/bin/hivectl` rootless, `/usr/local/bin/hivectl` rootful — and
+refreshes it on every re-run, so it always matches the running hive. This is
+the supported route on image-based hosts (Fedora Silverblue/Bluefin, RHEL
+image mode), which have no Go toolchain and a read-only `/usr` (#5646).
+
+The same extraction works by hand against any pulled Hive image. The image
+carries the binary as cargo at `/usr/local/share/hive/hivectl` (deliberately
+off the container's PATH — it is a client of the dashboard API, not part of
+the runtime; run it on the host, never inside the container):
+
+```bash
+podman create --name hivectl-extract ghcr.io/hivecommons/hive:stable
+podman cp hivectl-extract:/usr/local/share/hive/hivectl ~/.local/bin/hivectl
+podman rm hivectl-extract
+```
+
+Contributors working from a checkout build it from source instead:
+
 ```bash
 go build -o bin/hivectl ./cmd/hivectl
+```
 
+### First commands
+
+```bash
 # Point at a server (default: http://127.0.0.1:3001) and provide the token
 # via an environment variable, never as a flag value. The value must match the
 # server's dashboard token — see "Generating and rotating HIVE_DASHBOARD_TOKEN"
 # in env-vars.md (generate with: openssl rand -hex 32).
 export HIVE_DASHBOARD_TOKEN="..."
-bin/hivectl system status
+hivectl system status
+
+# On a Podman-standalone host, talk to the gateway's published port — the
+# installer prints the exact URL at the end of its run:
+hivectl --server http://127.0.0.1:3001 system status
 
 # Enroll a repository in clusterless, zero-secret Hive lite mode.
-bin/hivectl enroll kubestellar/hive
+hivectl enroll hivecommons/hive
 ```
+
+(From a source checkout the binary is `bin/hivectl` instead.)
 
 ## Running against a local Hive
 
@@ -137,6 +169,50 @@ hivectl observe timeline
 hivectl observe trends --range week        # or --hours 12 (1-720); not both
 ```
 
+### login / logout — hold a per-user session from the terminal
+
+```bash
+hivectl login                                    # against the default --server
+hivectl --server https://hive.example.com login  # against a specific hive
+hivectl logout
+```
+
+A hive dashboard identifies callers two ways, and they are not
+interchangeable: self-hosted hives accept the shared bearer token
+(`HIVE_DASHBOARD_TOKEN`), while hub-hosted hives and spokes with an
+`authorized_users` allowlist accept only a **per-user session** — the
+`hive_session` cookie the GitHub device-flow login mints, resolved on every
+request against the live allowlist. `hivectl login` runs that device flow from
+the terminal ([#5651](https://github.com/hivecommons/hive/issues/5651)): it
+prints a one-time code and `https://github.com/login/device`, waits for you to
+approve there, and caches the minted session so every subcommand — and
+`hivectl tui` — presents it automatically.
+
+Details worth knowing:
+
+- **The login proves identity only.** It requests no OAuth scope at all, and
+  your role (owner or viewer) is re-resolved by the hive on every request —
+  caching a session caches who you are, never what you may do.
+- **The cache** lives at `$XDG_CONFIG_HOME/hive/sessions.json` (default
+  `~/.config/hive/sessions.json`), owner-only (0600), keyed by dashboard URL
+  so one operator can hold sessions for several hives. The credential is never
+  printed.
+- **Precedence:** an explicitly exported `HIVE_DASHBOARD_COOKIE` always wins
+  over the cache. The token lane is independent — both credentials are
+  presented when both exist, and the hive honours whichever lane its
+  deployment implements.
+- **A hive runs one device flow at a time.** If another operator's login
+  starts while yours is pending, yours is replaced and `hivectl login` says
+  so — just run it again.
+- **On an allowlist spoke, an unauthorized GitHub account is refused** with
+  the server's own explanation naming the account; nothing is cached.
+- **Sessions expire** (30 days server-side). When a cached session stops
+  working, hivectl says to run `hivectl login` again instead of showing a bare
+  401.
+- `hivectl logout` ends the session server-side via the existing endpoint and
+  removes the cached credential; the cache is cleared even when the hive is
+  unreachable.
+
 ### tui — live terminal dashboard
 
 ```bash
@@ -150,7 +226,7 @@ another client of the API: same auth token, same endpoints, same SSE stream
 the web dashboard consumes. Requires a real terminal.
 
 This is the v1 delivery of the `hive tui` epic
-([#4907](https://github.com/kubestellar/hive/issues/4907)); the design
+([#4907](https://github.com/hivecommons/hive/issues/4907)); the design
 rationale and the fixed architecture decisions behind it are recorded in
 [`src/docs/design/tui.md`](design/tui.md).
 
@@ -158,13 +234,14 @@ rationale and the fixed architecture decisions behind it are recorded in
 
 `hivectl tui` takes no flags — it is a bare subcommand. In particular it does
 **not** honour the root `--server` / `--token-env` flags the other `hivectl`
-commands read: it builds its own client directly from two environment
+commands read: it builds its own client directly from three environment
 variables, checked once at startup:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `HIVE_DASHBOARD_URL` | `http://localhost:3001` | Dashboard API base URL |
-| `HIVE_DASHBOARD_TOKEN` | *(empty)* | Auth token — the same variable `--token-env` defaults to |
+| `HIVE_DASHBOARD_TOKEN` | *(empty)* | Shared dashboard token — the same variable `--token-env` defaults to |
+| `HIVE_DASHBOARD_COOKIE` | *(empty)* | Session cookie header, for hives that do not accept the shared token — see [Credentials](#credentials) |
 
 If you already have `HIVE_DASHBOARD_TOKEN` exported for the commands above,
 `hivectl tui` picks it up for free — the token variable name is shared on
@@ -173,6 +250,62 @@ purpose. The base URL default differs by one detail from `--server`'s
 same loopback dashboard, but set `HIVE_DASHBOARD_URL` explicitly if you also
 pass `--server` to other commands against a non-default host, since the TUI
 will not pick that flag up.
+
+#### Credentials
+
+The dashboard has two credential lanes and they are **not** interchangeable.
+Which one your hive accepts is a property of how it was deployed, not a
+preference:
+
+| Your hive | What it accepts | Set |
+|---|---|---|
+| Self-hosted, `dashboard.auth_token` set, no `authorized_users` | Shared bearer token | `HIVE_DASHBOARD_TOKEN` |
+| Spoke with an `authorized_users` allowlist (direct-route) | Per-user session **only** | `HIVE_DASHBOARD_COOKIE` |
+| Hub-hosted | The hub's per-user session | `HIVE_DASHBOARD_COOKIE` |
+
+The shared token grants unscoped owner and carries no per-user identity, which
+is exactly why a spoke with an allowlist **disables** it — accepting it would
+let any holder act as an owner and defeat the per-hive allowlist. Those hives
+identify callers by the `hive_session` cookie the GitHub device-flow login
+mints, resolved on every request against the live allowlist.
+
+Terminal attach never appends the shared token to `/terminal` URLs. When a
+shared-token hive needs a browser/WebSocket terminal open, the client first
+posts to `/api/terminal/handoff` with the normal Authorization header and uses
+the returned short-lived single-use `code` in the terminal URL.
+
+`HIVE_DASHBOARD_COOKIE` is a **cookie header value**, not a bare session id —
+the same string a browser would send:
+
+```bash
+export HIVE_DASHBOARD_COOKIE='hive_session=8f3c…'
+hivectl tui
+```
+
+Several cookies are joined with `; `, which is what a hub-hosted hive needs
+when its per-hive terminal assertion rides alongside the hub session. Taking a
+header value rather than a named id is what lets one variable serve every
+cookie-based deployment without the TUI having to know which kind of hive it
+is talking to.
+
+Obtaining the value today means copying it out of a browser already logged in
+to that dashboard (devtools → Application → Cookies). There is no
+`hivectl login` yet; adding one so the credential can be acquired from the
+terminal is tracked in
+[#5651](https://github.com/hivecommons/hive/issues/5651).
+
+Both variables may be set at once, and both are sent. That is not redundancy:
+a shared-token hive ignores the cookie and an allowlist hive ignores the token,
+so setting both is how one exported environment works against every hive you
+operate.
+
+**If the credentials are rejected, `hivectl tui` refuses to start** rather than
+opening a screen of empty panes. A `401` is a standing answer — no keypress in
+the TUI can fix it — so it prints which variables to set and exits, leaving
+your scrollback intact. Every other failure still opens normally: a hive that
+is merely *down* is one of the main reasons to open the TUI, and the panes fill
+themselves when it returns. A `403` also opens: that is a working session whose
+role is too narrow for some reads, which the panes already handle individually.
 
 #### The four panes
 
@@ -198,7 +331,7 @@ The **activity loop** — Tokens and Events — polls every 5 seconds
 the stream carries token counts, estimated cost, or audit rows, so there is
 no push event for those panes to wait on; tying them to the reconciliation
 timer would make a *healthy* connection the reason they went stale. (This is
-what `tui T32` / [#5421](https://github.com/kubestellar/hive/issues/5421)
+what `tui T32` / [#5421](https://github.com/hivecommons/hive/issues/5421)
 fixed — earlier builds hung all seven reads off one timer, so a connected
 stream paradoxically made the Tokens and Events panes twelve times staler.)
 
@@ -228,7 +361,7 @@ simply keeps its last successful snapshot rather than showing an error.
 | `m` | Open the model picker for the selected agent | Agents pane |
 | `K` | Kick the selected agent now | Agents pane |
 | `A` | Open the ACMM level overlay | global |
-| `a` | Attach to the selected agent's tmux session (**local only**) | Agents pane |
+| `a` | Attach to the selected agent's tmux session (local, or via the dashboard's terminal proxy) | Agents pane |
 | `?` | Toggle the help overlay (lists this table; dismisses on any key) | global |
 | `q` / `ctrl+c` | Quit | global |
 
@@ -310,17 +443,42 @@ reconciled to it — a 500 after the write took effect), the overlay still
 shows an apply error, but the app also triggers an immediate refresh anyway,
 because the panes underneath may already describe a hive that has moved.
 
-#### Local tmux attach
+#### Attach: local tmux, or the dashboard's terminal proxy
 
-`a` on a selected agent runs a preflight check (`tmux has-session -t
-hive-<agent>`) before suspending the TUI, so a missing `tmux` binary or a
-session that does not exist yet surfaces as a footer message
-(`Attach failed: …`) instead of a redraw flicker. A successful preflight hands
-the terminal to `tmux attach` directly; returning from the session (however it
-ends) restores the TUI and immediately refreshes the fleet, since the agent's
-state may have moved while attached. **This is local-only** — it execs a
-`tmux` binary next to the TUI process and cannot attach to a session running
-on a remote hive.
+`a` on a selected agent attaches to that agent's tmux session. Where the
+session actually is decides how ([#5644](https://github.com/hivecommons/hive/issues/5644)):
+
+- **Local fast path.** When `HIVE_DASHBOARD_URL` is loopback (or unset) and a
+  local `tmux has-session -t hive-<agent>` succeeds, the terminal is handed to
+  `tmux attach` directly — the original, zero-network behavior.
+- **Remote attach.** When the dashboard is not loopback, or the local session
+  does not exist — the recommended Podman install, where the sessions live
+  inside the container under other UIDs — the TUI dials the dashboard's own
+  `/terminal` websocket instead: the same authenticated reverse proxy the web
+  dashboard's "▶ terminal" links use, in front of the container's ttyd.
+  Nothing new is exposed for this; ttyd's port stays loopback-only inside the
+  container, and the attach carries the same credentials as every other TUI
+  request (`HIVE_DASHBOARD_TOKEN` and/or `HIVE_DASHBOARD_COOKIE` — see
+  [Credentials](#credentials)), plus ttyd's own basic-auth credential derived
+  the way the container derives it (`hive:<token>`, overridable with
+  `HIVE_TTYD_CREDENTIAL` if the deployment overrode it too).
+
+The fallback is never silent: a remote attach prints one line before the
+session's first byte saying which hive it went through and which session it
+attached to, so there is no ambiguity about what you are typing into. That
+line never contains the token.
+
+Both paths preflight before suspending the TUI, so a missing `tmux` binary, a
+session that does not exist anywhere, an unreachable dashboard, or a refused
+authorization surfaces as a footer message (`Attach failed: …`) instead of a
+redraw flicker — a 403 reads `owner access required` like the other actions,
+a 401 names both credential variables. Inside a remote session every
+keystroke, `ctrl+c` included, belongs to the agent's terminal; you leave with
+tmux's own detach (`prefix + d`, i.e. `Ctrl-b d` by default). Returning from
+the session (however it ends, on either path) restores the TUI and
+immediately refreshes the fleet, since the agent's state may have moved while
+attached. If the connection drops mid-session rather than closing cleanly,
+the footer says so — your last keystrokes may not have arrived.
 
 #### Connection status and the poll fallback
 
@@ -355,10 +513,17 @@ an operator dismisses the overlay first (see the modal rule above).
 
 #### v1 boundaries
 
-- **Self-hosted, token auth only.** `HIVE_DASHBOARD_TOKEN` against a
-  self-hosted hive's dashboard; there is no hub OAuth login flow.
-- **Local tmux attach only.** No remote terminal embedding over the ttyd
-  WebSocket — that is a follow-up epic.
+- **No login flow.** Both credentials must already exist in your environment:
+  the TUI reads `HIVE_DASHBOARD_TOKEN` and `HIVE_DASHBOARD_COOKIE` and cannot
+  acquire either. Session-based hives (hub-hosted, or a spoke with an
+  `authorized_users` allowlist) are reachable, but the cookie has to be lifted
+  from a browser — see [Credentials](#credentials) and
+  [#5651](https://github.com/hivecommons/hive/issues/5651).
+- **No terminal emulation in-frame.** Remote attach
+  ([#5644](https://github.com/hivecommons/hive/issues/5644)) suspends the TUI
+  and streams the ttyd websocket through your own terminal, exactly as the
+  local path suspends into `tmux attach`; the session is not re-rendered
+  inside a pane.
 - **Feature parity with the web dashboard's operator loop, not visual
   parity.** The TUI does not attempt to look like the web dashboard.
 
@@ -390,7 +555,7 @@ SSE degradation, both of which need state the fixture cannot produce
 deterministically. Each omission is explained in a comment in the tape itself.
 
 Track any further work under the `hive tui` epic
-([#4907](https://github.com/kubestellar/hive/issues/4907)).
+([#4907](https://github.com/hivecommons/hive/issues/4907)).
 
 ### enroll — spoke-based lite repo enrollment
 

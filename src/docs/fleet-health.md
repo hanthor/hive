@@ -80,21 +80,34 @@ least one agent must be running at cadence. The verdict checks these in a
 fixed order and returns on the first match, so a deeper cause can never be
 shadowed by a shallower one:
 
-1. **GitHub App broken** — beats everything. The chip names the specific
-   failure when the spoke reported one (for example "GitHub App:
-   repo-not-covered", which needs a different remedy than a bad key).
-2. **Provider spending limit reached** — the model provider is refusing
+1. **Inference gateway failing** — beats inferred App breakage. Runtime proxy
+   failures and Gateway Test report DNS/connect/5xx/auth/budget classes; the
+   chip says, for example, "inference gateway 'litellm' unreachable (dns)"
+   or "inference gateway 'litellm' rejected key (401)" and points at
+   Settings → Model Gateways.
+2. **GitHub App broken** — applies when an actual App/auth problem is reported
+   or no gateway fault is present. The chip names the specific failure when the
+   spoke reported one (for example "GitHub App: repo-not-covered", which needs
+   a different remedy than a bad key). New spokes also send the App host,
+   App ID, installation ID, HTTP status, and error class, so token-mint 404s
+   render as an installation mismatch instead of a generic auth failure.
+3. **Provider spending limit reached** — the model provider is refusing
    calls; shown with the refused-call count when known.
-3. **Budget exhausted / budget misconfigured** — the hive's own token budget
+4. **Budget exhausted / budget misconfigured** — the hive's own token budget
    closed the gate (see [the budget signals](#budget-exhausted-vs-budget-misconfigured)).
-4. **Blocked agents** — all blocked agents share one cause when possible:
+5. **Blocked agents** — all blocked agents share one cause when possible:
    "N agent(s) out of provider quota", "N agent(s) stuck at login —
-   re-login needed", "N agent(s) down — restart needed", "N agent(s) idle
-   with work queued", or the generic "N agent(s) blocked".
-5. **No agents running** (red) or **all agents paused** (amber — pausing is
+   re-login needed", "starting failed ×N: <reason> (last <age>)",
+   "N agent(s) down — restart needed", "N agent(s) idle with work queued",
+   "agent restarts: NAME ×N/24h (reason)", or the generic "N agent(s)
+   blocked". Agent restart storms use the hub threshold
+   `HIVE_HUB_AGENT_RESTART_PROBLEM_THRESHOLD` (default `5`). Provider quota
+   is counted per named quota-exhausted agent unless the heartbeat explicitly
+   marks the provider limit as hive-wide.
+6. **No agents running** (red) or **all agents paused** (amber — pausing is
    operator choice, not an outage, but queued work will not move until
    someone resumes them).
-6. **Repo Issues disabled** — the repo's Issues tab is off (the GitHub
+7. **Repo Issues disabled** — the repo's Issues tab is off (the GitHub
    default on forks), so the advisory digest and every agent-filed issue
    have nowhere to go. Nothing about the App, key, or agents is wrong; the
    fix is the repo setting.
@@ -143,6 +156,7 @@ agents down, advisory stale, …) deliberately get none rather than a guess.
 
 | Cause | WHY chip you see | Verdict | Hint (action) | Where to do it |
 |---|---|---|---|---|
+| Inference gateway | "inference gateway 'litellm' unreachable (dns)" / "rejected key (401)" | red | Fix or retest the failing gateway (Settings → Model Gateways) | spoke dashboard settings |
 | App broken | "GitHub App broken" or "GitHub App: \<state\>" | red | Install or repair the GitHub App for this repo | GitHub App settings (link resolved per cluster/forge) |
 | Login stuck | "N agent(s) stuck at login — re-login needed" | red | Copilot device-flow login on the spoke dashboard | spoke dashboard `/login` |
 | Budget exhausted | "budget exhausted — spend X of Y, kicks suppressed" | red | Raise or reset the budget limit (Settings → Budget) | spoke dashboard settings |
@@ -245,23 +259,35 @@ The scalar quadrant signals (budget spend/limit/exhausted, hold totals)
 follow the same nil-means-not-measured rule: an old spoke that never sends
 them is simply not judged on them.
 
+## Output-freshness telemetry
+
+For L3-L6 hives, newer spokes add optional heartbeat fields that explain stale write/merge streams: the most recent write-capable kick, the last kick disposition or skip reason, and how many queued items were deliberately deemed not writable. The hub treats missing fields as an old spoke and keeps the legacy red `no write in Nd (M queued)` behavior. When the fields are present, the verdict can distinguish a broken pipeline (recent write-capable kicks but no writes) from quiet-by-design states such as no due agents, budget-suppressed kicks, advisory-only operation, or work that agents intentionally declined as not writable.
+
 ## Troubleshooting: symptom → hint → fix
 
 | Symptom on `/fleet` | What it means | Fix, and where |
 |---|---|---|
 | "GitHub App broken" / "GitHub App: repo-not-covered" | The hive cannot authenticate to its repo, or the App is installed but this repo is not selected | Install or repair the App; for repo-not-covered, add the repo to the App installation. Follow the row's **open** link, or see [GitHub App setup](github-app-setup.md) |
+| "GitHub App N on HOST: installation M not found (404) …" | The spoke can identify the App/host it used, but GitHub did not find that installation for the App on that host | Reinstall the App for the target account, or fix `github.app_id`, `github.installation_id`, or the GitHub Enterprise host |
+| "GitHub App: repo-moved" | The App installation is healthy, but it covers this hive's repositories under a **different account** — they were transferred to another org | Point the hive's configured organization at the account named in the message. Do **not** add the repo to the old org's installation: it has left that account, so there is nothing there to add |
 | "provider spending limit reached — N refused calls" | The model provider is refusing calls on billing/limit grounds | Raise the provider's spending limit or wait for it to reset (provider console — no hint link) |
 | "budget exhausted — spend X of Y, kicks suppressed" | The hive spent its window's tokens; the governor halted kicks | Raise the limit in the spoke dashboard (Settings → Budget), or wait for the window to roll |
 | "budget limit misconfigured (N tokens) …" | The limit is too small to fund one model call — likely a unit mistake | Fix the number in Settings → Budget. Window reset will **not** help |
 | "N agent(s) stuck at login — re-login needed" | Every blocked agent is wedged at a login prompt | Run the Copilot device-flow login on the spoke dashboard `/login` |
 | "N agent(s) out of provider quota" | Agents hit per-account model quota | Wait for quota reset or change the account/model on the agent cards |
 | "N agent(s) down — restart needed" | Agent sessions failed or died | Restart the agents from the spoke dashboard |
+| "starting failed ×N: REASON (last AGE ago)" | The spoke has a current launch failure, even if it has not reached the blocked threshold yet | Follow the named reason (for example login, missing CLI, rejected key, or no prompt); restart only after fixing that cause |
 | "N agent(s) idle with work queued" | Sessions are alive but agents sat past the idle threshold with work available | Kick the agents or review their schedules — this is not a restart problem |
+| "agent restarts: NAME ×N/24h (reason)" | One agent has been relaunched at least the configured threshold within the recent window | Use the `/fleet` reset button next to the restart chip before troubleshooting; the hub records a reset marker and asks the spoke to zero its counter on the next heartbeat so recurrence is visible |
 | "no agents running" | Agents are expected on but none are running | Start/resume agents on the spoke dashboard |
 | "all agents paused — resume to produce output" (amber) | Every agent is operator-paused while work is queued | Resume agents when you want the queue to move — deliberate pause is respected, not faulted |
 | "repo Issues disabled — advisory/issues have nowhere to go" | The repo's Issues tab is off (common on forks) | Enable Issues in the repo's settings on your forge |
 | "advisory stale" / "advisory posting failing" | The L2 output — the advisory digest — is old, or the spoke reported a posting error | See [advisory digest staleness](advisory-staleness.md) |
-| "no write in Nh (M queued)" / "no create output" | Preconditions are green but the write stream stalled with work available | Check agent activity and logs on the spoke dashboard; if an error-streak chip appears instead, follow that hint first |
+| "pipeline broken — write-capable kick … but no writes" | Kicks are reaching write-capable agents, but no work-source writes are appearing | Check the kicked agent logs and write permissions on the spoke dashboard |
+| "nothing to write — governor idle since … because …" | The governor is intentionally idle (for example no due agents), so stale writes are not a broken pipeline | Review schedules only if you expected an agent to be due |
+| "advisory-only — …" | The hive is in an advisory-only band/path, so writes are not expected from that activity | Nothing, unless you intended L3+ write behavior |
+| "nothing writable — N queued deemed not writable" | Agents classified queued items as held or not writable and stood down | Review the queued/held items; no restart is implied |
+| "no write in Nh (M queued)" / "no create output" | Older spoke or no freshness telemetry: preconditions are green but the write stream appears stalled | Check agent activity and logs on the spoke dashboard; if an error-streak chip appears instead, follow that hint first |
 | "no merge in Nh (M queued)" (L6) | PRs are being created but nothing merges | Check merge-agent grants and required checks on the queued PRs |
 | "agent NAME model calls failing (N consecutive) — pin a working model" | The agent's turns run but every model call dies | Pin a working model on the agent card in the spoke dashboard |
 | "agent(s) NAME stuck at Copilot consent — restarting in a loop" | The kick path keeps restarting an agent parked on a consent screen | Complete the consent flow on the spoke dashboard; the alarm clears itself within the hour |

@@ -15,16 +15,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/beads"
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/governor"
-	"github.com/kubestellar/hive/pkg/planning"
-	"github.com/kubestellar/hive/pkg/resolve"
-	"github.com/kubestellar/hive/pkg/skillreg"
-	"github.com/kubestellar/hive/pkg/tokens"
-	"github.com/kubestellar/hive/pkg/watchdog"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/beads"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/governor"
+	"github.com/hivecommons/hive/pkg/planning"
+	"github.com/hivecommons/hive/pkg/resolve"
+	"github.com/hivecommons/hive/pkg/skillreg"
+	"github.com/hivecommons/hive/pkg/tokens"
+	"github.com/hivecommons/hive/pkg/watchdog"
 )
 
 // skillsConventionalDir is the conventional on-disk location the dashboard
@@ -674,6 +674,26 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 			TransientNudges: proc.TransientNudges,
 			Conditions:      proc.WatchdogConditions,
 			WatchdogMode:    watchdogMode,
+		}
+		if proc.ProviderErrorClass != "" && time.Now().Before(proc.ProviderErrorBackoffUntil) {
+			a.StructuredStatus = "BLOCKED"
+			a.StatusEvidence = "blocked: inference (" + proc.ProviderErrorClass + ")"
+			if line := strings.TrimSpace(proc.ProviderErrorLine); line != "" {
+				a.StatusEvidence += ": " + line
+			}
+		}
+		// #5958: the card said "restart needed" for an agent that had failed to
+		// start the same way three times running, so the one control it offered
+		// was the one that could not help. Show the reason and the recurrence
+		// instead. Written after the inference block on purpose — an agent that
+		// cannot START is a more basic fault than one whose provider is erroring,
+		// and it is the one the operator has to act on first.
+		if proc.StartBlocked {
+			a.StructuredStatus = "BLOCKED"
+			a.StatusEvidence = "blocked: " + strings.TrimSpace(proc.StartFailureReason)
+			if proc.StartFailureCount > 0 {
+				a.StatusEvidence += fmt.Sprintf(" (%d consecutive failed starts)", proc.StartFailureCount)
+			}
 		}
 
 		acmmLevel := 0
@@ -1640,11 +1660,21 @@ func buildGHRateLimits(ghClient *github.Client, ctx context.Context, cfg *config
 	if ghClient != nil && ctx != nil {
 		limits, err := ghClient.RateLimits(ctx)
 		if err == nil && limits != nil {
-			result["core"] = map[string]any{
+			core := map[string]any{
 				"limit":     limits.Core.Limit,
 				"remaining": limits.Core.Remaining,
 				"reset":     limits.Core.Reset.Format(time.RFC3339),
 			}
+			// observed_at is when this reading was actually taken
+			// (kubestellar/hive#5733). reset cannot answer that — it moves
+			// independently of the sample, and was 8.5 minutes adrift of
+			// reality while the card sat pinned at the full limit. Emitted
+			// only when known, so a client that has never observed a bucket
+			// does not publish a zero timestamp that renders as 1970.
+			if !limits.Core.ObservedAt.IsZero() {
+				core["observed_at"] = limits.Core.ObservedAt.Format(time.RFC3339)
+			}
+			result["core"] = core
 		}
 	}
 

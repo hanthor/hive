@@ -12,7 +12,7 @@
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-hive_image := env("HIVE_CONTRIBUTOR_IMAGE", "ghcr.io/kubestellar/hive-contributor:latest")
+hive_image := env("HIVE_CONTRIBUTOR_IMAGE", "ghcr.io/hivecommons/hive-contributor:latest")
 hive_hub := env("HIVE_HUB", "wss://hive.kubestellar.io/contribute")
 config_dir := env("HOME") + "/.config/hive"
 # Container runtime for containerized mode. Empty = auto-detect (docker, then
@@ -1131,9 +1131,10 @@ contribute-hive backend="" mode="docker": check-version
       # costs nothing and keeps the default blast radius off the user's home.
       export HIVE_AGENT_CWD="${XDG_STATE_HOME:-${HOME}/.local/state}/hive/agent-cwd"
       mkdir -p "$HIVE_AGENT_CWD"
+      export AGENT_LAUNCH_CMD="${LITELLM_ENV:+$LITELLM_ENV }$CMD${PERM_FLAG:+ $PERM_FLAG}"
       tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
       tmux new-session -d -s "$TMUX_SESSION" -x 200 -y 50 -c "$HIVE_WORKSPACE_DIR"
-      tmux send-keys -t "$TMUX_SESSION" "cd $(printf %q "$HIVE_AGENT_CWD") && ${LITELLM_ENV:+$LITELLM_ENV }$CMD $PERM_FLAG" Enter
+      tmux send-keys -t "$TMUX_SESSION" "cd $(printf %q "$HIVE_AGENT_CWD") && $AGENT_LAUNCH_CMD" Enter
 
       # Surface a poisoned tmux server rather than letting the backend die a
       # silent, unexplained death 30 seconds into its first task.
@@ -1686,7 +1687,7 @@ contribute-k8s namespace="hive-contributor" outfile="" image_tag="v4":
     readonly ENV_FILE="{{config_dir}}/contributor.env"
     readonly GH_AUTH_FILE="{{config_dir}}/gh-auth.env"
     # Published multi-arch image (.github/workflows/docker.yml build-contributor).
-    readonly IMAGE_REPO="ghcr.io/kubestellar/hive-contributor"
+    readonly IMAGE_REPO="ghcr.io/hivecommons/hive-contributor"
     # CONTRIBUTOR_MODE selector values — must match bin/contributor-relay.sh.
     readonly MODE_HEADLESS="headless"
     # Where the headless relay writes its coarse lifecycle state as JSON
