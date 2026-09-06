@@ -15442,11 +15442,15 @@ function burnAreaChart() {
     }
 
     function acmmCriterionRow(c, repoName) {
-      const icon = c.passed ? '✅' : '❌';
+      // ❔ = GitHub did not answer for every pattern (rate limit, timeout,
+      // error). Not a gap: no Open Issue button, excluded from Open All.
+      const icon = c.unknown ? '❔' : (c.passed ? '✅' : '❌');
       const tip = ACMM_CRITERION_TIPS[c.id] || '';
       const patternItems = (c.patterns || []).map(p => '<span style="display:inline-block;font-size:0.68rem;background:var(--bg);padding:1px 6px;border-radius:3px;border:1px solid var(--border);margin:1px 2px;font-family:var(--font-mono)">' + escapeHtml(p) + '</span>').join('');
       let issueBtn = '';
-      if (!c.passed) {
+      if (c.unknown) {
+        issueBtn = '<span class="muted-xs" style="margin-left:auto;white-space:nowrap" title="The evaluation could not check this criterion — GitHub returned an error or the per-repo time budget ran out. Re-evaluate before treating it as a gap.">not evaluated</span>';
+      } else if (!c.passed) {
         const repo = repoName || _acmmSelectedRepo || '';
         const issueKey = repo + ':' + c.id;
         const existing = _acmmOpenedIssues[issueKey];
@@ -15561,7 +15565,7 @@ function burnAreaChart() {
     function acmmOpenAllIssuesForLevel(level) {
       if (!_acmmEvalData) return;
       const active = acmmGetActiveData();
-      const criteria = (active.criteria_results || active.CriteriaResults || []).filter(c => c.level === level && !c.passed);
+      const criteria = (active.criteria_results || active.CriteriaResults || []).filter(c => c.level === level && !c.passed && !c.unknown);
       if (criteria.length === 0) return;
       const repos = (_acmmEvalData.repo_results || []);
       const hasMultiRepo = repos.length > 1;
@@ -15598,7 +15602,7 @@ function burnAreaChart() {
 
     async function acmmBatchCreateIssues(level) {
       const active = acmmGetActiveData();
-      const criteria = (active.criteria_results || []).filter(c => c.level === level && !c.passed);
+      const criteria = (active.criteria_results || []).filter(c => c.level === level && !c.passed && !c.unknown);
       const repos = (_acmmEvalData.repo_results || []);
       const targetRepo = _acmmSelectedRepo || (repos.length === 1 ? repos[0].repo : null);
 
@@ -15624,7 +15628,7 @@ function burnAreaChart() {
             const issueKey = rr.repo + ':' + c.id;
             if (_acmmOpenedIssues[issueKey]) { skipped++; continue; }
             const rc = (rr.criteria_results || []).find(x => x.id === c.id);
-            if (rc && !rc.passed) {
+            if (rc && !rc.passed && !rc.unknown) {
               try {
                 const r = await fetch('/api/acmm/issue', {
                   method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -15658,7 +15662,7 @@ function burnAreaChart() {
       const statusColor = passed ? 'var(--green)' : (pct > 40 ? 'var(--yellow)' : 'var(--red)');
       const statusText = passed ? '✓ Passed' : '✗ Not passed';
       const threshold = lvlData ? Math.round(lvlData.threshold * 100) : 70;
-      const failCount = criteria.filter(c => !c.passed).length;
+      const failCount = criteria.filter(c => !c.passed && !c.unknown).length;
 
       const byCategory = {};
       for (const c of criteria) {
@@ -15826,7 +15830,7 @@ function burnAreaChart() {
         const criteria = results.filter(c => c.level === lvl.level);
         const pct = Math.round(lvl.score * 100);
         const color = lvl.passed ? 'var(--green)' : (pct > 40 ? 'var(--yellow)' : 'var(--red)');
-        const failCount = criteria.filter(c => !c.passed).length;
+        const failCount = criteria.filter(c => !c.passed && !c.unknown).length;
         html += '<div style="margin-bottom:8px">' +
           '<div data-action="ghAcmmCloseAndShowLevel" data-arg0="' + lvl.level + '" data-arg-types="j" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:6px 8px;background:var(--bg);border-radius:6px;border:1px solid var(--border);transition:border-color .15s" data-mouseover-action="gh22" data-mouseout-action="gh21">' +
           '<span style="font-size:0.82rem;font-weight:600">L' + lvl.level + ' ' + escapeHtml(lvl.name) + '</span>' +
