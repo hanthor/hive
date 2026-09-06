@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ============================================================
@@ -286,6 +287,13 @@ func TestHandleUpgradeHiveKubectlFails(t *testing.T) {
 	// failure alone no longer fails the request: with a known target it arms
 	// the heartbeat fallback instead (TestHandleUpgradeHiveUnreachableCluster*).
 	saveSaaSHive(&SaaSHive{ID: "h1", Owner: "alice", ClusterID: "hive-oke"})
+	// The hive must be heartbeating, otherwise the collectibility gate refuses
+	// with 409 BEFORE the no-build-target check this case is about. The branch
+	// deliberately has no known SHA, which is what produces the 502.
+	s.registry.Hives = []RegistryEntry{{
+		ID: "h1", GitBranch: "branch-with-no-build",
+		LastHeartbeat: time.Now().UTC().Format(time.RFC3339),
+	}}
 	rec = httptest.NewRecorder()
 	req = setPathValue(reqWithUser(http.MethodPost, "/up", "", "alice"), "id", "h1")
 	s.handleUpgradeHive(rec, req)
@@ -325,6 +333,9 @@ func TestHandleSwitchBranchValidation(t *testing.T) {
 	latestSHAMu.Lock()
 	latestSHAByBranch["v2"] = branchSHAInfo{SHA: "abc1234"}
 	latestSHAMu.Unlock()
+	oldSpokeImageExists := spokeImageExists
+	spokeImageExists = func(string, *slog.Logger) bool { return true }
+	t.Cleanup(func() { spokeImageExists = oldSpokeImageExists })
 	// Point the hive's registry entry at the tracked branch so it's in the list.
 	s.registry.Hives = []RegistryEntry{{ID: "h1", GitBranch: "v2"}}
 	rec = httptest.NewRecorder()
@@ -341,5 +352,44 @@ func TestBranchToTag(t *testing.T) {
 	}
 	if got := branchToTag("v2"); got != "v2" {
 		t.Errorf("branchToTag(v2) = %q, want v2", got)
+	}
+}
+
+func TestHandleResetAgentRestartsAuthzAndPersistence(t *testing.T) {
+	cleanup := helperSetupTempDirs(t)
+	defer cleanup()
+	s := newHubServerForTest(t)
+	owner := "owner"
+	other := "other"
+	mkUser(t, owner)
+	mkUser(t, other)
+	if err := saveSaaSHive(&SaaSHive{ID: "h1", Owner: owner, Org: "org", PrimaryRepo: "repo"}); err != nil {
+		t.Fatalf("save hive: %v", err)
+	}
+	s.registry.Hives = []RegistryEntry{{ID: "h1", Agents: []AgentSummary{{Name: "scanner", Restarts: AgentRestartTelemetry{Total: 9, Last24h: 9}}}}}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/saas/hives/h1/agents/scanner/restarts/reset", nil)
+	req.SetPathValue("id", "h1")
+	req.SetPathValue("agent", "scanner")
+	req.AddCookie(testAuthCookie(other))
+	rec := httptest.NewRecorder()
+	s.handleResetAgentRestarts(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-owner status = %d, want 403", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/saas/hives/h1/agents/scanner/restarts/reset", nil)
+	req.SetPathValue("id", "h1")
+	req.SetPathValue("agent", "scanner")
+	req.AddCookie(testAuthCookie(owner))
+	rec = httptest.NewRecorder()
+	s.handleResetAgentRestarts(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner status = %d body %s", rec.Code, rec.Body.String())
+	}
+	h := loadSaaSHive("h1")
+	reset := h.AgentRestartResets["scanner"]
+	if !reset.Pending || reset.TotalBaseline != 9 || reset.By != owner || reset.ResetAt == "" {
+		t.Fatalf("reset marker = %+v", reset)
 	}
 }

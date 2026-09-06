@@ -20,11 +20,11 @@ run_number=$5
 release_branch=$6
 include_latest=$7
 # CHANNELS: comma-separated release-channel tags this branch's builds own
-# (default preserves the historical behavior). Channel ownership is
-# per-branch: v4 owns stable+candidate, the v5 line owns edge — without the
+# (default is fail-closed and never moves stable). Channel ownership is
+# per-branch: v4 merge builds own candidate, the v5 line owns edge — without the
 # split, every v4 merge silently re-pointed edge back onto v4 minutes after
 # any deliberate promotion of edge to v5.
-channels=${8:-stable,candidate,edge}
+channels=${8:-candidate}
 run_label=io.kubestellar.hive.github-actions-run-number
 
 if [[ ! $run_number =~ ^[0-9]+$ ]]; then
@@ -120,3 +120,23 @@ for file in "${digest_files[@]}"; do
 done
 
 docker buildx imagetools create "${tag_args[@]}" "${source_args[@]}"
+
+assert_linux_platforms() {
+  local ref=$1 platform inspect
+  for platform in linux/amd64 linux/arm64; do
+    if ! inspect=$(docker buildx imagetools inspect \
+        --format "{{json (index .Image \"$platform\")}}" "$ref" 2>&1); then
+      echo "::error::could not inspect $ref after publishing; refusing to leave an unverified moving tag" >&2
+      echo "$inspect" >&2
+      exit 1
+    fi
+    if [[ $inspect == null ]]; then
+      echo "::error::$ref is missing $platform after publishing" >&2
+      exit 1
+    fi
+  done
+}
+
+for ((i = 0; i < ${#tag_args[@]}; i += 2)); do
+  assert_linux_platforms "${tag_args[i+1]}"
+done

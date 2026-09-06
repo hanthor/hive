@@ -56,6 +56,35 @@ type AgentActionResult struct {
 	State string `json:"state"`
 }
 
+// KickResult is the response from POST /api/kick/{agent}.
+//
+// It mirrors dashboard/openapi.json exactly. Unlike AgentActionResult, the kick
+// response has no resulting lifecycle state.
+//
+// The endpoint is ASYNCHRONOUS (#5325): it answers 202 once the message is
+// queued, so Status is "queued" — or "in-flight" when a delivery for the same
+// agent was already running and this call was deduplicated to guarantee the
+// prompt is typed exactly once. Neither value asserts the message reached the
+// CLI. A definitive precondition failure (unknown, paused, stopped, no tmux
+// session) still comes back as an APIError with 400; delivery success or
+// failure is read from GET /api/kick/{agent}/status.
+type KickResult struct {
+	Status string `json:"status"`
+	Agent  string `json:"agent"`
+}
+
+// Queued reports whether the kick was accepted for delivery by this call, as
+// opposed to being folded into a delivery that was already in flight.
+func (r KickResult) Queued() bool { return r.Status == "queued" }
+
+// kickRequest is the prompt-bearing form of the optional kick request body.
+// The published operation also accepts a legacy message field when prompt is
+// empty, but callers of KickAgent supply a prompt, so sending message here
+// would duplicate the same value in a lower-precedence field.
+type kickRequest struct {
+	Prompt string `json:"prompt"`
+}
+
 // Paused reports whether the agent is paused after the call, per State.
 //
 // State is a string on the wire because that is what the spec and handler
@@ -87,6 +116,31 @@ func (c *Client) PauseAgent(ctx context.Context, agent string) (AgentActionResul
 // owner-only.
 func (c *Client) ResumeAgent(ctx context.Context, agent string) (AgentActionResult, error) {
 	return c.agentAction(ctx, "/api/resume/", agent)
+}
+
+// KickAgent sends a prompt to one running agent via POST /api/kick/{agent}.
+//
+// An empty prompt deliberately sends no request body. That reaches the
+// server's auto-generated-message path, which builds a kick from the agent's
+// last actionable item. A non-empty prompt is sent in the preferred prompt
+// field; the server enforces the operation's 10000-character limit.
+func (c *Client) KickAgent(ctx context.Context, agent, prompt string) (KickResult, error) {
+	const prefix = "/api/kick/"
+	if agent == "" {
+		return KickResult{}, fmt.Errorf("POST %s: agent name is required", prefix)
+	}
+
+	var body any
+	if prompt != "" {
+		body = kickRequest{Prompt: prompt}
+	}
+
+	var result KickResult
+	path := prefix + url.PathEscape(agent)
+	if err := c.postJSON(ctx, path, body, &result); err != nil {
+		return KickResult{}, err
+	}
+	return result, nil
 }
 
 // agentAction is the shared body of PauseAgent and ResumeAgent, which differ

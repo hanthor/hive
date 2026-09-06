@@ -47,7 +47,7 @@ Knowledge flows DOWN automatically (community → personal). Knowledge flows UP 
 ┌──────────────────▼──────────────────────────────┐
 │  Org Wiki                SHARED / TEAM-SCOPED    │
 │  Hosted per-org (e.g., wiki.kubestellar.io)      │
-│  Or git-backed repo (kubestellar/hive-wiki)      │
+│  Or git-backed repo (hivecommons/hive-wiki)      │
 │  Org members read+write, outsiders read-only     │
 │  "ALWAYS use DCO signing"                        │
 │  "isDemoData wiring is MANDATORY"                │
@@ -86,7 +86,7 @@ Knowledge flows DOWN automatically (community → personal). Knowledge flows UP 
 |-------|---------------|-------------|--------------|---------|
 | **Personal** | `~/.hive/wiki/` on user's machine | Only you | Only you | Local llm-wiki instance (never networked) |
 | **Project** | `.hive/wiki/` in repo | Anyone with repo access | Agents + Knowledge Curator | Local llm-wiki instance per worktree |
-| **Org** | Dedicated git repo (e.g., `kubestellar/hive-wiki`) | Org members | Promoted facts from project wikis | llm-wiki HTTP service (self-hosted or cloud) |
+| **Org** | Dedicated git repo (e.g., `hivecommons/hive-wiki`) | Org members | Promoted facts from project wikis | llm-wiki HTTP service (self-hosted or cloud) |
 | **Community** | Public git repo or hosted service | Anyone | Curated contributors (PR-based) | llm-wiki HTTP service at wiki.hive.dev |
 
 ### Privacy principles
@@ -391,9 +391,9 @@ knowledge:
 
 ### Phase 2: Testing progression engine
 
-9. **`src/pkg/knowledge/maturity.go`** — ACMM test maturity detector
-   - `DetectMaturity(repo) Level` — checks: has tests? has CI? coverage config? TDD markers?
-   - Returns Level 1-4
+9. **Existing ACMM advisory/governor signals** — test progression inputs
+   - Reuse the current maturity evaluation pipeline instead of adding a
+     separate knowledge-package detector.
 
 10. **`src/pkg/governor/governor.go`** — Add test maturity to governor logic
     - Governor reads maturity level from snapshot

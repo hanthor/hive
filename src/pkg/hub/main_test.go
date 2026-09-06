@@ -29,7 +29,7 @@ var realFetchCommitCompareStatus func(base, head string, logger *slog.Logger) (s
 // seeds the SHA cache with the fixture value "target1" and calls
 // handleHubSelfUpgrade, producing a literal
 //
-//	kubectl set image deployment/hive-hub hub=ghcr.io/kubestellar/hive-hub:target1 -n hive-hub
+//	kubectl set image deployment/hive-hub hub=ghcr.io/hivecommons/hive-hub:target1 -n hive-hub
 //
 // against the live cluster. `target1` was never a published tag, so the new
 // ReplicaSet went ImagePullBackOff while the old one kept serving — the hub
@@ -45,6 +45,29 @@ func TestMain(m *testing.M) {
 	// KUBECONFIG could equally point a real kubectl at a real cluster for the
 	// non-InCluster branch, so neutralize it to a path that cannot exist.
 	os.Setenv("KUBECONFIG", os.DevNull)
+	k8sTokenPath = "testdata/no-such-serviceaccount-token"
+	k8sCACertPath = "testdata/no-such-serviceaccount-ca.crt"
+
+	// Provider and forge credentials. The suite is run inside hive pods and on
+	// developer machines whose environment carries REAL keys, and handlers
+	// under test (GitHub token validation, model probes, the gh wrapper paths)
+	// read these straight from os.Getenv. A test that forgets to stub one
+	// would silently exercise a live provider on the operator's credit — the
+	// #4889-class leak — instead of failing offline. Tests that need a value
+	// set it explicitly with t.Setenv. HIVE_HUB_SECRET is scrubbed for the
+	// same reason: with it unset, NewHubServer resolves the master through
+	// hubSecretPath, which newHubServerForTest points into a per-test TempDir,
+	// rather than inheriting whatever master the host process was given.
+	for _, key := range []string{
+		"OPENAI_API_KEY",
+		"CODEX_API_KEY",
+		"ANTHROPIC_API_KEY",
+		"GITHUB_TOKEN",
+		"GH_TOKEN",
+		"HIVE_HUB_SECRET",
+	} {
+		os.Unsetenv(key)
+	}
 
 	// Commit-order ancestry resolves are kicked as BACKGROUND goroutines from
 	// the heartbeat completion chain, the orphan sweep and triggerAutoUpgrades

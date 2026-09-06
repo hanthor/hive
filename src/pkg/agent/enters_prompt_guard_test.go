@@ -15,7 +15,7 @@ import (
 
 	"log/slog"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
 )
 
 // syncBuffer is a bytes.Buffer safe for a logger that may be written from
@@ -47,7 +47,7 @@ func entersGuardManager(t *testing.T, pane string) (*Manager, *AgentProcess, *sy
 	m := NewManager(map[string]config.AgentConfig{
 		"worker": makeAgentConfig("codex", "gpt-5-codex"),
 	}, slog.New(slog.NewTextHandler(logBuf, nil)), ProjectContext{})
-	m.visiblePaneCapture = func(*AgentProcess) string { return pane }
+	termSeams(m).captureVisiblePane = func(*AgentProcess) string { return pane }
 	m.mu.RLock()
 	agent := m.agents["worker"]
 	m.mu.RUnlock()

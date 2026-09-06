@@ -13,6 +13,12 @@ project:
     - repo-two
   ai_author: your-bot-user               # GitHub username for AI commits
   primary_repo: repo-one                 # Main repo for priority routing
+  # Optional: host-local directory holding one checkout per repo, as
+  # <checkouts_dir>/<repo name>. Supplies the repo root Hive reads AGENTS.md
+  # from at kick time (src/docs/agents-md.md). Hive agents work over the API and
+  # keep no clones, so without this AGENTS.md injection stays a no-op — which is
+  # the default. An absent directory or a repo with no AGENTS.md is also a no-op.
+  # checkouts_dir: /data/checkouts
 
 ioscan:
   enabled: true                           # default: true; scans untrusted text before agent kicks
@@ -367,7 +373,9 @@ governor:
   # backend: bob — bob's default IBMid/W3ID auth opens a browser and waits on a
   # localhost callback, which no pod can satisfy, so it fails after a 3-minute
   # timeout. With a key, hive launches bob with --auth-method api-key and it
-  # authenticates headlessly (interactive tmux use still works).
+  # authenticates headlessly (interactive tmux use still works). If Bob returns
+  # HTTP 401 / "API Key verification failed: Invalid or expired API Key", Hive
+  # reports the agents as needing login/credential refresh instead of restart.
   # SECURITY: store only the env var NAME or a key file path, never the value.
   # Both defaults below are consulted automatically, so if you mount the key at
   # /secrets/bob_api_key or set HIVE_BOB_API_KEY, this block can stay commented.
@@ -547,12 +555,21 @@ knowledge:
     #   url: https://wiki.hive.dev/mcp       # Public, read-only
     #   shared: true
   curator:
-    schedule: daily                           # How often to extract facts from merged PRs
+    # enabled: true                          # OPT-IN. Absent or false = scheduled
+                                             # auto-promotion never runs, even with a
+                                             # schedule set below. Auto-promotion copies
+                                             # facts into a higher layer with NO human
+                                             # review, so it is off unless you ask for it.
+    schedule: daily                          # Cadence for the promotion sweep once
+                                             # enabled: true. Accepts daily or hourly.
+                                             # Ignored entirely while disabled.
     extract_from:
       - pr_comments
       - ci_failures
       - review_comments
     auto_promote_threshold: 0.9              # Confidence to auto-promote project→org
+    # promote_from: project                  # Source layer (default: project)
+    # promote_to: org                        # Target layer (default: org)
   git_sources:                               # Remote git repos indexed as knowledge
     # - name: dakota-skills                  # Display name for this source
     #   url: https://github.com/projectbluefin/dakota

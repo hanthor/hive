@@ -126,7 +126,7 @@ grants exactly two things — posting a comment on an issue or PR, and leaving a
 PR review — and nothing else moves.
 
 It exists because those two operations had nowhere sensible to sit
-([#4492](https://github.com/kubestellar/hive/issues/4492)). Commenting was
+([#4492](https://github.com/hivecommons/hive/issues/4492)). Commenting was
 bundled with `ISSUES_ONLY`, alongside creating issues, editing issue bodies and
 relabelling; leaving a PR review was bundled with `ISSUES_AND_PRS`, alongside
 pushing branches. Both bundles are wrong in both directions:
@@ -172,14 +172,7 @@ Three optional blocks replace hardcoded behavior with declarations:
 
 ```yaml
     channels:                    # how the agent gets triggered. Omit = governor timer.
-      - type: kick               # kick | webhook | discord | schedule | bead
-      - type: webhook
-        events: ["issues.opened", "issues.labeled"]
-        repos: [repo-one]        # optional repo-name filter
-      - type: bead
-        match: { nudge_target: scanner }
-      - type: schedule
-        schedule: "0 */4 * * *"  # cron; required for type: schedule
+      - type: kick               # kick is the only supported type (see below)
     tools:                       # tool permissions. Omit = the mode field governs.
       preset: issues-only        # advisory | issues-only | issues-prs | full
       rules:                     # per-tool allow/deny overrides on top of the preset
@@ -200,15 +193,13 @@ Set `replicas: N` on a declared agent to run a small pool with the same prompt, 
 
 ### Trigger channels
 
-`channels:` declares non-default ways to wake an agent. If the block is omitted, governor timer kicks still work. If you include the block, add `type: kick` when the agent should keep normal governor kicks alongside other triggers.
+`channels:` declares how an agent is woken. If the block is omitted, governor timer kicks work as usual. `kick` is the only supported type; declaring it just makes the default explicit.
 
 | Type | Required fields | Behavior |
 |---|---|---|
 | `kick` | none | Keep ordinary governor timer kicks. |
-| `webhook` | `events` | `/webhook`/GitHub webhook receiver matches `X-GitHub-Event` or `event.action` strings such as `issues.opened`; optional `repos` filters by repository name. `HIVE_WEBHOOK_SECRET` is required and every request must include a valid GitHub `X-Hub-Signature-256` HMAC. Missing configuration or invalid signatures fail closed with `401`. |
-| `bead` | `match` | The bead watcher polls the agent's `beads_dir` about every 30 seconds and kicks when an individual JSON file has every `key: value` in `match` at the top level. Current watcher matching is not the nested `metadata` map inside the `bd` ledger file. |
-| `schedule` | `schedule` | Cron-style channel trigger independent of governor-mode cadences. |
-| `discord` | `patterns` | Declared shape for Discord-triggered work; patterns are validated by config load. |
+
+The former `webhook`, `bead`, `schedule`, and `discord` types were declarative-only: the trigger runtime meant to serve them (`pkg/channels`) was never wired into the binary and was removed (#5591). Declaring one of them used to validate cleanly and then silently suppress governor kicks, leaving the agent permanently dormant — config validation now rejects them instead.
 
 Rounding out the schema — fields you will rarely touch:
 
@@ -621,7 +612,7 @@ Both polarities are enforced at **enumeration** — the point where GitHub issue
 - **[Documentation index](README.md)** — what hive is, setup, and the full topic-guide surface.
 - **[Architecture](architecture.md)** — process model, deterministic pipeline, governor loop, guardrails, and hub/spoke design.
 - **[Portable AgentDefinition format](../AGENT-DEFINITION.md)** — standalone YAML schema for agent imports, exports, and overlays.
-- **[AGENTS.md repo instructions](agents-md.md)** — the per-repo instruction file format Hive's parser understands. **Not wired into kicks today** — see the page for why.
+- **[AGENTS.md repo instructions](agents-md.md)** — the per-repo instruction file format Hive's parser understands. Injected into kicks once `project.checkouts_dir` gives Hive a checkout to read it from — see the page.
 - **[Dashboard route and health checks](health-checks.md)** — listener probes and alert behavior for stuck sessions and restart loops.
 - **[Troubleshooting](troubleshooting.md)** — stuck sessions, login expiry, restart loops, and notification checks.
 - **[ACMM policy matrix](acmm-policy-matrix.md)** — the full per-level, per-agent policy table.

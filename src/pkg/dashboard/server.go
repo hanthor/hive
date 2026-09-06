@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"context"
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
@@ -14,13 +15,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/hub"
-	"github.com/kubestellar/hive/pkg/openrouter"
-	"github.com/kubestellar/hive/pkg/planning"
-	"github.com/kubestellar/hive/pkg/watchdog"
+	"github.com/hivecommons/hive/pkg/acmmadvisor"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/hub"
+	"github.com/hivecommons/hive/pkg/inferencehealth"
+	"github.com/hivecommons/hive/pkg/openrouter"
+	"github.com/hivecommons/hive/pkg/planning"
+	"github.com/hivecommons/hive/pkg/tokens"
+	"github.com/hivecommons/hive/pkg/watchdog"
 )
 
 //go:embed static
@@ -41,6 +45,7 @@ const sessionCookieMaxAge = 30 * 24 * 60 * 60 // 30 days
 // domain-widened to .hive.kubestellar.io (unlike the hub-wide hive_hub_user
 // cookie), so the browser only ever sends it to THIS hive's own terminal path.
 const terminalAssertionCookieName = "hive_terminal_assertion"
+const terminalHandoffCodeParam = "code"
 
 // proxyAuthHeader is the proof-of-proxy header the hub's auth-check injects
 // (value = this hive's dashboard token) so a hub-proxied spoke can verify a
@@ -79,21 +84,58 @@ type Server struct {
 	// startup-grace window before the first heartbeat has to have succeeded.
 	startedAt time.Time
 
-	agentPipelines map[string]map[string]bool
-	agentHooks     map[string]map[string][]any
-	pipelineMu     sync.RWMutex
-	hooksMu        sync.RWMutex
-	knowledgeMu    sync.Mutex
-	levelMu        sync.Mutex
-	restartMu      sync.Mutex // serializes concurrent agent restart operations
+	agentPipelines    map[string]map[string]bool
+	agentHooks        map[string]map[string][]any
+	pipelineMu        sync.RWMutex
+	hooksMu           sync.RWMutex
+	knowledgeMu       sync.Mutex
+	levelMu           sync.Mutex
+	restartMu         sync.Mutex // serializes concurrent agent restart operations
+	gatewayHealthOnce sync.Once
+	gatewayHealth     *inferencehealth.Store
 
 	acmmEvalMu       sync.RWMutex
 	acmmEvalCache    *ACMMEvaluation
 	acmmEvalCachedAt time.Time
+
+	// Operator-initiated repository rescan (POST /api/repos/rescan). The
+	// mutex guards all three: repoRescanInFlight collapses concurrent
+	// presses onto one GitHub sweep, repoRescanAt is the debounce clock, and
+	// repoRescanLast is the counts a debounced/in-flight caller is answered
+	// with so the UI never has to render an empty result.
+	repoRescanMu       sync.Mutex
+	repoRescanInFlight bool
+	repoRescanAt       time.Time
+	repoRescanLast     ReposRescanResult
 	// acmmLinearBaseURL overrides the Linear GraphQL endpoint the ACMM
 	// "Open Issue" path posts issueCreate to. Empty = production; tests
 	// point it at an httptest server.
 	acmmLinearBaseURL string
+
+	// snapshotDir overrides the directory handleSnapshotPage/buildSnapshot
+	// read and write snapshot-{mode}.html under (#5235). Empty = production
+	// default "/data/snapshots"; tests point it at t.TempDir() so the
+	// stale-threshold rebuild decision can be exercised against real mtimes
+	// without touching the host filesystem. Read via s.snapshotDirOrDefault().
+	snapshotDir string
+	// buildSnapshotFn, if non-nil, replaces the Node builder invocation in
+	// buildSnapshot (#5235) — the same nil-in-production hook convention as
+	// pkg/hub's afterGenerationsReadAttempt (#5080). Production leaves this
+	// nil, in which case buildSnapshot runs the real `node
+	// build-snapshot.mjs` subprocess; tests set it to a fake that writes a
+	// fixture file instead, so the CSP-stamping/rewrite pipeline in
+	// handleSnapshotPage can be exercised without a Node toolchain on the
+	// test host.
+	buildSnapshotFn func(s *Server, outputFile, mode string)
+
+	// captureFullLogFn, if non-nil, replaces AgentMgr.CaptureFullLog for
+	// handleAgentFullLog tests so handler success paths can be exercised without
+	// a live tmux pane.
+	captureFullLogFn func(name string) (string, error)
+
+	kickBrainstormSendKickFn func(name, msg string) error
+	kickBrainstormRestartFn  func(ctx context.Context, name, prompt string) error
+	kickBrainstormDoneFn     func()
 
 	// Sparkline histories, all backed by the generic timeSeries ring buffer
 	// (see timeseries.go). Lazily constructed via the tokenSeries()/factSeries()
@@ -170,6 +212,11 @@ type Server struct {
 
 	deviceFlowMu    sync.Mutex
 	deviceFlowState *github.DeviceFlowState
+	// deviceFlowID binds the in-progress device flow to the caller who started
+	// it: /start returns it, /poll must present it (both routes are public, and
+	// the session cookie is minted on the poll response — without this secret
+	// any anonymous poller could race the operator and steal the session).
+	deviceFlowID string
 
 	// userSessions maps a random opaque session id (stored in the client's
 	// hive_session cookie on direct-route spokes) to the authenticated user.
@@ -180,6 +227,9 @@ type Server struct {
 	// sessionStorePath, when non-empty, persists userSessions across restarts
 	// (see EnableSessionPersistence). Guarded by sessionMu.
 	sessionStorePath string
+
+	terminalHandoffMu sync.Mutex
+	terminalHandoffs  map[string]terminalHandoff
 
 	claudeOAuthFlow claudeOAuthFlow
 
@@ -239,7 +289,7 @@ type Server struct {
 	inferenceEndpoints map[string][]string // backend id → list of base URLs
 
 	// cliModels caches best-effort runtime model discovery for the CLI
-	// backends (copilot/claude/gemini/goose), each with its own discovery
+	// backends (copilot/claude/gemini/goose/codex/agy), each with its own discovery
 	// source and static fallback. See cli_models.go.
 	cliModels *cliModelCache
 
@@ -304,23 +354,29 @@ type StatusPayload struct {
 	// from the shallow /api/health liveness signal or the repo-workflow
 	// Health map above, so the pill can never show "Health OK" while the
 	// spoke's own agents are down (#2465).
-	DeepHealth          map[string]any         `json:"deepHealth,omitempty"`
-	Budget              FrontendBudget         `json:"budget"`
-	CadenceMatrix       []FrontendCadence      `json:"cadenceMatrix"`
-	GHRateLimits        map[string]any         `json:"ghRateLimits"`
-	AgentMetrics        map[string]any         `json:"agentMetrics"`
-	Hold                FrontendHold           `json:"hold"`
-	IssueToMerge        map[string]any         `json:"issueToMerge"`
-	ACMMLevel           int                    `json:"acmmLevel"`
-	ACMMLevelConfigured bool                   `json:"acmmLevelConfigured"`
-	ACMMPackAgents      []string               `json:"acmmPackAgents"`
-	AdvisoryDigest      any                    `json:"advisoryDigest,omitempty"`
-	ContributorPool     *ContributorPoolStatus `json:"contributorPool,omitempty"`
-	SystemResources     *SystemResources       `json:"systemResources,omitempty"`
-	GitHubAppRequired   bool                   `json:"githubAppRequired,omitempty"`
-	GitHubAppInstallURL string                 `json:"githubAppInstallURL,omitempty"`
-	GitHubAppPermIssue  string                 `json:"githubAppPermIssue,omitempty"`
-	GitHubAppState      string                 `json:"githubAppState,omitempty"`
+	DeepHealth          map[string]any    `json:"deepHealth,omitempty"`
+	Budget              FrontendBudget    `json:"budget"`
+	CadenceMatrix       []FrontendCadence `json:"cadenceMatrix"`
+	GHRateLimits        map[string]any    `json:"ghRateLimits"`
+	AgentMetrics        map[string]any    `json:"agentMetrics"`
+	Hold                FrontendHold      `json:"hold"`
+	IssueToMerge        map[string]any    `json:"issueToMerge"`
+	ACMMLevel           int               `json:"acmmLevel"`
+	ACMMLevelConfigured bool              `json:"acmmLevelConfigured"`
+	ACMMPackAgents      []string          `json:"acmmPackAgents"`
+	// ACMMAdvice is the advisory level-up recommendation (#5225), derived from
+	// the same live signals the /api/acmm-recommendation endpoint serves so the
+	// two surfaces can never drift. It is ADVISORY ONLY: nothing acts on it
+	// automatically — a human approves a level change via handlePackSetLevel.
+	// Omitted when it could not be computed (e.g. no config yet).
+	ACMMAdvice          *acmmadvisor.Recommendation `json:"acmmAdvice,omitempty"`
+	AdvisoryDigest      any                         `json:"advisoryDigest,omitempty"`
+	ContributorPool     *ContributorPoolStatus      `json:"contributorPool,omitempty"`
+	SystemResources     *SystemResources            `json:"systemResources,omitempty"`
+	GitHubAppRequired   bool                        `json:"githubAppRequired,omitempty"`
+	GitHubAppInstallURL string                      `json:"githubAppInstallURL,omitempty"`
+	GitHubAppPermIssue  string                      `json:"githubAppPermIssue,omitempty"`
+	GitHubAppState      string                      `json:"githubAppState,omitempty"`
 	// GitHubAppInstallMissing is CONFIG TRUTH, independent of any auth probe
 	// or classification: a real App is named (app_id set, not the placeholder)
 	// but installation_id is 0. That state alone means every token is a
@@ -450,6 +506,7 @@ type FrontendAgent struct {
 	PausedTrigger    string `json:"pausedTrigger,omitempty"`
 	PausedBy         string `json:"pausedBy,omitempty"`
 	OffByCadence     bool   `json:"offByCadence"`
+	NoCadence        bool   `json:"noCadence"`
 	NeedsLogin       bool   `json:"needsLogin"`
 	AuthAvailable    bool   `json:"authAvailable"`
 	AuthKnown        bool   `json:"authKnown"`
@@ -463,6 +520,7 @@ type FrontendAgent struct {
 	Pinned           bool   `json:"pinned"`
 	LastKick         string `json:"lastKick,omitempty"`
 	NextKick         string `json:"nextKick,omitempty"`
+	NextKickIn       string `json:"nextKickIn,omitempty"`
 	Restarts         int    `json:"restarts"`
 	LiveSummary      string `json:"liveSummary,omitempty"`
 	DetailSummary    string `json:"detailSummary,omitempty"`
@@ -796,17 +854,18 @@ const sseRetryMs = 3000
 
 func NewServer(port int, logger *slog.Logger) *Server {
 	s := &Server{
-		port:           port,
-		sseClients:     make(map[chan []byte]struct{}),
-		logger:         logger,
-		mux:            http.NewServeMux(),
-		agentPipelines: make(map[string]map[string]bool),
-		agentHooks:     make(map[string]map[string][]any),
-		audit:          newAuditLog(),
-		promptHistory:  newPromptHistory(),
-		userSessions:   make(map[string]*userSession),
-		cliModels:      newCLIModelCache(),
-		startedAt:      time.Now(),
+		port:             port,
+		sseClients:       make(map[chan []byte]struct{}),
+		logger:           logger,
+		mux:              http.NewServeMux(),
+		agentPipelines:   make(map[string]map[string]bool),
+		agentHooks:       make(map[string]map[string][]any),
+		audit:            newAuditLog(),
+		promptHistory:    newPromptHistory(),
+		userSessions:     make(map[string]*userSession),
+		terminalHandoffs: make(map[string]terminalHandoff),
+		cliModels:        newCLIModelCache(),
+		startedAt:        time.Now(),
 	}
 	s.registerCoreRoutes()
 	return s
@@ -814,18 +873,19 @@ func NewServer(port int, logger *slog.Logger) *Server {
 
 func NewServerWithAuth(port int, authToken string, logger *slog.Logger) *Server {
 	s := &Server{
-		port:           port,
-		authToken:      authToken,
-		sseClients:     make(map[chan []byte]struct{}),
-		logger:         logger,
-		mux:            http.NewServeMux(),
-		agentPipelines: make(map[string]map[string]bool),
-		agentHooks:     make(map[string]map[string][]any),
-		audit:          newAuditLog(),
-		promptHistory:  newPromptHistory(),
-		userSessions:   make(map[string]*userSession),
-		cliModels:      newCLIModelCache(),
-		startedAt:      time.Now(),
+		port:             port,
+		authToken:        authToken,
+		sseClients:       make(map[chan []byte]struct{}),
+		logger:           logger,
+		mux:              http.NewServeMux(),
+		agentPipelines:   make(map[string]map[string]bool),
+		agentHooks:       make(map[string]map[string][]any),
+		audit:            newAuditLog(),
+		promptHistory:    newPromptHistory(),
+		userSessions:     make(map[string]*userSession),
+		terminalHandoffs: make(map[string]terminalHandoff),
+		cliModels:        newCLIModelCache(),
+		startedAt:        time.Now(),
 	}
 	s.registerCoreRoutes()
 	return s
@@ -925,6 +985,7 @@ func (s *Server) registerCoreRoutes() {
 	// hive_hub_user cookie being consulted. NOT a public path: it authenticates
 	// on hive_session and 401s without one.
 	s.mux.HandleFunc("POST "+renewTerminalAssertionPath, s.handleRenewTerminalAssertion)
+	s.mux.HandleFunc("POST "+terminalHandoffPath, s.handleCreateTerminalHandoff)
 	// /terminal → in-container ttyd, so the dashboard's "▶ terminal" links
 	// work even when the cluster route sends the whole host to this server
 	// (see registerTerminalProxy).
@@ -943,12 +1004,32 @@ func (s *Server) Start() error {
 	// on every visit. "/{$}" matches the root path exactly; every other static
 	// path falls through to the plain file server below.
 	if rawIndex, err := fs.ReadFile(staticContent, "index.html"); err == nil {
-		idx := newIndexDocument(rawIndex)
+		// Strings are baked in ONCE here, unlike custom.css which is read per
+		// request: the document carries a precomputed gzip body and a strong
+		// ETag, so its content cannot vary per request without discarding both.
+		// Editing branding.json therefore needs a restart; editing the
+		// stylesheet does not. That asymmetry is documented in branding.md.
+		idx := newIndexDocument(rawIndex, s.loadBranding())
+		// Hand the FINAL served bytes to the CSP layer explicitly, rather than
+		// having newIndexDocument reach out and set global state: constructing a
+		// document should not silently change the process-wide CSP, and a test
+		// building a throwaway document must not shrink the real allowlist.
+		setBrandedIndex(idx.raw)
 		s.mux.Handle("GET /{$}", idx)
 		s.mux.Handle("GET /index.html", idx)
 	} else {
 		s.logger.Warn("embedded index.html unavailable; falling back to plain file serving", "error", err)
 	}
+	// Operator branding override: an optional stylesheet on the data volume,
+	// served at the path the index document links to. Lets a deployment carry
+	// its own colours/logo without forking the embedded SPA or rebuilding the
+	// image — the override is data, not code.
+	//
+	// Read per request (not cached at startup) so dropping a file in takes
+	// effect on reload. It is a single small stylesheet on local disk; the
+	// index document itself remains startup-precompressed.
+	s.mux.HandleFunc("GET /branding/custom.css", s.handleBrandingCSS)
+
 	s.mux.Handle("GET /", http.FileServer(http.FS(staticContent)))
 
 	// authenticate is outermost so the identity headers it injects from a
@@ -1079,8 +1160,51 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		//
 		// The authToken=="" bypass remains for spokes that are genuinely open by
 		// design (no allowlist AND no token) — e.g. a local/dev dashboard.
+		inboundUser := r.Header.Get("X-Hive-User")
+		inboundRole := r.Header.Get("X-Hive-Role")
+
+		// Treat identity headers as an internal request attribute. Preserve inbound
+		// values only after the request has proved it transited the trusted hub
+		// proxy; this must happen before public-path dispatch because several public
+		// contribute handlers consult X-Hive-User/X-Hive-Role for optional identity.
+		r.Header.Del("X-Hive-User")
+		r.Header.Del("X-Hive-Role")
+		r.Header.Del(ownerRoleVerifiedHeader)
+
+		trustProxyIdentity := func(markOwner bool) (bool, string) {
+			if directRouteAuthz || inboundUser == "" || inboundRole == "" {
+				return false, ""
+			}
+			proof := r.Header.Get(proxyAuthHeader)
+			switch {
+			case proof != "" && s.authToken != "" && secureCompare(proof, s.authToken):
+				r.Header.Set("X-Hive-User", inboundUser)
+				r.Header.Set("X-Hive-Role", inboundRole)
+				if markOwner && isOwnerRole(inboundRole) {
+					r.Header.Set(ownerRoleVerifiedHeader, "true")
+				}
+				return true, ""
+			case proof == "" && !proxyProofRequired:
+				r.Header.Set("X-Hive-User", inboundUser)
+				r.Header.Set("X-Hive-Role", inboundRole)
+				return true, ""
+			case proof == "":
+				return false, "missing proxy proof header"
+			default:
+				return false, "invalid proxy proof header"
+			}
+		}
+
 		if isPublicPath(r.URL.Path) {
+			// Public endpoints remain reachable anonymously, but identity headers are
+			// visible to handlers only when backed by the hub's proxy proof.
+			trustProxyIdentity(true)
 			next.ServeHTTP(w, r)
+			return
+		}
+
+		if r.URL.Query().Get("token") != "" {
+			writeQueryTokenRejected(w, r)
 			return
 		}
 		if s.authToken == "" && !directRouteAuthz {
@@ -1100,26 +1224,24 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 						r.Header.Set(ownerRoleVerifiedHeader, "true")
 					}
 				}
-			} else if r.Header.Get("X-Hive-Role") == "" {
+			} else if inboundRole != "" {
+				// Open/dev spokes have no auth boundary; preserve an explicit role so
+				// local role-gate tests and read-only demos can still exercise least
+				// privilege. Public paths returned above with unproved identity stripped.
+				if inboundUser != "" {
+					r.Header.Set("X-Hive-User", inboundUser)
+				}
+				r.Header.Set("X-Hive-Role", inboundRole)
+				if isOwnerRole(inboundRole) {
+					r.Header.Set(ownerRoleVerifiedHeader, "true")
+				}
+			} else {
 				r.Header.Set("X-Hive-Role", config.RoleOwner)
-				r.Header.Set(ownerRoleVerifiedHeader, "true")
-			} else if isOwnerRole(r.Header.Get("X-Hive-Role")) {
 				r.Header.Set(ownerRoleVerifiedHeader, "true")
 			}
 			next.ServeHTTP(w, r)
 			return
 		}
-		inboundUser := r.Header.Get("X-Hive-User")
-		inboundRole := r.Header.Get("X-Hive-Role")
-
-		// Treat identity headers as an internal request attribute. Preserve the
-		// inbound values only in the hub-proxy branch below, after that path has
-		// been authenticated as trusted; all other auth paths must set any role
-		// explicitly so clients cannot spoof owner access with X-Hive-Role.
-		r.Header.Del("X-Hive-User")
-		r.Header.Del("X-Hive-Role")
-		r.Header.Del(ownerRoleVerifiedHeader)
-
 		// Internal automation authenticates with the shared token via the
 		// X-Hive-Internal header; this is a trusted server-to-server path
 		// (the local proxy injects it) and carries no browser user identity.
@@ -1177,35 +1299,43 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		// inject X-Hive-Proxy-Auth must be upgraded before their identity headers
 		// are accepted.
 		proxyProofRejectReason := ""
-		if !trusted && !directRouteAuthz &&
-			inboundUser != "" && inboundRole != "" {
-			proof := r.Header.Get(proxyAuthHeader)
-			switch {
-			case proof != "" && s.authToken != "" && secureCompare(proof, s.authToken):
-				// Proof present and valid — definitely came through the hub.
+		if !trusted {
+			if ok, reason := trustProxyIdentity(true); ok {
 				trusted = true
-				if isOwnerRole(inboundRole) {
-					r.Header.Set(ownerRoleVerifiedHeader, "true")
-				}
-			case proof == "" && !proxyProofRequired:
-				// No proof header yet (hub not upgraded) and we're not enforcing
-				// strictly — trust the identity headers as before (rollout window).
-				// Do not mark owner as verified in this legacy path: missing proof
-				// keeps reads/general writes compatible but owner-only mutations
-				// must fail closed.
-				trusted = true
-			default:
-				// Proof header present but WRONG, or strict mode with no proof:
-				// this did not come through the trusted hub proxy — reject.
-				if proof == "" {
-					proxyProofRejectReason = "missing proxy proof header"
-				} else {
-					proxyProofRejectReason = "invalid proxy proof header"
+			} else {
+				proxyProofRejectReason = reason
+			}
+		}
+
+		// Terminal handoff path: the dashboard first creates a short-lived,
+		// single-use code via an authenticated POST, then opens /terminal with only
+		// that code in the URL. Always redeem a presented code so a hosted request
+		// that is already trusted by hub-injected identity still burns its code on
+		// first use. When the request is not otherwise trusted, a valid code also
+		// authenticates the initial ttyd document load and establishes the
+		// Path=/terminal assertion cookie for subsequent asset/websocket requests.
+		if isTerminalPath(r.URL.Path) {
+			if user, role, ok := s.redeemTerminalHandoff(r.URL.Query().Get(terminalHandoffCodeParam)); ok && terminalRoleAllowed(role) {
+				if !trusted {
+					r.Header.Set("X-Hive-User", user)
+					r.Header.Set("X-Hive-Role", role)
+					if isOwnerRole(role) {
+						r.Header.Set(ownerRoleVerifiedHeader, "true")
+					}
+					s.setTerminalAssertionCookie(w, r, user, role)
+					trusted = true
 				}
 			}
-			if trusted {
-				r.Header.Set("X-Hive-User", inboundUser)
-				r.Header.Set("X-Hive-Role", inboundRole)
+		}
+
+		if !trusted && isTerminalPath(r.URL.Path) {
+			if user, role, ok := s.terminalAssertionFromRequest(r); ok && terminalRoleAllowed(role) {
+				r.Header.Set("X-Hive-User", user)
+				r.Header.Set("X-Hive-Role", role)
+				if isOwnerRole(role) {
+					r.Header.Set(ownerRoleVerifiedHeader, "true")
+				}
+				trusted = true
 			}
 		}
 
@@ -1235,18 +1365,15 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			}
 		}
 
-		// Bearer/query shared-token path for programmatic API clients. This is
+		// Shared-token header path for programmatic API clients. This is
 		// an internal credential, not a browser session, so it is only accepted
-		// from the Authorization header or ?token= — never from the session
+		// from the Authorization header — never from the URL query string or session
 		// cookie. On a direct-route spoke it is DISABLED: the shared token grants
 		// no per-user identity, so accepting it would let any holder act as an
 		// unscoped owner and defeat the per-hive allowlist. Direct-route callers
 		// must use a per-user session instead.
 		if !trusted && !directRouteAuthz && s.authToken != "" {
 			token := r.Header.Get("Authorization")
-			if token == "" {
-				token = r.URL.Query().Get("token")
-			}
 			expected := "Bearer " + s.authToken
 			if secureCompare(token, expected) || secureCompare(token, s.authToken) {
 				trusted = true
@@ -1275,6 +1402,10 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 				w.WriteHeader(http.StatusUnauthorized)
 				_, _ = w.Write([]byte(loginPage))
 			}
+			return
+		}
+		if isTerminalPath(r.URL.Path) && !terminalRoleAllowed(r.Header.Get("X-Hive-Role")) {
+			writeTerminalRoleForbidden(w, r)
 			return
 		}
 
@@ -1380,7 +1511,7 @@ func isPublicPath(path string) bool {
 	case strings.HasPrefix(path, "/api/leaderboard"):
 		return true
 	case strings.HasPrefix(path, "/api/gh-user-auth/"):
-		return true
+		return path != "/api/gh-user-auth/logout"
 	case path == openRouterCallbackPath:
 		// OpenRouter OAuth PKCE return: the sponsor's browser comes back with no
 		// session, so the path must be public. The single-use state token in the
@@ -1514,14 +1645,16 @@ async function startFlow(){
     document.getElementById('user-code').textContent=d.user_code;
     document.getElementById('verify-link').href=d.verification_uri;
     showStep('step-code');
-    poll(d.interval||5);
+    poll(d.interval||5,d.flow_id||'');
   }catch(e){showError('Network error: '+e.message)}
 }
-async function poll(interval){
+async function poll(interval,flowId){
   var ms=interval*1000;
   async function check(){
     try{
-      var r=await fetch('/api/gh-user-auth/poll',{method:'POST'});
+      // flow_id proves this poll belongs to the flow WE started — the server
+      // refuses to mint the session for any poll that cannot present it.
+      var r=await fetch('/api/gh-user-auth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({flow_id:flowId})});
       var d=await r.json();
       if(d.status==='complete'){showStep('step-done');setTimeout(function(){location.href='/api/gh-user-auth/session'},1000);return}
       if(d.status==='error'){showError(d.error||'Authorization failed');return}
@@ -1648,6 +1781,15 @@ func (s *Server) UpdateStatusIfFresh(status *StatusPayload, buildEpoch uint64) b
 	}
 
 	status.InferenceBackends = s.buildInferenceBackends()
+
+	// Attach the advisory ACMM level-up recommendation (#5225) from the SAME
+	// signal-collection path the /api/acmm-recommendation endpoint uses, so the
+	// endpoint and the status payload cannot report different advice. Pure
+	// computation over already-collected signals — no I/O on this hot path.
+	// ADVISORY ONLY: this must never auto-apply a level.
+	if advice := acmmadvisor.RecommendFromStatus(s.buildACMMStatusInputs()); advice.CurrentLevel > 0 {
+		status.ACMMAdvice = &advice
+	}
 
 	// Deep checks travel inside the status payload so every dashboard surface
 	// (header pill included) renders the same truth the heartbeat sends the
@@ -2854,6 +2996,9 @@ func agentCLIUnauthenticated(proc *agent.AgentProcess, authFn func(backend strin
 	if proc.BackendOverride != "" {
 		backend = proc.BackendOverride
 	}
+	if backend == "bob" && proc.StartFailureClass == string(agent.StartFailureCredentialRejected) {
+		return true
+	}
 	// METHOD GATE. An inference backend (litellm/vllm/llm-d) authenticates with
 	// an API key supplied by config — there is no interactive login and so no
 	// "needs login" state an operator could act on. Checking this BEFORE the
@@ -2885,6 +3030,147 @@ func (s *Server) HealthSummary() map[string]any {
 	ready := s.status != nil && s.ready
 	s.statusMu.RUnlock()
 	return s.healthSummaryFor(status, ready)
+}
+
+func (s *Server) healthGovernorMode() string {
+	if s == nil || s.deps == nil || s.deps.Governor == nil {
+		return ""
+	}
+	return string(s.deps.Governor.GetState().Mode)
+}
+
+func (s *Server) agentIdleByDesign(name string, proc *agent.AgentProcess, currentMode string, onDemandFromPack map[string]bool) string {
+	if s == nil || s.deps == nil || s.deps.Config == nil || proc == nil {
+		return ""
+	}
+	onDemand := proc.Config.OnDemand
+	if ac, ok := s.deps.Config.Agents[name]; ok {
+		onDemand = ac.OnDemand
+	}
+	if onDemand || onDemandFromPack[name] {
+		return "on-demand"
+	}
+	if s.agentExplicitlyOffSchedule(name, currentMode) {
+		return "off-schedule"
+	}
+	return ""
+}
+
+func (s *Server) agentExplicitlyOffSchedule(name, currentMode string) bool {
+	if s == nil || s.deps == nil || s.deps.Config == nil {
+		return false
+	}
+	cad := s.deps.Config.CadenceValueForMode(name, strings.ToLower(strings.TrimSpace(currentMode)))
+	return cad != "" && cad.IsPaused()
+}
+
+func (s *Server) zeroTokenHealth(ts *tokens.AggregateSummary) (status, detail string) {
+	detail = "zero consumed — no model calls recorded"
+	if s == nil || s.deps == nil {
+		return "warn", detail
+	}
+	if s.allAgentsPaused() {
+		return "skip", "zero consumed — all agents paused"
+	}
+	if s.noAgentsDue() {
+		return "skip", "zero consumed — no agents due in the current governor mode"
+	}
+	if diag := s.deps.Tokens.Diagnostics(); diag.LastScanError != "" {
+		return "warn", "zero consumed — token parser/sink error: " + diag.LastScanError
+	} else if diag.LastClaudeScanError != "" {
+		return "warn", "zero consumed — Claude token parser error: " + diag.LastClaudeScanError
+	} else if diag.LastCopilotScanError != "" {
+		return "warn", "zero consumed — Copilot token parser error: " + diag.LastCopilotScanError
+	} else if diag.LastBobScanError != "" {
+		return "warn", "zero consumed — Bob token parser error: " + diag.LastBobScanError
+	} else if diag.LiveCaptureEnabled && ts != nil && ts.SessionCount > 0 {
+		return "warn", "zero consumed — sessions still open or live-capture has not accounted usage yet"
+	}
+	if ts != nil && ts.SessionCount > 0 {
+		return "warn", "zero consumed — sessions made no model calls"
+	}
+	if s.hasRunningMeteredAgentWithoutLiveCapture() {
+		return "warn", "zero consumed — token sink or live metering disabled/misconfigured"
+	}
+	return "warn", detail
+}
+
+func (s *Server) allAgentsPaused() bool {
+	if s == nil || s.deps == nil || s.deps.AgentMgr == nil {
+		return false
+	}
+	statuses := s.deps.AgentMgr.AllStatuses()
+	if healthAgentStatuses != nil {
+		statuses = healthAgentStatuses()
+	}
+	seen := false
+	for name, proc := range statuses {
+		if proc == nil || agentDisabledInConfig(s.deps.Config, name, proc) {
+			continue
+		}
+		seen = true
+		if !proc.Paused && proc.State != agent.StatePaused {
+			return false
+		}
+	}
+	return seen
+}
+
+func (s *Server) noAgentsDue() bool {
+	if s == nil || s.deps == nil || s.deps.AgentMgr == nil || s.deps.Config == nil {
+		return false
+	}
+	statuses := s.deps.AgentMgr.AllStatuses()
+	if healthAgentStatuses != nil {
+		statuses = healthAgentStatuses()
+	}
+	currentMode := s.healthGovernorMode()
+	onDemandFromPack := config.OnDemandAgentsFromPacks()
+	seen := false
+	for name, proc := range statuses {
+		if proc == nil || agentDisabledInConfig(s.deps.Config, name, proc) || proc.Paused || proc.State == agent.StatePaused {
+			continue
+		}
+		if proc.State == agent.StateRunning {
+			return false
+		}
+		seen = true
+		onDemand := proc.Config.OnDemand
+		if ac, ok := s.deps.Config.Agents[name]; ok {
+			onDemand = ac.OnDemand
+		}
+		if !onDemand && !onDemandFromPack[name] && !s.agentExplicitlyOffSchedule(name, currentMode) {
+			return false
+		}
+	}
+	return seen
+}
+
+func (s *Server) hasRunningMeteredAgentWithoutLiveCapture() bool {
+	if s == nil || s.deps == nil || s.deps.AgentMgr == nil || s.deps.Tokens == nil {
+		return false
+	}
+	if s.deps.Tokens.Diagnostics().LiveCaptureEnabled {
+		return false
+	}
+	statuses := s.deps.AgentMgr.AllStatuses()
+	if healthAgentStatuses != nil {
+		statuses = healthAgentStatuses()
+	}
+	for _, proc := range statuses {
+		if proc == nil || proc.State != agent.StateRunning {
+			continue
+		}
+		backend := strings.ToLower(strings.TrimSpace(proc.BackendOverride))
+		if backend == "" {
+			backend = strings.ToLower(strings.TrimSpace(proc.Config.Backend))
+		}
+		switch backend {
+		case "copilot", "inference", "litellm", "vllm", "llm-d":
+			return true
+		}
+	}
+	return false
 }
 
 // healthSummaryFor computes the deep-health checks against an explicit status
@@ -2959,16 +3245,19 @@ func (s *Server) healthSummaryFor(status *StatusPayload, ready bool) map[string]
 		stalled := 0
 		unsubstituted := 0
 		down := 0
+		idle := 0
 		needLogin := 0
 		// The names behind the counts. "1 down" alone is unactionable — the
 		// operator's next question is always WHICH one, and the answer was
 		// dropped right here where it was known.
-		var downNames, stalledNames, needLoginNames []string
+		var downNames, stalledNames, needLoginNames, idleNames []string
 		authFn := getBackendAuthFn()
 		statuses := s.deps.AgentMgr.AllStatuses()
 		if healthAgentStatuses != nil {
 			statuses = healthAgentStatuses()
 		}
+		currentMode := s.healthGovernorMode()
+		onDemandFromPack := config.OnDemandAgentsFromPacks()
 		for name, proc := range statuses {
 			if proc.Paused {
 				paused++
@@ -3013,6 +3302,11 @@ func (s *Server) healthSummaryFor(status *StatusPayload, ready bool) map[string]
 					disabled++
 					continue
 				}
+				if reason := s.agentIdleByDesign(name, proc, currentMode, onDemandFromPack); reason != "" {
+					idle++
+					idleNames = append(idleNames, fmt.Sprintf("%s (%s)", name, reason))
+					continue
+				}
 				// A non-running agent whose CLI has no credentials is not
 				// crashed — it is waiting for a human to click Login on the
 				// agent panel. Bucket it separately so the operator reads an
@@ -3031,6 +3325,7 @@ func (s *Server) healthSummaryFor(status *StatusPayload, ready bool) map[string]
 		// stable across beats so the hub does not see a "changed" status that
 		// is really the same agents in a different order.
 		sort.Strings(downNames)
+		sort.Strings(idleNames)
 		sort.Strings(stalledNames)
 		sort.Strings(needLoginNames)
 		detail := fmt.Sprintf("%d running", running)
@@ -3039,6 +3334,9 @@ func (s *Server) healthSummaryFor(status *StatusPayload, ready bool) map[string]
 		}
 		if disabled > 0 {
 			detail += fmt.Sprintf(", %d disabled", disabled)
+		}
+		if idle > 0 {
+			detail += fmt.Sprintf(", %d idle: %s", idle, strings.Join(idleNames, ", "))
 		}
 		if down > 0 {
 			detail += fmt.Sprintf(", %d down: %s", down, strings.Join(downNames, ", "))
@@ -3112,8 +3410,11 @@ func (s *Server) healthSummaryFor(status *StatusPayload, ready bool) map[string]
 		ts := s.deps.Tokens.Summary()
 		if ts != nil {
 			if ts.TotalTokens == 0 {
-				checks = append(checks, check{Name: "tokens", Status: "warn", Detail: "zero consumed"})
-				warns++
+				st, detail := s.zeroTokenHealth(ts)
+				checks = append(checks, check{Name: "tokens", Status: st, Detail: detail})
+				if st == "warn" {
+					warns++
+				}
 			} else {
 				checks = append(checks, check{Name: "tokens", Status: "pass", Detail: fmt.Sprintf("%d total", ts.TotalTokens)})
 			}

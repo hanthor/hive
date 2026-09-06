@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/hivecommons/hive/internal/testutil"
 )
 
 // bin/gh-app-token.sh mints two very different things from the same GitHub App
@@ -51,7 +53,7 @@ func runGHAppTokenScript(t *testing.T, warmCache bool, args ...string) scriptRun
 
 	src, err := os.ReadFile(ghAppTokenScriptPath)
 	if err != nil {
-		t.Skipf("gh-app-token.sh not readable from this package: %v", err)
+		testutil.SkipfUnlessRequired(t, "gh-app-token.sh not readable from this package: %v", err)
 	}
 	for _, tool := range []string{"bash", "openssl", "jq", "python3"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -286,12 +288,12 @@ func TestScopedMintRejectsUnknownTier(t *testing.T) {
 // Repo scoping narrows a tier token to named repositories; the list has to
 // reach GitHub as a JSON array.
 func TestScopedMintPassesRepositoryRestriction(t *testing.T) {
-	run := runGHAppTokenScript(t, true, "--scoped", "advisor", "kubestellar/hive,kubestellar/ui")
+	run := runGHAppTokenScript(t, true, "--scoped", "advisor", "hivecommons/hive,kubestellar/ui")
 
 	if run.exitCode != 0 {
 		t.Fatalf("exit=%d stderr=%q", run.exitCode, run.stderr)
 	}
-	want := `{"permissions":{"issues":"read","metadata":"read"},"repositories":["kubestellar/hive","kubestellar/ui"]}`
+	want := `{"permissions":{"issues":"read","metadata":"read"},"repositories":["hivecommons/hive","kubestellar/ui"]}`
 	if run.scopedBody != want {
 		t.Fatalf("request body =\n  %s\nwant\n  %s", run.scopedBody, want)
 	}

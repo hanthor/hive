@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -472,7 +473,7 @@ func (r *Reconciler) reconcileAgent(ctx context.Context, name string, now time.T
 	r.mu.Unlock()
 
 	r.reconcileAuth(ctx, name, obs, cls, now, authCache)
-	r.reconcileReadiness(name, now)
+	r.reconcileReadiness(name, obs, now)
 
 	if act != nil {
 		act()
@@ -657,7 +658,32 @@ func (r *Reconciler) reconcileAuth(ctx context.Context, name string, obs Observa
 	reason := "NoProbe"
 	message := "no credential probe available for backend " + obs.Backend
 
-	if cls.Class == ClassAuthRequired {
+	// healable: the pane shows login chrome, but the backend credential is
+	// demonstrably still usable, so a CLI restart recovers it and no human is
+	// needed. Hoisted to a variable because two later steps must honour it —
+	// the CredentialPresent upgrade must not overwrite the verdict, and a
+	// standing operator alert must be cleared.
+	healable := cls.Class == ClassAuthRequired && obs.CredentialProven
+
+	if healable {
+		// A login screen over a credential that demonstrably still works is
+		// the token-restart heal's case, not an operator's — the same division
+		// of labour #5291 established for the governor's login detector, which
+		// was paused for exactly this misreading. The routine cause is a
+		// Claude access token that aged out under a session older than its
+		// 8h life: the CLI pins the token it read at startup, so the pane
+		// 401s while the refresh grant on disk is still good for weeks, and
+		// the next restart mints a fresh token with no human involved.
+		//
+		// Unknown, not True: the credential is proven, the SESSION is not.
+		// Claiming Authenticated=true here would vouch for a pane that is
+		// visibly not working. Unknown clears the operator alert (there is
+		// nothing for a human to do) without asserting health the reconciler
+		// cannot see.
+		status = ConditionUnknown
+		reason = "LoginPromptWithUsableCredential"
+		message = cls.Reason + "; the backend credential is still usable, so a CLI restart recovers this without an operator login"
+	} else if cls.Class == ClassAuthRequired {
 		status = ConditionFalse
 		reason = "PaneShowsLogin"
 		message = cls.Reason
@@ -689,8 +715,11 @@ func (r *Reconciler) reconcileAuth(ctx context.Context, name string, obs Observa
 	}
 
 	// With no provider verdict, the per-agent credential-file probe's
-	// positive answer still beats "unknown".
-	if status == ConditionUnknown && obs.AuthKnown && obs.AuthAvailable {
+	// positive answer still beats "unknown" — EXCEPT over a healable pane,
+	// whose Unknown is a deliberate verdict rather than an absent one.
+	// Upgrading it to True there would report Authenticated on an agent
+	// visibly sitting at a login prompt.
+	if status == ConditionUnknown && !healable && obs.AuthKnown && obs.AuthAvailable {
 		status, reason = ConditionTrue, "CredentialPresent"
 		message = "per-agent credential probe reports a live credential for backend " + obs.Backend
 	}
@@ -712,7 +741,13 @@ func (r *Reconciler) reconcileAuth(ctx context.Context, name string, obs Observa
 				fmt.Sprintf("Agent %q needs re-authentication (%s): %s", name, reason, message))
 		}
 	}
-	if status == ConditionTrue && prev.Status == ConditionFalse && r.alerter != nil {
+	// Clear on a healable pane as well as on a True verdict. Without this the
+	// alert is sticky in exactly the case it is most wrong: an operator who
+	// re-authenticates leaves login chrome on the pane, the verdict moves
+	// False -> Unknown rather than False -> True, and the "needs
+	// re-authentication" banner would stand over a credential that no longer
+	// needs anything from them.
+	if r.alerter != nil && prev.Status == ConditionFalse && (status == ConditionTrue || healable) {
 		r.alerter.ClearSystemAlert(authAlertID(name))
 	}
 }
@@ -721,13 +756,20 @@ func (r *Reconciler) reconcileAuth(ctx context.Context, name string, obs Observa
 // evidence. A readiness failure alone NEVER pauses or restarts (design
 // decision on RFC open question 3): it publishes Producing=False and a
 // warning alert, degrading the agent's standing rather than its life.
-func (r *Reconciler) reconcileReadiness(name string, now time.Time) {
+func (r *Reconciler) reconcileReadiness(name string, obs Observation, now time.Time) {
 	settings := r.snapshotSettings()
 	last, ok := r.fleet.LastProduction(name)
 	status := ConditionUnknown
 	reason := "NoEvidence"
 	message := "no production evidence source is readable for this agent"
-	if ok {
+	if obs.ProviderErrorClass != "" {
+		status = ConditionFalse
+		reason = "ProviderInferenceError"
+		message = fmt.Sprintf("blocked: inference (%s)", obs.ProviderErrorClass)
+		if line := strings.TrimSpace(obs.ProviderErrorLine); line != "" {
+			message += ": " + line
+		}
+	} else if ok {
 		age := now.Sub(last)
 		switch {
 		case age < settings.NoProductionFor:

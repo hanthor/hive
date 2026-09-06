@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/config"
 )
 
 func loginScanConfig(patterns []string) *config.Config {
@@ -35,7 +35,7 @@ func TestScanForLoginRequiredStandsDownWithoutUsablePatterns(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Must return without touching any of the nil collaborators.
 			scanForLoginRequired(context.Background(), loginScanConfig(tc.patterns),
-				nil, nil, nil, restoreTestLogger())
+				nil, nil, nil, restoreTestLogger(), nil)
 		})
 	}
 }
@@ -55,5 +55,5 @@ func TestScanForLoginRequiredMixedValidityPatternsReachesScanLoop(t *testing.T) 
 	// never executes. This still proves the function gets PAST the early
 	// "no usable patterns" return (which the panic-on-touch test above
 	// verifies happens for an all-invalid list) to the scan loop itself.
-	scanForLoginRequired(context.Background(), cfg, mgr, nil, nil, restoreTestLogger())
+	scanForLoginRequired(context.Background(), cfg, mgr, nil, nil, restoreTestLogger(), newLoginSightingTracker())
 }

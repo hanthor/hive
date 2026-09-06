@@ -9,7 +9,7 @@ contributor's laptop deletes their other work.
 
 This page defines what Hive owns and what Hive lifecycle tooling is allowed to
 remove. It is the contract that the Podman lifecycle work in
-[#4188](https://github.com/kubestellar/hive/issues/4188) must build on.
+[#4188](https://github.com/hivecommons/hive/issues/4188) must build on.
 
 The contract lives in `bin/hive-podman-cleanup.sh` and is enforced by
 `bin/test_hive_podman_cleanup.sh` in CI. `bin/hive-podman-teardown.sh` is the
@@ -93,7 +93,7 @@ Allowed, because they are scoped:
 ```bash
 podman rm --force hive hive-gateway
 podman volume prune --force --filter label=io.kubestellar.hive.owned=true
-podman rmi ghcr.io/kubestellar/hive:v4
+podman rmi ghcr.io/hivecommons/hive:v4
 buildah rm hive-build
 ```
 
@@ -162,7 +162,7 @@ are torn down through their own Compose path, which this script does not touch.
 
 The teardown can only remove what the create side labelled, and the standalone
 Podman deployment asset does not exist yet — it is its own slice of
-[#4188](https://github.com/kubestellar/hive/issues/4188), and
+[#4188](https://github.com/hivecommons/hive/issues/4188), and
 [ADR-0017](adr/0017-podman-quadlet-lifecycle.md) records Quadlet as the
 mechanism it will use. When it lands, every container, pod, network, and volume
 it creates must carry the label set above, applied through

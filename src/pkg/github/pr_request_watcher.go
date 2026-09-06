@@ -60,6 +60,23 @@ type PRResponse struct {
 	Number         int    `json:"number,omitempty"`
 	URL            string `json:"url,omitempty"`
 	AlreadyExisted bool   `json:"already_existed,omitempty"`
+	// DuplicateTree says the returned PR was reused because it already carries
+	// this request's exact content, not because it shares the head branch
+	// (#5111). It is the difference between "your retry landed on the PR you
+	// already opened" and "this change is already proposed as #N" — the second
+	// is the one an agent must act on, by commenting on that PR rather than
+	// filing again, so it is reported rather than folded into AlreadyExisted.
+	DuplicateTree bool `json:"duplicate_tree,omitempty"`
+	// SelfAuthorized reports that the PR was held because its only tracked
+	// rationale is an issue the hive filed and no human has acknowledged
+	// (#5117). The PR was still opened; it just cannot merge until someone
+	// signs off on the direction. Reported to the agent so it can go get that
+	// sign-off rather than reading the hold as an unexplained failure.
+	//
+	// Never set together with DuplicateTree: see the precedence note in
+	// handleOnePRRequest. A duplicate request opened no PR, so there is nothing
+	// of this request's to have authorised.
+	SelfAuthorized bool   `json:"self_authorized,omitempty"`
 	Error          string `json:"error,omitempty"`
 	At             string `json:"at"`
 }
@@ -135,7 +152,8 @@ func (c *Client) StartPRRequestWatcher(ctx context.Context, authz PRRequestAutho
 	}
 	// Shared with PrepareRequestDirs, which creates this queue unconditionally
 	// at boot so requests can accumulate even before a watcher runs.
-	if !ensureRequestDir(c.logger, "pr", prRequestDir()) {
+	dir := prRequestDir()
+	if !ensureRequestDir(c.logger, "pr", dir) {
 		close(done)
 		return done
 	}
@@ -160,18 +178,22 @@ func (c *Client) StartPRRequestWatcher(ctx context.Context, authz PRRequestAutho
 				if ctx.Err() != nil {
 					return
 				}
-				c.processPRRequests(ctx, nowFn)
+				c.processPRRequestsInDir(ctx, nowFn, dir)
 			}
 		}
 	}()
-	c.logger.Info("pr-request watcher started", slog.String("dir", prRequestDir()))
+	c.logger.Info("pr-request watcher started", slog.String("dir", dir))
 	return done
 }
 
 // processPRRequests handles one scan of the request dir. Exported-in-spirit for
 // tests via ProcessPRRequestsOnce.
 func (c *Client) processPRRequests(ctx context.Context, nowFn func() time.Time) {
-	entries, err := os.ReadDir(prRequestDir())
+	c.processPRRequestsInDir(ctx, nowFn, prRequestDir())
+}
+
+func (c *Client) processPRRequestsInDir(ctx context.Context, nowFn func() time.Time, dir string) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
@@ -181,7 +203,7 @@ func (c *Client) processPRRequests(ctx context.Context, nowFn func() time.Time) 
 		if e.IsDir() || !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".result.json") {
 			continue
 		}
-		path := filepath.Join(prRequestDir(), name)
+		path := filepath.Join(dir, name)
 		c.handleOnePRRequest(ctx, path, nowFn)
 	}
 }
@@ -242,6 +264,20 @@ func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func
 		return
 	}
 
+	// Scan the candidate diff at the same choke point (#5114). The gate above
+	// checks what the request SAYS; this one checks what the branch would
+	// PUBLISH — agent and run metadata committed into files, which no change to
+	// the request can make safe. Both run because a request can be honest about
+	// a branch that is still unpublishable.
+	if err := c.validatePRRequestContent(ctx, req); err != nil {
+		if reason, policy := prContentMetadataReason(err); policy {
+			c.rejectPRRequest(path, req, "content", reason, nowFn)
+			return
+		}
+		c.failPRRequest(path, req, err, nowFn)
+		return
+	}
+
 	// Public outreach prose speaks for the project, so it gets a second gate at
 	// the same choke point (#5115). The check above is about the request being
 	// accurate; this one is about the project being able to stand behind what
@@ -275,6 +311,7 @@ func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func
 	resp.Number = res.Number
 	resp.URL = res.URL
 	resp.AlreadyExisted = res.AlreadyExisted
+	resp.DuplicateTree = res.DuplicateTree
 
 	// F6: apply the ACMM "hold" label server-side, from authoritative config, on
 	// the path that actually runs. At hold-gated levels (L3/L4/L5) every
@@ -283,7 +320,33 @@ func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func
 	// unreachable (it followed `exec hive-open-pr`), so those PRs were opened
 	// unlabeled and the gate was inert. AddLabels is additive + idempotent, so it
 	// is safe to (re)apply even when we reused an already-open PR.
-	if c.prHoldLabel != nil && c.prHoldLabel(req.Agent) {
+	//
+	// #5117 adds a second, level-independent reason to hold: the PR's only
+	// tracked rationale is an issue the hive filed that nobody has acknowledged.
+	// It is evaluated only when the level is NOT already holding — at a
+	// hold-gated level every PR already waits for the human checkpoint this gate
+	// exists to create, so asking GitHub about the issue would buy nothing.
+	//
+	// PRECEDENCE, #5111 over #5117 (and over the level gate). The other two ask
+	// "may this agent's change proceed to merge?", which is a property of the PR
+	// THIS REQUEST CREATED. DuplicateTree says this request created nothing: res
+	// names a PR that already existed, and it may belong to another agent or to
+	// a human. Labelling or commenting there acts on somebody else's PR, and a
+	// "hold" stamped on it blocks a merge that has nothing to do with this
+	// request. So the duplicate path takes neither hold reason.
+	//
+	// No governance is skipped by that ordering. The PR being pointed at went
+	// through the self-authorisation gate when IT was opened through this same
+	// path; and where it is a human's PR, hive has no standing to gate it at
+	// all. Evaluating the gate here would additionally spend GitHub calls to
+	// compute a hold that must not be applied.
+	holdByLevel := c.prHoldLabel != nil && c.prHoldLabel(req.Agent)
+	var selfAuth SelfAuthorization
+	if !res.DuplicateTree && !holdByLevel {
+		selfAuth = c.EvaluateSelfAuthorization(ctx, req.Repo, title, body, req.IssueN)
+		resp.SelfAuthorized = selfAuth.Held
+	}
+	if !res.DuplicateTree && (holdByLevel || selfAuth.Held) {
 		if lerr := c.AddLabels(ctx, req.Repo, res.Number, []string{"hold"}); lerr != nil {
 			// A missing hold label is a policy failure, not a cosmetic one. Keep
 			// the request queued: the next bounded retry deduplicates the existing
@@ -292,9 +355,26 @@ func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func
 				slog.String("repo", req.Repo), slog.Int("number", res.Number), slog.String("error", lerr.Error()))
 			c.failPRRequest(path, req, fmt.Errorf("PR #%d opened but required hold label could not be applied: %w", res.Number, lerr), nowFn)
 			return
+		} else if selfAuth.Held {
+			c.logger.Info("pr-request watcher: held PR — its only tracked rationale is an issue the hive filed and nobody acknowledged",
+				slog.String("repo", req.Repo), slog.Int("number", res.Number),
+				slog.String("rationale_repo", selfAuth.Repo), slog.Int("rationale_issue", selfAuth.Issue),
+				slog.String("reason", selfAuth.Reason), slog.String("agent", req.Agent))
 		} else {
 			c.logger.Info("pr-request watcher: applied hold label (hold-gated ACMM level)",
 				slog.String("repo", req.Repo), slog.Int("number", res.Number))
+		}
+	}
+
+	// Explain the hold on the PR itself, once, when we opened it. A "hold" with
+	// no stated cause reads as a malfunction, and the person who has to clear it
+	// needs to know what clears it. Best-effort: the label is the enforcement,
+	// the comment is the courtesy, and a failed courtesy must not fail the
+	// request and send it round the retry loop.
+	if selfAuth.Held && !res.AlreadyExisted {
+		if cerr := c.CreateIssueComment(ctx, req.Repo, res.Number, selfAuthorizationNotice(selfAuth)); cerr != nil {
+			c.logger.Warn("pr-request watcher: held PR but could not post the explanation",
+				slog.String("repo", req.Repo), slog.Int("number", res.Number), slog.String("error", cerr.Error()))
 		}
 	}
 
@@ -314,15 +394,27 @@ func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func
 		"number", strconv.Itoa(res.Number),
 		"author", res.Author,
 		"url", res.URL,
-		"reused", strconv.FormatBool(res.AlreadyExisted))
+		"reused", strconv.FormatBool(res.AlreadyExisted),
+		"self_authorized", strconv.FormatBool(selfAuth.Held),
+		"duplicate_tree", strconv.FormatBool(res.DuplicateTree))
 	c.writePRResult(path, resp)
 	// Success (or reuse of an existing PR) — consume the request so it isn't
 	// reprocessed.
 	_ = os.Remove(path)
 	c.prRetries.clear(path)
+	if res.DuplicateTree {
+		// Logged on its own line, not folded into the line below: this is the
+		// outcome the issue asked to be able to count ("a queue that looks like
+		// five problems when it is one"), and it should be findable without
+		// parsing a boolean out of a success message.
+		c.logger.Info("pr-request watcher: request carried content an open PR already proposes; reused it instead of opening a duplicate",
+			slog.String("repo", req.Repo), slog.String("head", req.Head),
+			slog.Int("number", res.Number), slog.String("agent", req.Agent))
+	}
 	c.logger.Info("pr-request watcher: PR opened by App bot",
 		slog.String("repo", req.Repo), slog.String("head", req.Head),
 		slog.Int("number", res.Number), slog.Bool("reused", res.AlreadyExisted),
+		slog.Bool("duplicate_tree", res.DuplicateTree),
 		slog.String("agent", req.Agent))
 }
 
@@ -332,6 +424,16 @@ func (c *Client) handleOnePRRequest(ctx context.Context, path string, nowFn func
 func (c *Client) failPRRequest(path string, req PRRequest, err error, nowFn func() time.Time) {
 	resp := PRResponse{OK: false, Error: err.Error(), At: nowFn().UTC().Format(time.RFC3339)}
 	c.writePRResult(path, resp)
+
+	// #5343: an unpushed head ref is the one failure here whose visible symptom
+	// points away from its cause. Log it at ERROR on its own line — this is
+	// work an agent already completed and cannot publish, and it is invisible
+	// in the fleet view because the agent's session ended healthy.
+	if reason, ok := missingHeadReason(err); ok {
+		c.logger.Error("pr-request watcher: head branch is not on the remote — the agent's push did not authenticate",
+			slog.String("repo", req.Repo), slog.String("head", req.Head),
+			slog.String("agent", req.Agent), slog.String("diagnosis", reason))
+	}
 	if c.prRetries.noteFailure(path, nowFn()) {
 		_ = os.Rename(path, path+".failed")
 		c.prRetries.clear(path)

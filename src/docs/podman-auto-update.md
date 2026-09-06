@@ -98,7 +98,7 @@ expect **~5 minutes of downtime**, then automatic recovery to the previous image
 > stayed `0`, `podman auto-update` exited `0` — and `:3001`, the only published port,
 > stayed dead until a human noticed. `hive.container` now carries
 > `Wants=hive-gateway.service` so every path that starts Hive brings the gateway with
-> it ([#4516](https://github.com/kubestellar/hive/issues/4516)).
+> it ([#4516](https://github.com/hivecommons/hive/issues/4516)).
 
 **`is-failed` never leaves `activating`, and `NRestarts` never leaves `0`.**
 #4378's warning stands: monitoring keyed on unit state does not fire. Worse for
@@ -158,7 +158,7 @@ both `status` and `autoupdate status` flag the combination when it exists.
 There is a worse case. If the pinned digest stops resolving in the registry —
 garbage-collected, or pinned across repositories, which #4378's own failure run
 did when it pinned `docker.io/library/nginx@sha256:…` onto a unit whose tag is
-`ghcr.io/kubestellar/hive:stable` — auto-update does not skip it:
+`ghcr.io/hivecommons/hive:stable` — auto-update does not skip it:
 
 ```
 hivefixture.service  0fd250ba7b08  localhost:5000/hivefixture@sha256:3775a702…  registry  failed
@@ -231,7 +231,7 @@ retries) and let the bad tag be fixed upstream:
 
 ```sh
 bin/hive-podman-update.sh autoupdate off
-bin/hive-podman-update.sh pin ghcr.io/kubestellar/hive@sha256:<last good>
+bin/hive-podman-update.sh pin ghcr.io/hivecommons/hive@sha256:<last good>
 ```
 
 ## Rootful, under the system manager

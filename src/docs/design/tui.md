@@ -1,10 +1,16 @@
 # `hive tui` — a terminal dashboard for Hive (#4907)
 
-Status: **design only.** Nothing described here is shipped. The scaffold is
-proposed in [#4916](https://github.com/kubestellar/hive/issues/4916) (PR #4919,
-open); every pane, every client call, and every action below is a separate
-unmerged task in the [#4907](https://github.com/kubestellar/hive/issues/4907)
-task graph. Read this as intent, not as behaviour.
+Status: **shipped (v1).** Every task in the [#4907](https://github.com/hivecommons/hive/issues/4907)
+task graph has landed: the scaffold, all four panes, the SSE stream and its
+polling fallback, and every action (pause/resume, model apply, kick, ACMM
+apply, local tmux attach). Per this record's own convention
+([`design/README.md`](README.md)), this page is **not rewritten** to describe
+that delivery in detail — it stays the plan and the reasoning behind it, with
+only the two corrections below and the
+[Delivery: `hivectl tui`](#delivery-hivectl-tui) note updated against what
+actually shipped. **[`src/docs/hivectl.md`](../hivectl.md#tui--live-terminal-dashboard) is the
+operator reference and the page to read first** — keybindings, pane cadence,
+authorization failures, and v1 boundaries as delivered.
 
 Two things in the epic's drafted text do not match this repository, and both
 are corrected here with the evidence: the `v2/` path prefix
@@ -86,19 +92,28 @@ entrypoints in the module, only one has subcommand structure:
   `http://127.0.0.1:3001` and `--token-env` defaults to `HIVE_DASHBOARD_TOKEN`
   (`src/pkg/hivectl/commands/root.go`).
 
-So the command is **`hivectl tui`**. Note the one deviation this forces from the
-Data source decision as written: the base URL comes from `--server`, whose
-default is `http://127.0.0.1:3001` rather than the epic's
-`HIVE_DASHBOARD_URL` / `http://localhost:3001`. Reusing hivectl's existing flag
-is worth more than a second, differently-spelled way to say the same thing; a
-task that wants `HIVE_DASHBOARD_URL` honoured should add it as the flag's
-default source rather than as a parallel path.
+So the command is **`hivectl tui`**.
+
+**Correction against delivery.** This section originally proposed that the TUI
+reuse hivectl's `--server` / `--token-env` flags for its base URL and token,
+deviating from the Data source decision's `HIVE_DASHBOARD_URL` /
+`http://localhost:3001`. That is not what shipped: `newTUICommand`
+(`src/pkg/hivectl/commands/tui.go`) calls `tui.Run()` with nothing from
+`*commandEnv`, so `hivectl tui` reads `HIVE_DASHBOARD_URL` and
+`HIVE_DASHBOARD_TOKEN` directly — exactly the Data source decision as
+written — and does **not** honour `--server` or `--token-env`. The two base
+URL defaults consequently differ by one detail (`http://localhost:3001` here
+vs. `http://127.0.0.1:3001` for `--server`'s default on every other `hivectl`
+command), which is worth knowing if you pass `--server` for a non-default host
+elsewhere: the TUI will not pick it up. See
+[`src/docs/hivectl.md`](../hivectl.md#launch-and-endpoint-selection) for the
+operator-facing version of this note.
 
 ### Paths: the epic's `v2/` prefix predates #3996
 
 The epic and its sub-issues specify `v2/internal/tui/...` and `v2/docs/tui.md`.
 **There is no `v2/` directory in this repository and no module at the repo
-root.** The Go module is `src/` (`github.com/kubestellar/hive`), which is where
+root.** The Go module is `src/` (`github.com/hivecommons/hive`), which is where
 `go build ./...` and every CI test shard run from
 (`.github/workflows/v2-tests.yml`, `working-directory: src`). A tree at the repo
 root would sit outside the module and never be compiled or tested at all.
@@ -133,7 +148,7 @@ tells a sub-issue what to do when an operation is missing from it. This section
 records how large that gap actually is.
 
 **Originally measured at `45a13d5`, the spec was GET-only: 32 routes, zero
-writes.** [#5023](https://github.com/kubestellar/hive/pull/5023) closed most of
+writes.** [#5023](https://github.com/hivecommons/hive/pull/5023) closed most of
 that — it found the 32-vs-298 comparison had been made against
 `dashboard/server.js`, a legacy Node prototype that `dashboard/README.md`
 states v2 production never starts, and re-measured against the live Go server.
@@ -288,7 +303,7 @@ running Hive, no Docker, no network.
 
 ## Related
 
-- [#4907](https://github.com/kubestellar/hive/issues/4907) — the tracker, task
+- [#4907](https://github.com/hivecommons/hive/issues/4907) — the tracker, task
   table, and filing protocol.
 - [`hivectl`](../hivectl.md) — the non-interactive client for the same API, and
   the command this TUI is a subcommand of.

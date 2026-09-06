@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/config"
-	hivegithub "github.com/kubestellar/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/config"
+	hivegithub "github.com/hivecommons/hive/pkg/github"
 )
 
 const (
@@ -334,7 +334,7 @@ func (s *HubServer) requestHostedLiteSpoke(username, owner, repo, host string, i
 	if host != "" && host != publicGitHubHost {
 		h.GitHubHost = host
 		h.GitHubBaseURL = "https://" + host
-		h.GitHubAPIURL = gheAPIURLForHost(host)
+		h.GitHubAPIURL = forgeAPIURLForHost("", host)
 	}
 	if err := saveSaaSHive(h); err != nil {
 		return nil, fmt.Errorf("save hosted lite spoke metadata: %w", err)

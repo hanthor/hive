@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
 )
 
 // The regression window: a GHE cluster written in the 2026-07-31 shape —
@@ -143,8 +143,8 @@ func TestBackfillGitHubHostForgeMapShape(t *testing.T) {
 		t.Errorf("public pin backfill = %q, want empty — an explicit public pin must stay public", got)
 	}
 	// And the backfilled host must actually drive a GHE API URL on the heartbeat.
-	if got := gheAPIURLForHost(backfillGitHubHostFromCluster(&SaaSHive{}, cluster)); got != identGHEAPIURL {
-		t.Errorf("gheAPIURLForHost = %q, want %q", got, identGHEAPIURL)
+	if got := forgeAPIURLForHost("", backfillGitHubHostFromCluster(&SaaSHive{}, cluster)); got != identGHEAPIURL {
+		t.Errorf("forgeAPIURLForHost = %q, want %q", got, identGHEAPIURL)
 	}
 }
 

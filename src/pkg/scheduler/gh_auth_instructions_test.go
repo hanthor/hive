@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
 )
 
 // kubestellar/hive#1861 asks that agents hold no GitHub token material at all.
@@ -55,7 +55,7 @@ func TestGHAuthInstructions_NeverHandsTheAgentAToken(t *testing.T) {
 	} {
 		if strings.Contains(block, forbidden) {
 			t.Errorf("the kick prompt names a token path (%q). Agents must not be told where credentials live "+
-				"(kubestellar/hive#1861): gh-wrapper.sh already applies the scoped token per invocation, so this "+
+				"(hivecommons/hive#1861): gh-wrapper.sh already applies the scoped token per invocation, so this "+
 				"instruction is redundant AND puts a live credential in the agent's transcript.", forbidden)
 		}
 	}
@@ -66,7 +66,7 @@ func TestGHAuthInstructions_NeverHandsTheAgentAToken(t *testing.T) {
 	if m := readsASecret.FindString(block); m != "" {
 		t.Errorf("the kick prompt tells the agent to read or export a credential (matched %q). "+
 			"The hive authenticates gh and git on the agent's behalf; nothing here should ask the agent to "+
-			"fetch, echo, or export one (kubestellar/hive#1861).", m)
+			"fetch, echo, or export one (hivecommons/hive#1861).", m)
 	}
 }
 

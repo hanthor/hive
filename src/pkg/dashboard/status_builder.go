@@ -15,22 +15,24 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/beads"
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/governor"
-	"github.com/kubestellar/hive/pkg/planning"
-	"github.com/kubestellar/hive/pkg/resolve"
-	"github.com/kubestellar/hive/pkg/skillreg"
-	"github.com/kubestellar/hive/pkg/tokens"
-	"github.com/kubestellar/hive/pkg/watchdog"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/beads"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/governor"
+	"github.com/hivecommons/hive/pkg/planning"
+	"github.com/hivecommons/hive/pkg/resolve"
+	"github.com/hivecommons/hive/pkg/skillreg"
+	"github.com/hivecommons/hive/pkg/tokens"
+	"github.com/hivecommons/hive/pkg/watchdog"
 )
 
 // skillsConventionalDir is the conventional on-disk location the dashboard
-// probes for a skills registry. The skills registry (pkg/skillreg) is not yet
-// wired into the runtime, so this is a best-effort, optional load: an absent
-// directory reports "not configured" rather than an error.
+// probes for a skills registry. It is the same directory the scheduler loads at
+// kick time (scheduler.skillsRegistryDir), so the count reported here and the
+// skills actually injected into an agent's context come from one place. The
+// load stays best-effort and optional: an absent directory reports "not
+// configured" rather than an error.
 //
 // It is a var, not a const, purely so tests can point it at a temp dir.
 var skillsConventionalDir = dataVolumePath + "/skills"
@@ -111,6 +113,16 @@ var (
 
 	cachedHealth   map[string]any
 	cachedHealthMu sync.RWMutex
+
+	// cachedGreenStreak carries the real green-CI streak (#5226) computed on
+	// the status-build path, where a GitHub client and context already exist.
+	// The ACMM advisor endpoint reads this cache rather than calling GitHub
+	// itself, so an advisory HTTP request never triggers an Actions API call.
+	// cachedGreenStreakOK stays false until a collect has actually succeeded,
+	// which is what keeps "not measured yet" distinct from a measured zero.
+	cachedGreenStreak   int
+	cachedGreenStreakOK bool
+	cachedGreenStreakMu sync.RWMutex
 
 	proxyViolationsMu sync.RWMutex
 	proxyViolationsFn func() map[string]int
@@ -543,6 +555,7 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 		}
 		cadence := cadenceDisplay(cadenceValue)
 		nextKick := computeNextKickFromCadence(proc.LastKick, cadenceValue)
+		nextKickIn := computeNextKickETA(proc.LastKick, cadenceValue)
 
 		// offByCadence: the agent's cadence for the CURRENT governor mode is a
 		// non-kicking value ("pause"/"off"), so the governor will never kick it
@@ -562,6 +575,23 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 		modeCadence := cfg.CadenceValueForMode(name, currentMode)
 		offByCadence := modeCadence != "" && modeCadence.IsPaused() &&
 			!proc.Config.OnDemand && !onDemandSet[name]
+
+		// noCadence: NO governor mode names this agent in its cadence map and it
+		// has never been kicked, so nothing will ever schedule it — the silent
+		// idle class named by governor.NoCadenceAgents (#5577). offByCadence is
+		// the OPPOSITE situation (an explicit pause/off entry, i.e. an operator
+		// choice), which is why the two are separate flags and both can be false.
+		//
+		// Predicate deliberately identical to the governor's, down to the
+		// never-kicked clause, so the fleet banner and the agent card cannot
+		// name different agents (#5594). The cadence lookup itself is the shared
+		// config.HasAnyCadenceIn the governor calls.
+		agentEnabled := !agentDisabledInConfig(cfg, name, proc)
+		noCadence := agentEnabled &&
+			!proc.Config.OnDemand && !onDemandSet[name] &&
+			proc.Config.UsesGovernorKick() &&
+			!cfg.HasAnyCadence(name) &&
+			proc.LastKick == nil
 
 		pinnedCli := proc.PinnedCLI != "" || proc.Config.CLIPinned
 		pinnedModel := proc.PinnedModel != ""
@@ -603,7 +633,7 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 			Color:         agentCfg.Color,
 			BeadRole:      agentCfg.GetBeadRole(),
 			Managed:       agentCfg.Managed,
-			Enabled:       !agentDisabledInConfig(cfg, name, proc),
+			Enabled:       agentEnabled,
 			ReplicaBase:   agentCfg.ReplicaOf,
 			ReplicaIndex:  agentCfg.ReplicaIndex,
 			ReplicaCount:  agentCfg.ReplicaCount,
@@ -618,6 +648,7 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 			PausedTrigger: proc.PausedTrigger,
 			PausedBy:      proc.PausedBy,
 			OffByCadence:  offByCadence,
+			NoCadence:     noCadence,
 			CLI:           cli,
 			Model:         model,
 			Cadence:       cadence,
@@ -627,6 +658,7 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 			Pinned:        pinnedCli || pinnedModel,
 			LastKick:      lastKick,
 			NextKick:      nextKick,
+			NextKickIn:    nextKickIn,
 			Restarts:      proc.RestartCount,
 			GovBackend:    cli,
 			GovModel:      model,
@@ -642,6 +674,26 @@ func buildAgents(statuses map[string]*agent.AgentProcess, cfg *config.Config, go
 			TransientNudges: proc.TransientNudges,
 			Conditions:      proc.WatchdogConditions,
 			WatchdogMode:    watchdogMode,
+		}
+		if proc.ProviderErrorClass != "" && time.Now().Before(proc.ProviderErrorBackoffUntil) {
+			a.StructuredStatus = "BLOCKED"
+			a.StatusEvidence = "blocked: inference (" + proc.ProviderErrorClass + ")"
+			if line := strings.TrimSpace(proc.ProviderErrorLine); line != "" {
+				a.StatusEvidence += ": " + line
+			}
+		}
+		// #5958: the card said "restart needed" for an agent that had failed to
+		// start the same way three times running, so the one control it offered
+		// was the one that could not help. Show the reason and the recurrence
+		// instead. Written after the inference block on purpose — an agent that
+		// cannot START is a more basic fault than one whose provider is erroring,
+		// and it is the one the operator has to act on first.
+		if proc.StartBlocked {
+			a.StructuredStatus = "BLOCKED"
+			a.StatusEvidence = "blocked: " + strings.TrimSpace(proc.StartFailureReason)
+			if proc.StartFailureCount > 0 {
+				a.StatusEvidence += fmt.Sprintf(" (%d consecutive failed starts)", proc.StartFailureCount)
+			}
 		}
 
 		acmmLevel := 0
@@ -1380,7 +1432,29 @@ func buildHealth(ghClient *github.Client, ctx context.Context) map[string]any {
 	cachedHealth = health
 	cachedHealthMu.Unlock()
 
+	// Refresh the green-CI streak on the same pass that already talks to
+	// GitHub for workflow health (#5226). A failed or unmeasurable read leaves
+	// the previous cached value untouched rather than clobbering a real streak
+	// with an unknown — a transient API error must not make the advisor
+	// suddenly withdraw a recommendation it had legitimately earned.
+	if streak, measured := ghClient.GreenCIStreak(ctx); measured {
+		cachedGreenStreakMu.Lock()
+		cachedGreenStreak = streak
+		cachedGreenStreakOK = true
+		cachedGreenStreakMu.Unlock()
+	}
+
 	return copyHealthMap(health)
+}
+
+// greenCIStreakSnapshot returns the last successfully measured green-CI streak
+// and whether one has ever been measured. measured=false means "unknown", and
+// the ACMM advisor leaves its GreenStreak signal at the conservative zero
+// rather than treating the absence of data as a measured zero.
+func greenCIStreakSnapshot() (streak int, measured bool) {
+	cachedGreenStreakMu.RLock()
+	defer cachedGreenStreakMu.RUnlock()
+	return cachedGreenStreak, cachedGreenStreakOK
 }
 
 func buildBudget(gov *governor.Governor, tokenCollector *tokens.Collector) FrontendBudget {
@@ -1586,11 +1660,21 @@ func buildGHRateLimits(ghClient *github.Client, ctx context.Context, cfg *config
 	if ghClient != nil && ctx != nil {
 		limits, err := ghClient.RateLimits(ctx)
 		if err == nil && limits != nil {
-			result["core"] = map[string]any{
+			core := map[string]any{
 				"limit":     limits.Core.Limit,
 				"remaining": limits.Core.Remaining,
 				"reset":     limits.Core.Reset.Format(time.RFC3339),
 			}
+			// observed_at is when this reading was actually taken
+			// (kubestellar/hive#5733). reset cannot answer that — it moves
+			// independently of the sample, and was 8.5 minutes adrift of
+			// reality while the card sat pinned at the full limit. Emitted
+			// only when known, so a client that has never observed a bucket
+			// does not publish a zero timestamp that renders as 1970.
+			if !limits.Core.ObservedAt.IsZero() {
+				core["observed_at"] = limits.Core.ObservedAt.Format(time.RFC3339)
+			}
+			result["core"] = core
 		}
 	}
 

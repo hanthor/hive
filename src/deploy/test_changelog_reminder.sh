@@ -17,6 +17,12 @@ set -uo pipefail
 
 PASS=0
 FAIL=0
+
+# Shared skip discipline (#5388): hive_test_skip is permissive by default and
+# FATAL under HIVE_TEST_REQUIRE_BEHAVIOURAL=1, so a lane whose runner GUARANTEES
+# the precondition below turns a silent skip into a red build.
+# shellcheck source=src/deploy/test_lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/test_lib.sh"
 pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; [ $# -gt 1 ] && echo "        $2"; FAIL=$((FAIL + 1)); }
 
@@ -30,8 +36,8 @@ if [ ! -f "$WF" ]; then
   echo ""; echo "=== Results: $PASS passed, $FAIL failed ==="; exit 1
 fi
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import yaml' >/dev/null 2>&1; then
-  echo "  SKIP: python3 + PyYAML unavailable — cannot extract the step script"
-  exit 0
+  hive_test_skip "python3 + PyYAML unavailable — cannot extract the step script"
+  hive_test_report; exit $?
 fi
 
 WORK="$(mktemp -d)"
@@ -84,7 +90,7 @@ run_step() { # $1 = IS_FORK value
   : >"${WORK}/gh-calls.log"
   : >"${WORK}/summary.md"
   OUT="$(cd "$WORK" && env PATH="${STUB}:${PATH}" \
-    GH_TOKEN=stub PR=4439 REPO=kubestellar/hive IS_FORK="$1" \
+    GH_TOKEN=stub PR=4439 REPO=hivecommons/hive IS_FORK="$1" \
     GITHUB_STEP_SUMMARY="${WORK}/summary.md" \
     bash "${WORK}/step.sh" 2>&1)"
   RC=$?

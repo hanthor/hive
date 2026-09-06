@@ -26,6 +26,14 @@ export HIVE_PROXY_EGRESS_MARK="${HIVE_PROXY_EGRESS_MARK:-0x1112}"
 # "the container was not granted a capability it needs" — chosen over a
 # script-local number so it means the same thing to anyone who already knows
 # sysexits.h. See the FATAL branch below and src/docs/net-admin-requirement.md.
+#
+# The SAME code is reused (#6003) for the sibling preflight failure "the node's
+# kernel does not provide a netfilter extension the forced-egress ruleset needs"
+# (xt_owner / xt_REDIRECT). It is the same class of problem from the operator's
+# side: the container was granted everything the manifest can grant, and the
+# host still cannot supply what the egress gate requires, so the environment -
+# not the image or the config - has to change. Both cases exit 77 with a FATAL
+# line naming exactly what is missing.
 EXIT_NET_ADMIN_REQUIRED=77
 
 # ── Config backup/restore across container recreation ─────────────────
@@ -61,6 +69,201 @@ HIVE_CONFIG_PATH="${HIVE_CONFIG:-/etc/hive/hive.yaml}"
 HIVE_CONFIG_RUNTIME="/data/hive.yaml.runtime"
 HIVE_CONFIG_RUNTIME_LEGACY="/data/hive.yaml.bak"
 
+# The uid/gid the hive process actually runs as after the privilege drop
+# further down (setpriv/gosu to dev). 0600 is an OWNER-only mode, so every
+# hardened config copy has to be owned by THIS user or the owner of the file
+# is not the reader of the file — see hive_harden_runtime_config.
+HIVE_RUNTIME_USER="dev"
+HIVE_RUNTIME_GROUP="node"
+
+# hive_harden_runtime_config makes $1 readable by the user that reads it, and
+# by nobody else: chown to dev:node, then chmod 0600.
+#
+# BOTH halves are load-bearing, and #5360 is what happens with only one.
+#
+# The mode half (#5342/#5331): every `cp` below that writes a PVC config copy
+# creates the destination anew, and cp gives a newly created destination the
+# SOURCE's mode — the ConfigMap seed and the bind-mounted hive.yaml are both
+# 0644 — so the copy is re-widened to 0644 on every boot. Without the chmod
+# the 0600 fix only holds from the first Config.Save() onward, and a hive that
+# boots and never saves stays world-readable indefinitely. These files carry
+# dashboard.auth_token (and github.token in PAT mode) and /data is
+# world-traversable, so that is the dashboard owner credential readable by
+# every unprivileged agent uid.
+#
+# The ownership half (#5360): those same `cp` calls run in the ROOT phase, so
+# the destination is created root:root. chmod 600 on a root:root file grants
+# access to root ALONE — and the hive process drops to dev (uid 1001) before
+# it ever opens the config, so it reads back `permission denied` and startup
+# aborts. The `chown -R dev:node /data` in the root-only block does NOT cover
+# this: it is guarded by `[ "$DATA_OWNER" != "1001" ]` and src/Dockerfile
+# already ships /data owned by dev:node, so on a fresh anonymous volume the
+# guard is false and the recursive chown never runs at all. It is also far
+# BELOW these call sites, so even when it does run it cannot help a file the
+# config branch has not created yet.
+#
+# Do the chown FIRST and the chmod second. The reverse order leaves a window
+# in which the file is 0644 and root-owned; chown does not clear the mode, so
+# chown-then-chmod is never wider than 0600 for longer than the chown itself.
+#
+# Best-effort throughout: a read-only or foreign-owned PVC, or a container
+# without CAP_CHOWN, must not abort boot. When the chown cannot be performed
+# the chmod is deliberately skipped rather than applied to a file we do not
+# own — locking a root-owned file to 0600 is precisely the #5360 failure, and
+# a readable-but-wider file that boots beats a hardened one that cannot.
+hive_harden_runtime_config() {
+  [ -f "$1" ] || return 0
+  # Already owned by the runtime user (the steady state after Config.Save(),
+  # and every non-root boot) — just tighten the mode.
+  if [ "$(stat -c '%u' "$1" 2>/dev/null || echo)" = "1001" ]; then
+    chmod 600 "$1" 2>/dev/null || true
+    return 0
+  fi
+  if chown "$HIVE_RUNTIME_USER:$HIVE_RUNTIME_GROUP" "$1" 2>/dev/null; then
+    chmod 600 "$1" 2>/dev/null || true
+  else
+    echo "[entrypoint] WARN: cannot chown $1 to $HIVE_RUNTIME_USER:$HIVE_RUNTIME_GROUP — leaving its mode alone so the runtime user can still read it (0600 on a foreign-owned file is #5360). Is CAP_CHOWN in the pod's capabilities.add?"
+  fi
+}
+
+# ── /data ownership as an INVARIANT, not a boot-time snapshot (#5369) ──
+#
+# HIVE_DATA_ROOT_PHASE_PATHS is the closed list of paths the root phase of this
+# script creates under /data. It exists because the recursive
+# `chown -R dev:node /data` further down is guarded on `[ "$DATA_OWNER" != 1001 ]`
+# and src/Dockerfile already ships /data owned by dev:node — so on a normal boot
+# the guard is FALSE and that chown never runs. Everything the root phase then
+# creates keeps root:root, and the hive process (uid 1001, after the setpriv/gosu
+# drop) cannot read it. #5360 was one instance of that; this list closes the class.
+#
+# The guard is NOT the bug and must stay. A recursive chown over an NFS-backed
+# PVC with thousands of files costs minutes of startup. This list is the targeted
+# alternative: a fixed set of shallow paths, chowned by NAME, so the cost is
+# O(number of entries here) rather than O(size of the PVC) — and the invariant is
+# restored without reintroducing the walk.
+#
+# MAINTENANCE RULE: if you add a root-phase write under /data, add its path here.
+# hive_assert_runtime_readable below fails the boot LOUDLY, naming the path, when
+# something in this list is unreadable to the runtime uid — so a forgotten entry
+# surfaces as a named error at startup instead of as a silent EACCES later.
+#
+# Deliberately NOT in this list:
+#   /data/agents/*, /data/beads/*  — chowned to per-agent hive-<name> UIDs by the
+#     per-agent loop, not to dev. Sweeping them to dev would undo that isolation.
+#   /data/secrets/bob_api_key      — mode 440, chowned at its own site, and read
+#     by agent UIDs rather than by dev.
+#   /data/.hive/proxy-ca-key.pem   — owner-only by design, chowned at its site.
+HIVE_DATA_ROOT_PHASE_PATHS="
+/data/.hive
+/data/secrets
+/data/config
+/data/config/github-copilot
+/data/home
+/data/home/.config
+/data/home/.bashrc
+/data/home/.profile
+"
+
+# hive_sweep_root_phase_paths hands every existing entry of that list to the
+# runtime user. Ownership ONLY — it never touches modes, because the modes are
+# already deliberate at each site (2775 on /data/home, 710 on /data/secrets,
+# 700 on /data/.hive) and re-deriving them here would be a second source of
+# truth that silently drifts from the first.
+#
+# Non-recursive on purpose: `chown` without -R on a directory is a single
+# syscall regardless of how many files are under it, which is what keeps the
+# NFS cost bounded. Directory ENTRIES created by the root phase are named
+# individually above; entries created later by dev or by an agent are already
+# owned by their creator and are not ours to reassign.
+#
+# Fails OPEN, per #5368: a chown that cannot happen (no CAP_CHOWN, read-only or
+# foreign-owned PVC) WARNs and continues. Nothing here is a security control —
+# the modes set at each site are — so a failed chown must never abort a boot.
+hive_sweep_root_phase_paths() {
+  _sweep_failed=""
+  for _p in $HIVE_DATA_ROOT_PHASE_PATHS; do
+    [ -e "$_p" ] || continue
+    # Already owned by the runtime user — the steady state on almost every
+    # boot. Skip the syscall entirely so the common path costs one stat.
+    [ "$(stat -c '%u' "$_p" 2>/dev/null || echo)" = "1001" ] && continue
+    chown "$HIVE_RUNTIME_USER:$HIVE_RUNTIME_GROUP" "$_p" 2>/dev/null \
+      || _sweep_failed="$_sweep_failed $_p"
+  done
+  if [ -n "$_sweep_failed" ]; then
+    echo "[entrypoint] WARN: could not chown to $HIVE_RUNTIME_USER:$HIVE_RUNTIME_GROUP:$_sweep_failed — is CAP_CHOWN in the pod's capabilities.add? Continuing; the runtime user may hit EACCES on these paths."
+  fi
+  unset _p _sweep_failed
+}
+
+# hive_assert_runtime_readable is the #5369 assertion: immediately BEFORE the
+# privilege drop, prove that the paths the hive process must read are actually
+# readable by the uid it is about to become — and if not, say WHICH path.
+#
+# This is option 3 from the issue, and it is worth having no matter how good the
+# sweep above is. #5360 took four merges to diagnose because the symptom was a
+# bare `permission denied` from the Go binary with no indication of which file or
+# why. The same fault caught here prints the path, its owner and its mode, before
+# the process that would fail on it has even started.
+#
+# Cheap by construction: it stats a short fixed list and, where a real read is
+# possible, does ONE open() per path as the runtime user. No directory walk.
+#
+# Non-fatal by design. A hive that boots degraded and tells you which file is
+# wrong beats one that refuses to boot on a check that may itself be wrong — and
+# on hosts without a `dev` account or without root there is no way to perform the
+# authoritative test at all. The Go binary still enforces what it genuinely needs;
+# this exists to NAME the fault first. The one true hard failure (an unreadable
+# config) already exits from the config block above.
+hive_assert_runtime_readable() {
+  _assert_bad=""
+  for _p in "$@"; do
+    [ -e "$_p" ] || continue
+    _owner="$(stat -c '%u' "$_p" 2>/dev/null || echo '')"
+    # Owned by the runtime uid — readable by definition, no probe needed.
+    [ "$_owner" = "1001" ] && continue
+    # No usable stat (BSD stat has no -c; a stat-less image is conceivable).
+    # We cannot evaluate this path, and a check that cannot evaluate must stay
+    # SILENT rather than report a fault it did not observe. A warning that
+    # fires on every path on every boot trains the operator to ignore the one
+    # that is real — which is how #5360's actual signal got lost.
+    [ -n "$_owner" ] || continue
+    # Not owned by it. Try the real syscall as that user when we can, since
+    # a foreign-owned file may still be perfectly readable via group or other
+    # bits and flagging it on ownership alone would be a false alarm.
+    if [ "$(id -u)" = "0" ] && command -v gosu >/dev/null 2>&1 \
+       && id -u "$HIVE_RUNTIME_USER" >/dev/null 2>&1; then
+      if [ -d "$_p" ]; then
+        gosu "$HIVE_RUNTIME_USER" test -r "$_p" -a -x "$_p" 2>/dev/null && continue
+      else
+        gosu "$HIVE_RUNTIME_USER" test -r "$_p" 2>/dev/null && continue
+      fi
+    else
+      # Cannot perform the authoritative test. Fall back to the mode bits: if
+      # the "other" class can read it, the runtime user can too. This is weaker
+      # than the open() above and is only used where the open() is impossible.
+      case "$(stat -c '%a' "$_p" 2>/dev/null || echo 000)" in
+        *[4567]) continue ;;
+      esac
+    fi
+    _assert_bad="$_assert_bad
+  $_p (owner uid=$_owner, mode=$(stat -c '%a' "$_p" 2>/dev/null || echo '?'))"
+  done
+  if [ -n "$_assert_bad" ]; then
+    echo "[entrypoint] WARN (#5369): these paths are NOT readable by the runtime user '$HIVE_RUNTIME_USER' (uid 1001) that this process is about to become:$_assert_bad"
+    echo "[entrypoint] WARN (#5369): they were created by the root phase and never handed over. Anything that reads them after the privilege drop will fail with EACCES. If a path above is a root-phase write, add it to HIVE_DATA_ROOT_PHASE_PATHS in this script."
+  fi
+  unset _p _owner _assert_bad
+}
+
+# Tighten pre-existing PVC config copies at boot. Files written before the
+# 0600 fix (#5331) are world-readable. Routed through the helper above so
+# these get the same chown-then-chmod treatment as the ones the `cp` calls
+# recreate — a pre-existing root-owned copy is just as unreadable to dev.
+for _cfg in "$HIVE_CONFIG_RUNTIME" "$HIVE_CONFIG_RUNTIME_LEGACY" /data/hive.yaml.dashboard; do
+  hive_harden_runtime_config "$_cfg"
+done
+unset _cfg
+
 # hive_runtime_config_read echoes the path to read the persisted runtime
 # config from: the new name when it is present and non-empty, else the
 # legacy name when that is, else empty. Read-only — it never creates,
@@ -70,6 +273,108 @@ hive_runtime_config_read() {
     echo "$HIVE_CONFIG_RUNTIME"
   elif [ -f "$HIVE_CONFIG_RUNTIME_LEGACY" ] && [ -s "$HIVE_CONFIG_RUNTIME_LEGACY" ]; then
     echo "$HIVE_CONFIG_RUNTIME_LEGACY"
+  fi
+}
+
+# hive_ghe_git_host echoes this hive's configured GitHub host when it is NOT
+# public github.com (i.e. a GitHub Enterprise instance such as github.ibm.com),
+# and nothing at all otherwise. Derived the same way the Go binary's
+# GitHubConfig.HostLabel() derives it (pkg/config/config.go): prefer
+# github.base_url, fall back to the host portion of github.api_url, strip the
+# scheme and a trailing /api/v3.
+#
+# Defined here, at the top, because BOTH boot phases need it: the root phase
+# writes /etc/gitconfig (which every agent UID reads) and the dev phase writes
+# ~dev/.gitconfig. Deriving it once keeps the two from drifting apart, which is
+# exactly the failure mode #5343 was.
+hive_ghe_git_host() {
+  _hgh_cfg="${HIVE_CONFIG:-/etc/hive/hive.yaml}"
+  [ -f "$_hgh_cfg" ] || return 0
+  python3 -c "
+import sys, yaml
+try:
+    with open(sys.argv[1]) as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(0)
+gh = cfg.get('github') or {}
+pick = (gh.get('base_url') or gh.get('api_url') or '').strip()
+if pick.startswith('https://'):
+    pick = pick[len('https://'):]
+elif pick.startswith('http://'):
+    pick = pick[len('http://'):]
+pick = pick.rstrip('/')
+if pick.endswith('/api/v3'):
+    pick = pick[: -len('/api/v3')]
+host = pick.split('/', 1)[0]
+if host and host.lower() != 'api.github.com' and host.lower() != 'github.com':
+    print(host)
+" "$_hgh_cfg" 2>/dev/null || true
+}
+
+# hive_write_system_gitconfig writes /etc/gitconfig — the SYSTEM-level git
+# config, read by EVERY UID regardless of $HOME.
+#
+# WHY THIS EXISTS (#5343). The credential helper used to be installed with
+# `git config --global`, which is per-$HOME. The entrypoint runs as dev
+# (ENV HOME=/home/dev), so it landed in /home/dev/.gitconfig — while agents run
+# under per-agent UIDs with HOME=/data/home/agents/<name>. Measured on a hosted
+# GHE spoke: `su -s /bin/sh hive-quality -c 'git config --get-regexp credential'`
+# returned NOTHING for both --global and --system, because there was no
+# /etc/gitconfig either. Agents committed branches they could never push, and
+# the failure surfaced only as a line inside an otherwise-healthy session.
+#
+# /etc/gitconfig is the right home for it: the helper is already a single
+# system-wide binary at /usr/local/bin/git-credential-hive.sh, and a system file
+# sidesteps the per-UID ownership question that a shared /data/home/.gitconfig
+# would introduce (multiple agent UIDs, one directory).
+#
+# NO SECRET LIVES HERE. This file names a helper PATH and a bot identity. The
+# token is minted by the helper, per agent, from the per-agent scoped cache. So
+# 0644 (world-readable) is correct and required — every agent UID must read it.
+#
+# PRECEDENCE is safe: git reads system < global < local. /home/dev/.gitconfig
+# still exists for the dev user and for the contributor-relay/local-mode paths,
+# and it sets the SAME helper for the SAME hosts, so it shadows nothing. Agents
+# have no global config at all, so for them the system file is the only layer.
+#
+# HIVE_SYSTEM_GITCONFIG is a TEST SEAM (same convention as sharedAgentHome in
+# pkg/agent). It is never set in production; the regression test points it at a
+# temp file so it can exercise the real writer without touching /etc.
+hive_write_system_gitconfig() {
+  _hwsg_path="${HIVE_SYSTEM_GITCONFIG:-/etc/gitconfig}"
+  _hwsg_host="$(hive_ghe_git_host)"
+
+  # Refuse a planted symlink: /etc/gitconfig is read by every UID including
+  # root, so it must never be redirected somewhere agent-writable.
+  if [ -L "$_hwsg_path" ]; then
+    rm -f -- "$_hwsg_path" 2>/dev/null || true
+  fi
+
+  {
+    echo "# Managed by the hive entrypoint (hivecommons/hive#5343). Regenerated on every boot."
+    echo "# System-level so EVERY agent UID reads it regardless of \$HOME. Contains no secret:"
+    echo "# it names a helper path; the helper mints the per-agent scoped token."
+    echo "[user]"
+    echo "	name = kubestellar-hive"
+    echo "	email = hive-bot@kubestellar.io"
+    echo "[credential]"
+    echo "	helper = "
+    echo '[credential "https://github.com"]'
+    echo "	helper = /usr/local/bin/git-credential-hive.sh"
+    if [ -n "$_hwsg_host" ]; then
+      echo "[credential \"https://${_hwsg_host}\"]"
+      echo "	helper = /usr/local/bin/git-credential-hive.sh"
+    fi
+  } > "$_hwsg_path" 2>/dev/null || {
+    echo "[entrypoint] WARN: could not write $_hwsg_path — agents may be unable to push (see hivecommons/hive#5343)"
+    return 0
+  }
+  chmod 0644 "$_hwsg_path" 2>/dev/null || true
+  if [ -n "$_hwsg_host" ]; then
+    echo "[entrypoint] git credential helper wired system-wide in $_hwsg_path (github.com + GHE host ${_hwsg_host}) — readable by every agent UID"
+  else
+    echo "[entrypoint] git credential helper wired system-wide in $_hwsg_path (github.com) — readable by every agent UID"
   fi
 }
 
@@ -255,6 +560,7 @@ PYEOF
     # Write the (merged) config as the disaster-recovery snapshot. Always
     # under the new name; the legacy file is left untouched on the PVC.
     cp "$HIVE_CONFIG_PATH" "$HIVE_CONFIG_RUNTIME" 2>/dev/null || true
+    hive_harden_runtime_config "$HIVE_CONFIG_RUNTIME"
     echo "[entrypoint] K8s mode — ConfigMap is the seed, runtime config written to $HIVE_CONFIG_RUNTIME"
   else
     # Neither source exists: no runtime config on the PVC (checked first,
@@ -278,6 +584,7 @@ else
   if [ -f "$HIVE_CONFIG_PATH" ] && [ -s "$HIVE_CONFIG_PATH" ] && [ -z "$HIVE_CONFIG_SOURCE" ]; then
     # First boot: config exists but no PVC runtime config yet — seed it
     cp "$HIVE_CONFIG_PATH" "$HIVE_CONFIG_RUNTIME"
+    hive_harden_runtime_config "$HIVE_CONFIG_RUNTIME"
     echo "[entrypoint] First boot — config seeded to PVC: $HIVE_CONFIG_RUNTIME"
   elif [ -f "$HIVE_CONFIG_PATH" ] && [ -s "$HIVE_CONFIG_PATH" ] && [ -n "$HIVE_CONFIG_SOURCE" ]; then
     # The PVC runtime config is the source of truth (updated by Save()).
@@ -294,6 +601,7 @@ else
     # as the untouched fallback until Save() takes over writing the new one.
     if [ "$HIVE_CONFIG_SOURCE" = "$HIVE_CONFIG_RUNTIME_LEGACY" ]; then
       if cp "$HIVE_CONFIG_RUNTIME_LEGACY" "$HIVE_CONFIG_RUNTIME" 2>/dev/null; then
+        hive_harden_runtime_config "$HIVE_CONFIG_RUNTIME"
         echo "[entrypoint] Migration — seeded $HIVE_CONFIG_RUNTIME from legacy $HIVE_CONFIG_RUNTIME_LEGACY (legacy left in place)"
       fi
     fi
@@ -514,7 +822,7 @@ if [ "$(id -u)" = "0" ]; then
   # Shared CLI auth/cache lives in /data/home (persistent volume).
   # Make it group-writable so all agent UIDs (node group) can use it.
   # The manager sets HOME=/data/home for agent tmux sessions.
-  mkdir -p /data/home/.config /data/home/.copilot /data/home/.claude/session-env /data/home/.codex /data/home/.bob/settings /data/config/github-copilot /home/dev/.config
+  mkdir -p /data/home/.config /data/home/.copilot /data/home/.claude/session-env /data/home/.codex /data/home/.gemini/antigravity-cli /data/home/.bob/settings /data/config/github-copilot /home/dev/.config
   # $HOME itself must be group-writable, not just its children. bob calls
   # mkdirSync('$HOME/.bob') on first run, which needs write on /data/home — a
   # 0755 root-owned $HOME makes that EACCES even though every child dir below
@@ -538,6 +846,30 @@ if [ "$(id -u)" = "0" ]; then
   # codex backend fails with "Permission denied" initializing state_N.sqlite.
   chmod 2775 /data/home/.codex 2>/dev/null || true
   chown -R dev:node /data/home/.codex 2>/dev/null || true
+  # Antigravity (`agy`) persists its OAuth session to
+  # $HOME/.gemini/antigravity-cli/antigravity-oauth-token. Pre-create the tree
+  # group-writable + setgid for the same reason as .codex above.
+  #
+  # This was measured, not assumed. On a live hive .gemini existed at 2750 —
+  # group READ-only, because nothing here had ever created or repaired it and
+  # agy made it itself. The agent UID could not write the directory, so every
+  # sign-in succeeded in-process and then evaporated: `agy models` in any new
+  # process reported "Please sign in", and each hive restart lost the session
+  # again. The operator saw four consecutive logins "fail" with no error that
+  # named a permission. One chmod produced the token file immediately.
+  #
+  # 2770 rather than .codex's 2775: this directory holds an OAuth token, so it
+  # follows .copilot/.bob in keeping world off it.
+  #
+  # antigravity-cli/ is pre-created rather than left to agy (hivecommons/hive
+  # #5734). The token is one level DEEPER than the guard's watch, and a watch
+  # can only be established on a directory that exists — so a subdirectory agy
+  # creates itself after boot may never be covered, depending on the
+  # inotify-tools version's handling of directories created under a recursive
+  # watch. Creating it here removes that dependency entirely: the directory is
+  # on disk, with the right mode, before any watch is set up.
+  chmod 2770 /data/home/.gemini /data/home/.gemini/antigravity-cli 2>/dev/null || true
+  chown -R dev:node /data/home/.gemini 2>/dev/null || true
   # bob writes installation_id, settings.json, trustedFolders.json and tmp/ under
   # $HOME/.bob, plus custom modes under $HOME/.bob/settings. Pre-create both
   # group-writable + setgid so the FIRST agent to launch (a 2001+ UID in group
@@ -559,7 +891,7 @@ if [ "$(id -u)" = "0" ]; then
   # too so that gap cannot reopen.
   NEED_PERM_FIX=false
   if [ -d "/data/home/.copilot" ] && [ -d "/data/home/.claude" ]; then
-    for perm_dir in /data/home /data/home/.copilot /data/home/.claude /data/home/.bob; do
+    for perm_dir in /data/home /data/home/.copilot /data/home/.claude /data/home/.gemini /data/home/.bob; do
       # Missing dir → repair. Default 755 → repair (no group-write/setgid).
       DIR_PERMS=$(stat -c '%a' "$perm_dir" 2>/dev/null || echo "755")
       case "$DIR_PERMS" in
@@ -599,46 +931,202 @@ if [ "$(id -u)" = "0" ]; then
   # locking out other agent UIDs. Run inotify (if available) AND polling
   # as belt-and-suspenders — inotify is unreliable on NFS but instant on
   # local storage; polling is reliable everywhere but has a 5s delay.
+  #
+  # -- Why these loops are written so defensively (kubestellar/hive#5730) ------
+  #
+  # This file runs under `set -e`, and a `( ... ) &` subshell INHERITS it. One
+  # non-zero command in a guard body therefore does not merely skip a repair, it
+  # terminates that guard permanently for the life of the container. A `while
+  # inotifywait ...; do` is exempt from `set -e` only in its CONDITION; the body
+  # is not.
+  #
+  # That is not theoretical. Measured on a live standalone hive nine hours after
+  # boot (2026-09-02): of the four inotify guards, .copilot, .codex and .gemini
+  # were still running as root and the .claude one was gone — and the polling
+  # guard was gone too. The two dead loops were exactly the two that walked
+  # /data/home/.claude (161 MB, 8413 entries on that hive) with `chmod -R`.
+  # Claude Code writes into that tree constantly (history.jsonl,
+  # projects/*.jsonl, file-history/), and `chmod -R` returns non-zero the moment
+  # an entry vanishes mid-walk, which under `set -e` ends the subshell. `-qq`
+  # and `2>/dev/null` then erased the evidence, so the guard that keeps ONE
+  # operator login serving the whole fleet was simply absent, silently, while
+  # every agent but one dropped to a login prompt.
+  #
+  # Three rules follow, and every guard below obeys them:
+  #   1. No command in a loop body may be able to fail — `|| true` on each.
+  #   2. A watcher that exits is logged and restarted with backoff, never
+  #      treated as "this guard is finished".
+  #   3. Do not re-walk a churning multi-hundred-megabyte tree on every write.
+  #      The credential is what must be reopened instantly; the recursive sweep
+  #      belongs on the slow cycle, where a churn failure costs one cycle.
+  #
+  # The functions between the markers below are extracted and executed verbatim
+  # by src/deploy/test_entrypoint_perm_guard.sh — keep them self-contained.
+  #
+  # >>> hive perm guard functions
+
+  # hive_fix_shared_credential FILE — reopen one shared CLI credential to the
+  # node group. This is what the guards exist for: the CLIs rewrite these files
+  # 0600 as whichever agent UID refreshed the token, and every OTHER agent
+  # reaching the shared home through the `node` group is then locked out of a
+  # credential that is otherwise perfectly healthy — live access token, valid
+  # refresh grant, and a watchdog reporting an expired login that no re-login
+  # can fix.
+  #
+  # Group READ, not g+rwX: the CLIs replace the file by temp-file-and-rename in
+  # a group-writable directory, so no agent needs write on the file itself, and
+  # this is an OAuth token. The chown restores dev ownership as well, because
+  # that is the invariant the in-process Go permissions watcher depends on — it
+  # runs as dev after the privilege drop and can only chmod what dev owns.
+  hive_fix_shared_credential() {
+    [ -f "$1" ] || return 0
+    chmod g+r "$1" 2>/dev/null || true
+    chown dev:node "$1" 2>/dev/null || true
+    return 0
+  }
+
+  # hive_fix_copilot_config — copilot rewrites config.json 0600 on refresh.
+  hive_fix_copilot_config() {
+    [ -f /data/home/.copilot/config.json ] || return 0
+    chmod 660 /data/home/.copilot/config.json 2>/dev/null || true
+    chown dev:node /data/home/.copilot/config.json 2>/dev/null || true
+    return 0
+  }
+
+  # hive_fix_tree DIR — the recursive sweep, for trees that do not churn under
+  # an active CLI. Every arm is `|| true`: `chmod -R` over a live tree returns
+  # non-zero whenever an entry vanishes mid-walk, and that must cost one sweep,
+  # never the guard.
+  hive_fix_tree() {
+    [ -d "$1" ] || return 0
+    chmod -R g+rwX "$1" 2>/dev/null || true
+    find "$1" -type d -exec chmod g+s {} + 2>/dev/null || true
+    chown -R dev:node "$1" 2>/dev/null || true
+    return 0
+  }
+
+  # hive_fix_claude_instant — the INSTANT path for .claude. Deliberately does
+  # not touch the wider tree: that walk was 8413 entries per write event on the
+  # hive that produced #5730, and it is what killed this guard. The recursive
+  # sweep still happens, on the 5-minute cycle.
+  hive_fix_claude_instant() {
+    hive_fix_shared_credential /data/home/.claude/.credentials.json
+    chmod g+rwx /data/home/.claude 2>/dev/null || true
+    return 0
+  }
+
+  hive_fix_codex_instant() { hive_fix_tree /data/home/.codex; }
+
+  # agy writes antigravity-oauth-token 0600 owned by the agent that signed in,
+  # which locks every other agent UID out of a credential the shared CLI home
+  # exists to share — the same shape as copilot's config.json and claude's
+  # .credentials.json. Re-opening it to the node group is what makes ONE agy
+  # login serve the fleet instead of one login per agent.
+  #
+  # Credential first and NO tree walk, for the same reason the .claude instant
+  # path has none: this body now runs under a RECURSIVE watch (#5734), so it
+  # fires on writes anywhere under .gemini rather than only on the top level.
+  # The recursive sweep stays on the 5-minute cycle.
+  hive_fix_gemini_instant() {
+    hive_fix_shared_credential /data/home/.gemini/antigravity-cli/antigravity-oauth-token
+    chmod g+rwx /data/home/.gemini /data/home/.gemini/antigravity-cli 2>/dev/null || true
+    return 0
+  }
+
+  # hive_fix_credentials_fast — the 5s polling path. Bounded and cheap: the two
+  # files a CLI rewrites owner-only on a token refresh, and no tree walk at all.
+  # This is the backstop that would have repaired #5730 within five seconds.
+  hive_fix_credentials_fast() {
+    hive_fix_copilot_config
+    hive_fix_shared_credential /data/home/.claude/.credentials.json
+    hive_fix_shared_credential /data/home/.gemini/antigravity-cli/antigravity-oauth-token
+    return 0
+  }
+
+  hive_fix_slow_cycle() {
+    hive_fix_credentials_fast
+    for _t in /data/home/.cache /data/home/.copilot /data/home/.claude /data/home/.codex /data/home/.gemini /data/home/.bob; do
+      hive_fix_tree "$_t"
+    done
+    return 0
+  }
+
+  # hive_watch_once DIR EVENTS RECURSE — block until DIR changes, then return.
+  # RECURSE is "-r" to watch subdirectories too, "" for the directory alone.
+  #
+  # The depth matters, and getting it wrong is invisible (hivecommons/hive
+  # #5734). `inotifywait` without -r reports events only for entries DIRECTLY
+  # inside the watched directory, so the .gemini guard — watching
+  # /data/home/.gemini/ while agy keeps its token at
+  # .gemini/antigravity-cli/antigravity-oauth-token — could never fire. It was
+  # not merely untested: it was structurally incapable of firing, and it read
+  # as protection the whole time. Measured on a live hive: sixteen minutes and
+  # one token rewrite after boot, the .claude guard's inotifywait pid had
+  # advanced (its credential sits at depth 1) while .gemini's was still the
+  # boot pid.
+  #
+  # Recursion is per-guard, not the default: .claude is 161 MB and 8413 entries
+  # on a working hive, and watching it recursively would cost a watch per
+  # subdirectory for a credential that sits at the top level anyway.
+  hive_watch_once() {
+    if [ -n "$3" ]; then
+      inotifywait -qq -r -e "$2" "$1" 2>/dev/null
+    else
+      inotifywait -qq -e "$2" "$1" 2>/dev/null
+    fi
+  }
+
+  # hive_guard_forever LABEL DIR EVENTS BODY_FN [RECURSE] — run BODY_FN every
+  # time DIR changes, forever. Restarts the watcher when it exits (rule 2)
+  # instead of letting the loop end, which is exactly what a bare
+  # `while inotifywait; do` does the first time inotifywait returns non-zero:
+  # exits, silently, for good. RECURSE is "-r" for a guard whose credential
+  # lives below the watched directory.
+  hive_guard_forever() {
+    _label="$1"; _dir="$2"; _events="$3"; _body="$4"; _recurse="${5:-}"
+    _backoff=1
+    while true; do
+      if hive_watch_once "$_dir" "$_events" "$_recurse"; then
+        _backoff=1
+        "$_body" || true
+        continue
+      fi
+      # inotifywait failed (watch limit, the directory went away, a signal).
+      # Say so — the silence here is what made #5730 undiagnosable — then repair
+      # once and try again, so a hive with no working inotify at all is still
+      # served by this loop rather than only by the 5s poller.
+      echo "[entrypoint] WARN: perm guard '$_label' watcher exited on $_dir; repairing and retrying in ${_backoff}s"
+      "$_body" || true
+      sleep "$_backoff" || true
+      [ "$_backoff" -ge 60 ] || _backoff=$((_backoff * 2))
+    done
+  }
+  # <<< hive perm guard functions
+
   if command -v inotifywait >/dev/null 2>&1; then
-    (
-      while inotifywait -qq -e close_write,moved_to /data/home/.copilot/ 2>/dev/null; do
-        chmod 660 /data/home/.copilot/config.json 2>/dev/null
-        chown dev:node /data/home/.copilot/config.json 2>/dev/null
-      done
-    ) &
-    (
-      while inotifywait -qq -e close_write,moved_to,create /data/home/.claude/ 2>/dev/null; do
-        chmod -R g+rwX /data/home/.claude 2>/dev/null
-        find /data/home/.claude -type d -exec chmod g+s {} + 2>/dev/null
-        chown -R dev:node /data/home/.claude 2>/dev/null
-      done
-    ) &
-    (
-      while inotifywait -qq -e close_write,moved_to,create /data/home/.codex/ 2>/dev/null; do
-        chmod -R g+rwX /data/home/.codex 2>/dev/null
-        find /data/home/.codex -type d -exec chmod g+s {} + 2>/dev/null
-        chown -R dev:node /data/home/.codex 2>/dev/null
-      done
-    ) &
-    echo "[entrypoint] inotify perm guard active (copilot + claude + codex)"
+    hive_guard_forever copilot /data/home/.copilot/ close_write,moved_to hive_fix_copilot_config &
+    hive_guard_forever claude /data/home/.claude/ close_write,moved_to,create hive_fix_claude_instant &
+    hive_guard_forever codex /data/home/.codex/ close_write,moved_to,create hive_fix_codex_instant &
+    # -r: agy's token is one directory deeper than this watch (#5734).
+    hive_guard_forever gemini /data/home/.gemini/ close_write,moved_to,create hive_fix_gemini_instant -r &
+    echo "[entrypoint] inotify perm guard active (copilot + claude + codex + gemini)"
   fi
   (
     CYCLE=0
     while true; do
-      # Fast cycle: fix config.json every 5s (copilot rewrites it with 600)
-      chmod 660 /data/home/.copilot/config.json 2>/dev/null
-      chown dev:node /data/home/.copilot/config.json 2>/dev/null
-      # Slow cycle: fix entire /data/home tree every 5 min (new dirs from agents)
+      # Fast cycle every 5s: the credential files a CLI rewrites owner-only on a
+      # token refresh. Cheap and bounded — no tree walk on this path.
+      hive_fix_credentials_fast
+      # Slow cycle: sweep the shared dot-dirs every 5 min (new dirs from agents)
       CYCLE=$((CYCLE + 1))
       if [ "$CYCLE" -ge 60 ]; then
-        chmod -R g+rwX /data/home/.cache /data/home/.copilot /data/home/.claude /data/home/.codex /data/home/.bob 2>/dev/null
-        find /data/home/.cache /data/home/.claude /data/home/.codex /data/home/.bob -type d -exec chmod g+s {} + 2>/dev/null
+        hive_fix_slow_cycle
         CYCLE=0
       fi
-      sleep 5
+      sleep 5 || true
     done
   ) &
-  echo "[entrypoint] polling perm guard active (config.json 5s, cache 5m)"
+  echo "[entrypoint] polling perm guard active (credentials 5s, tree sweep 5m)"
   echo "[entrypoint] CLI config: /data/home (shared, group-writable for agent UIDs)"
 
   # Write .bashrc for agent shells. GH_TOKEN is NOT exported here — gh-wrapper.sh
@@ -661,12 +1149,35 @@ fi
 case ":$PATH:" in *:/usr/local/go/bin:*) ;; *) export PATH="$PATH:/usr/local/go/bin" ;; esac
 BASHRC
   chmod 644 /data/home/.bashrc 2>/dev/null || true
+  # Written by root via `cat >` above, so it is created root:root. Hand it to
+  # dev at the point of creation (#5369): the recursive /data chown is guarded
+  # off on every normal boot and cannot be relied on to fix it later.
+  chown dev:node /data/home/.bashrc 2>/dev/null || true
   # Login shells (tmux default-command) read ~/.profile, not ~/.bashrc — chain
   # them so both shell flavors get the same environment.
   if [ ! -f /data/home/.profile ]; then
     printf '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"\n' > /data/home/.profile 2>/dev/null || true
     chmod 644 /data/home/.profile 2>/dev/null || true
+    # Same as .bashrc above — created by root, so hand it over here (#5369).
+    chown dev:node /data/home/.profile 2>/dev/null || true
   fi
+
+  # ── #5369: targeted post-phase ownership sweep ────────────────────────
+  # Everything the root phase creates under /data has now been created. Hand
+  # the closed list of those paths (HIVE_DATA_ROOT_PHASE_PATHS, defined at the
+  # top of this script) to the runtime user by NAME.
+  #
+  # This is what restores the invariant the DATA_OWNER guard turned into a
+  # boot-time snapshot. It is NOT a substitute for the guard and does not
+  # weaken it: the guard still prevents the recursive walk over an NFS PVC,
+  # and this sweep is deliberately non-recursive over a fixed list so its cost
+  # does not scale with the size of the volume.
+  #
+  # Most sites above already chown at the point of creation, and this sweep
+  # skips anything already dev-owned — so on a steady-state boot it is a
+  # handful of stat() calls and nothing else. It is the backstop for the site
+  # that forgets, which is the failure mode #5369 is actually about.
+  hive_sweep_root_phase_paths
 
   # ── Per-agent UID isolation ──────────────────────────────────────────
   # Extract agent names from config + pack YAML, create system users,
@@ -803,7 +1314,7 @@ print('\n'.join(sorted(names)))
       # the agent UID. A derived gid (e.g. uid+1000) can collide with an
       # existing group; letting groupadd pick from the system range cannot.
       #
-      # Verified in ghcr.io/kubestellar/hive:v2-latest: dev writes in place OK,
+      # Verified in ghcr.io/hivecommons/hive:v2-latest: dev writes in place OK,
       # the owning agent reads its own token OK, and a second agent gets
       # EACCES on the first agent's token.
       AGENT_TOKEN_GROUP="hive-${agent_name}"
@@ -862,6 +1373,34 @@ print('[entrypoint] UID map written to /var/run/hive/uid-map.json')
     PROXY_PORT=18443
     PROXY_ADVISORY_OK="${HIVE_PROXY_ADVISORY_OK:-false}"
     _iptables_ok=false
+    _ipt_err_log="${HIVE_IPTABLES_ERR_LOG:-/var/run/hive/hive-ipt-err.log}"
+    # Set by the extension preflight below when a REQUIRED netfilter match or
+    # target is not loadable on this node. Read by the FATAL branch at the end
+    # of the gate so the operator gets ONE line naming the kernel module rather
+    # than exit 4 at whichever append happened to be first (#6003).
+    _ipt_missing_modules=""
+
+    hive_iptables_error_text() {
+      _hive_ipt_err_text="$(cat "$1" 2>/dev/null || true)"
+      [ -n "$_hive_ipt_err_text" ] || _hive_ipt_err_text="no stderr captured"
+      printf '%s' "$_hive_ipt_err_text"
+      unset _hive_ipt_err_text
+    }
+
+    hive_run_iptables_required() {
+      _hive_ipt_desc="$1"
+      _hive_ipt_err_file="$2"
+      shift 2
+      if "$@" 2>"$_hive_ipt_err_file"; then
+        unset _hive_ipt_desc _hive_ipt_err_file
+        return 0
+      else
+        _hive_ipt_rc=$?
+        echo "[entrypoint] ERROR: ${_hive_ipt_desc} failed (exit ${_hive_ipt_rc}): $(hive_iptables_error_text "$_hive_ipt_err_file")" >&2
+        unset _hive_ipt_desc _hive_ipt_err_file _hive_ipt_rc
+        return 1
+      fi
+    }
 
     # Select the iptables binary. Both OKE and OpenShift/RHEL9 hosts run the
     # kernel in nft mode, where the legacy `iptables` (xtables-legacy) backend
@@ -876,6 +1415,99 @@ print('[entrypoint] UID map written to /var/run/hive/uid-map.json')
     fi
 
     if [ -n "$IPT" ]; then
+      hive_flush_iptables_proxy_chain() {
+        # Remove any stale hook first, then flush the chain. A failed rebuild
+        # must leave no partial HIVE_PROXY ruleset that looks enforcing but
+        # redirects nothing.
+        while $IPT -t nat -D OUTPUT -j HIVE_PROXY 2>/dev/null; do :; done
+        if $IPT -t nat -nL HIVE_PROXY >/dev/null 2>&1; then
+          $IPT -t nat -F HIVE_PROXY 2>/dev/null || true
+        fi
+      }
+
+      # HIVE-EGRESS-PREFLIGHT-BEGIN (extracted by test_entrypoint_xt_module_preflight.sh)
+      # ── Netfilter extension preflight (#6003) ─────────────────────────────
+      # The two rules the gate CANNOT do without are the :443 REDIRECT (the
+      # enforcement itself) and the packet-mark RETURN (the proxy's own
+      # self-exemption, the only one that works where xt_owner is absent).
+      # Both are kernel EXTENSIONS: iptables happily creates the chain and then
+      # fails the individual `-A` with "Extension <x> revision 0 not supported,
+      # missing kernel module?" / RULE_APPEND failed (No such file or directory)
+      # when the node has not loaded the matching xt_* module.
+      #
+      # Probe them in a THROWAWAY chain first, so the diagnosis happens before
+      # any part of the real ruleset exists. Two properties matter here:
+      #
+      #   1. The operator gets the module NAME. On 2026-09-04 one RHEL CoreOS
+      #      node out of two (fmaas-vllm-d-wv25b-worker-2-4ptps) had neither
+      #      xt_owner nor xt_REDIRECT loaded; 17 spokes crashlooped to 77
+      #      restarts, and the only clue was exit 4 from an arbitrary append.
+      #   2. Nothing half-built is ever installed. A spoke on the HEALTHY node
+      #      survived the same append failures with a partial HIVE_PROXY chain
+      #      and went MUTE instead of crashing - 104 proxy read timeouts, 34
+      #      heartbeat collect timeouts, zero successful collections, no
+      #      git_hash reported, so the hub never upgraded it and it ran a stale
+      #      image for hours while reporting healthy. A crashloop is visible; a
+      #      green-but-unenforced hive is not. Fail loudly, never fail open.
+      hive_iptables_probe_extension() {
+        # $1 = human label, $2 = xt module name, rest = rule spec fragment.
+        _hive_probe_label="$1"
+        _hive_probe_module="$2"
+        shift 2
+        if $IPT -t nat -A HIVE_PROXY_PREFLIGHT "$@" 2>"$_ipt_err_log"; then
+          unset _hive_probe_label _hive_probe_module
+          return 0
+        fi
+        echo "[entrypoint] ERROR: netfilter ${_hive_probe_label} unavailable on this node (kernel module ${_hive_probe_module}): $(hive_iptables_error_text "$_ipt_err_log")" >&2
+        _ipt_missing_modules="${_ipt_missing_modules}${_ipt_missing_modules:+, }${_hive_probe_module}"
+        unset _hive_probe_label _hive_probe_module
+        return 1
+      }
+
+      # The probe chain is created, used, then unconditionally torn down. It is
+      # never hooked into OUTPUT, so it can match no traffic even mid-probe.
+      $IPT -t nat -F HIVE_PROXY_PREFLIGHT 2>/dev/null || true
+      $IPT -t nat -X HIVE_PROXY_PREFLIGHT 2>/dev/null || true
+      if $IPT -w 10 -t nat -N HIVE_PROXY_PREFLIGHT 2>"$_ipt_err_log"; then
+        hive_iptables_probe_extension "packet-mark match" "xt_mark" \
+          -m mark --mark "$HIVE_PROXY_EGRESS_MARK" -j RETURN || true
+        hive_iptables_probe_extension "REDIRECT target" "xt_REDIRECT" \
+          -p tcp --dport 443 -j REDIRECT --to-ports "$PROXY_PORT" || true
+        # xt_owner is OPTIONAL by design (OpenShift/OVN runs without it and the
+        # mark exemption covers the proxy there), so its absence is reported as
+        # context on the same operator-facing line but never blocks startup.
+        if ! $IPT -t nat -A HIVE_PROXY_PREFLIGHT -m owner --uid-owner 0 -j RETURN 2>/dev/null; then
+          echo "[entrypoint] WARN: netfilter owner match unavailable on this node (kernel module xt_owner); the packet-mark exemption will carry the proxy's own egress"
+        fi
+        $IPT -t nat -F HIVE_PROXY_PREFLIGHT 2>/dev/null || true
+        $IPT -t nat -X HIVE_PROXY_PREFLIGHT 2>/dev/null || true
+      else
+        # Could not even create the probe chain. That is not an extension
+        # problem - leave $_ipt_missing_modules empty and let the existing
+        # chain-creation retry/reporting path below diagnose it.
+        echo "[entrypoint] WARN: could not create preflight chain to probe netfilter extensions: $(hive_iptables_error_text "$_ipt_err_log")"
+      fi
+
+      if [ -n "$_ipt_missing_modules" ]; then
+        # Make sure nothing from an earlier boot of this container is left
+        # installed and looking enforcing, then refuse to start.
+        hive_flush_iptables_proxy_chain
+        $IPT -t nat -X HIVE_PROXY 2>/dev/null || true
+        if [ "$PROXY_ADVISORY_OK" = "true" ]; then
+          # Same explicit operator opt-in the rest of the gate honours: the
+          # deployment has already declared it accepts unenforced egress. Leave
+          # _iptables_ok=false so the ADVISORY-ONLY warning below still fires.
+          echo "[entrypoint] WARN: this node's kernel is missing netfilter module(s) required by the forced-egress gate: ${_ipt_missing_modules}. Continuing because HIVE_PROXY_ADVISORY_OK=true - agents can bypass the MITM proxy on this node."
+        else
+        echo "[entrypoint] FATAL: this node's kernel is missing netfilter module(s) required by the forced-egress gate: ${_ipt_missing_modules}." >&2
+        echo "[entrypoint] FATAL: without them the HIVE_PROXY chain would redirect nothing, so agents holding raw tokens could reach the network unproxied while the spoke reported healthy. Refusing to start." >&2
+        echo "[entrypoint] FATAL: load the module(s) on this node - the durable fix is a MachineConfig writing an /etc/modules-load.d/ drop-in (for example /etc/modules-load.d/hive-netfilter.conf containing xt_owner and xt_REDIRECT), so they survive a node rebuild. Until then, taint or label the node so hive pods are not scheduled onto it." >&2
+        echo "[entrypoint] FATAL: exiting ${EXIT_NET_ADMIN_REQUIRED} (EX_NOPERM) rather than 1 - see EXIT_NET_ADMIN_REQUIRED near the top of entrypoint.sh." >&2
+        exit "$EXIT_NET_ADMIN_REQUIRED"
+        fi
+      fi
+      # HIVE-EGRESS-PREFLIGHT-END
+
       # Self-exemption uses BOTH owner-UID and packet-mark RETURNs, because the
       # two platforms we run on each support a DIFFERENT one, and a single
       # mechanism is not enough for both:
@@ -916,30 +1548,50 @@ print('[entrypoint] UID map written to /var/run/hive/uid-map.json')
         # A leftover chain from a prior partial attempt counts as created —
         # flush it so rule appends below start from a clean slate.
         if $IPT -t nat -nL HIVE_PROXY >/dev/null 2>&1; then
-          $IPT -t nat -F HIVE_PROXY 2>/dev/null || true
+          hive_flush_iptables_proxy_chain
           _ipt_chain_ok=true
           break
         fi
-        if $IPT -w 10 -t nat -N HIVE_PROXY 2>/tmp/hive-ipt-err.log; then
+        if $IPT -w 10 -t nat -N HIVE_PROXY 2>"$_ipt_err_log"; then
           _ipt_chain_ok=true
           break
         fi
-        echo "[entrypoint] WARN: iptables chain creation attempt ${_ipt_try}/5 failed: $(cat /tmp/hive-ipt-err.log 2>/dev/null) — retrying"
+        echo "[entrypoint] WARN: iptables chain creation attempt ${_ipt_try}/5 failed: $(hive_iptables_error_text "$_ipt_err_log") — retrying"
         sleep $(( _ipt_try * 2 + $$ % 3 ))
       done
+      # HIVE-EGRESS-RULESET-V4-BEGIN (extracted by test_entrypoint_egress_ruleset.sh)
       if [ "$_ipt_chain_ok" = "true" ]; then
         # OKE: owner-match exemption (reliable where xt_owner is present).
         # `|| true` keeps a failed append non-fatal on OpenShift (no xt_owner).
-        $IPT -t nat -A HIVE_PROXY -m owner --uid-owner 0 -j RETURN || true
-        $IPT -t nat -A HIVE_PROXY -m owner --uid-owner "$PROXY_UID" -j RETURN || true
+        if $IPT -t nat -A HIVE_PROXY -m owner --uid-owner 0 -j RETURN 2>"$_ipt_err_log"; then
+          :
+        else
+          echo "[entrypoint] WARN: optional iptables owner exemption for uid 0 failed: $(hive_iptables_error_text "$_ipt_err_log")"
+        fi
+        if $IPT -t nat -A HIVE_PROXY -m owner --uid-owner "$PROXY_UID" -j RETURN 2>"$_ipt_err_log"; then
+          :
+        else
+          echo "[entrypoint] WARN: optional iptables owner exemption for proxy uid ${PROXY_UID} failed: $(hive_iptables_error_text "$_ipt_err_log")"
+        fi
         # OpenShift/OVN: packet-mark exemption (works with no xt_owner).
-        $IPT -t nat -A HIVE_PROXY -m mark --mark "$HIVE_PROXY_EGRESS_MARK" -j RETURN
-        $IPT -t nat -A HIVE_PROXY -p tcp --dport 443 -j REDIRECT --to-ports "$PROXY_PORT"
-        $IPT -t nat -A OUTPUT -j HIVE_PROXY
-        echo "[entrypoint] iptables ($IPT): outbound :443 -> :${PROXY_PORT} (proxy UID ${PROXY_UID} + egress mark ${HIVE_PROXY_EGRESS_MARK} exempt)"
-        _iptables_ok=true
-        # Update uid-map to record iptables active
-        python3 -c "
+        _ipt_rules_ok=true
+        if ! hive_run_iptables_required "iptables packet-mark exemption append" "$_ipt_err_log" \
+          "$IPT" -t nat -A HIVE_PROXY -m mark --mark "$HIVE_PROXY_EGRESS_MARK" -j RETURN; then
+          _ipt_rules_ok=false
+        fi
+        if [ "$_ipt_rules_ok" = "true" ] && ! hive_run_iptables_required "iptables HTTPS REDIRECT append" "$_ipt_err_log" \
+          "$IPT" -t nat -A HIVE_PROXY -p tcp --dport 443 -j REDIRECT --to-ports "$PROXY_PORT"; then
+          _ipt_rules_ok=false
+        fi
+        if [ "$_ipt_rules_ok" = "true" ] && ! hive_run_iptables_required "iptables OUTPUT hook append" "$_ipt_err_log" \
+          "$IPT" -t nat -A OUTPUT -j HIVE_PROXY; then
+          _ipt_rules_ok=false
+        fi
+        if [ "$_ipt_rules_ok" = "true" ]; then
+          echo "[entrypoint] iptables ($IPT): outbound :443 -> :${PROXY_PORT} (proxy UID ${PROXY_UID} + egress mark ${HIVE_PROXY_EGRESS_MARK} exempt)"
+          _iptables_ok=true
+          # Update uid-map to record iptables active
+          python3 -c "
 import json
 with open('/var/run/hive/uid-map.json') as f:
     m = json.load(f)
@@ -947,9 +1599,15 @@ m['iptables_active'] = True
 with open('/var/run/hive/uid-map.json', 'w') as f:
     json.dump(m, f, indent=2)
 " 2>/dev/null || true
+        else
+          hive_flush_iptables_proxy_chain
+          echo "[entrypoint] ERROR: iptables ruleset incomplete; flushed HIVE_PROXY and left IPv4 forced proxy egress disabled"
+        fi
+        unset _ipt_rules_ok
       else
-        echo "[entrypoint] ERROR: iptables chain creation failed after ${_ipt_try} attempts: $(cat /tmp/hive-ipt-err.log 2>/dev/null)"
+        echo "[entrypoint] ERROR: iptables chain creation failed after ${_ipt_try} attempts: $(hive_iptables_error_text "$_ipt_err_log")"
       fi
+      # HIVE-EGRESS-RULESET-V4-END
     else
       echo "[entrypoint] ERROR: iptables not found — cannot force proxy egress"
     fi
@@ -1035,6 +1693,14 @@ with open('/var/run/hive/uid-map.json', 'w') as f:
         IP6T="ip6tables"
       fi
       if [ -n "$IP6T" ]; then
+        _ip6t_err_log="${HIVE_IP6TABLES_ERR_LOG:-/var/run/hive/hive-ip6t-err.log}"
+        hive_flush_ip6tables_proxy_chain() {
+          while $IP6T -D OUTPUT -j HIVE_PROXY6 2>/dev/null; do :; done
+          if $IP6T -nL HIVE_PROXY6 >/dev/null 2>&1; then
+            $IP6T -F HIVE_PROXY6 2>/dev/null || true
+          fi
+        }
+
         # Same jittered chain-creation retry as the IPv4 gate: one-shot
         # creation turns transient netlink/xtables contention into a
         # fail-closed crash-loop (see the 2026-08-13 note above).
@@ -1043,32 +1709,59 @@ with open('/var/run/hive/uid-map.json', 'w') as f:
         while [ "$_ip6_try" -lt 5 ]; do
           _ip6_try=$((_ip6_try + 1))
           if $IP6T -nL HIVE_PROXY6 >/dev/null 2>&1; then
-            $IP6T -F HIVE_PROXY6 2>/dev/null || true
+            hive_flush_ip6tables_proxy_chain
             _ip6_chain_ok=true
             break
           fi
-          if $IP6T -w 10 -N HIVE_PROXY6 2>/tmp/hive-ip6t-err.log; then
+          if $IP6T -w 10 -N HIVE_PROXY6 2>"$_ip6t_err_log"; then
             _ip6_chain_ok=true
             break
           fi
-          echo "[entrypoint] WARN: ip6tables chain creation attempt ${_ip6_try}/5 failed: $(cat /tmp/hive-ip6t-err.log 2>/dev/null) — retrying"
+          echo "[entrypoint] WARN: ip6tables chain creation attempt ${_ip6_try}/5 failed: $(hive_iptables_error_text "$_ip6t_err_log") — retrying"
           sleep $(( _ip6_try * 2 + $$ % 3 ))
         done
+        # HIVE-EGRESS-RULESET-V6-BEGIN (extracted by test_entrypoint_egress_ruleset.sh)
         if [ "$_ip6_chain_ok" = "true" ]; then
           # Exemptions mirror the IPv4 chain exactly, in the same order, for
           # the same two-platform reasons (owner-UID where xt_owner exists,
           # packet mark where it does not). `|| true` on the owner lines keeps
           # their failure non-fatal on hosts without xt_owner.
-          $IP6T -A HIVE_PROXY6 -m owner --uid-owner 0 -j RETURN || true
-          $IP6T -A HIVE_PROXY6 -m owner --uid-owner "$PROXY_UID" -j RETURN || true
-          $IP6T -A HIVE_PROXY6 -m mark --mark "$HIVE_PROXY_EGRESS_MARK" -j RETURN
-          $IP6T -A HIVE_PROXY6 -p tcp --dport 443 -j REJECT --reject-with tcp-reset
-          $IP6T -A OUTPUT -j HIVE_PROXY6
-          echo "[entrypoint] ip6tables ($IP6T): outbound IPv6 :443 REJECTed (proxy has no IPv6 listener; proxy UID ${PROXY_UID} + egress mark ${HIVE_PROXY_EGRESS_MARK} exempt)"
-          _ip6tables_ok=true
+          if $IP6T -A HIVE_PROXY6 -m owner --uid-owner 0 -j RETURN 2>"$_ip6t_err_log"; then
+            :
+          else
+            echo "[entrypoint] WARN: optional ip6tables owner exemption for uid 0 failed: $(hive_iptables_error_text "$_ip6t_err_log")"
+          fi
+          if $IP6T -A HIVE_PROXY6 -m owner --uid-owner "$PROXY_UID" -j RETURN 2>"$_ip6t_err_log"; then
+            :
+          else
+            echo "[entrypoint] WARN: optional ip6tables owner exemption for proxy uid ${PROXY_UID} failed: $(hive_iptables_error_text "$_ip6t_err_log")"
+          fi
+          _ip6_rules_ok=true
+          if ! hive_run_iptables_required "ip6tables packet-mark exemption append" "$_ip6t_err_log" \
+            "$IP6T" -A HIVE_PROXY6 -m mark --mark "$HIVE_PROXY_EGRESS_MARK" -j RETURN; then
+            _ip6_rules_ok=false
+          fi
+          if [ "$_ip6_rules_ok" = "true" ] && ! hive_run_iptables_required "ip6tables IPv6 HTTPS REJECT append" "$_ip6t_err_log" \
+            "$IP6T" -A HIVE_PROXY6 -p tcp --dport 443 -j REJECT --reject-with tcp-reset; then
+            _ip6_rules_ok=false
+          fi
+          if [ "$_ip6_rules_ok" = "true" ] && ! hive_run_iptables_required "ip6tables OUTPUT hook append" "$_ip6t_err_log" \
+            "$IP6T" -A OUTPUT -j HIVE_PROXY6; then
+            _ip6_rules_ok=false
+          fi
+          if [ "$_ip6_rules_ok" = "true" ]; then
+            echo "[entrypoint] ip6tables ($IP6T): outbound IPv6 :443 REJECTed (proxy has no IPv6 listener; proxy UID ${PROXY_UID} + egress mark ${HIVE_PROXY_EGRESS_MARK} exempt)"
+            _ip6tables_ok=true
+          else
+            hive_flush_ip6tables_proxy_chain
+            echo "[entrypoint] ERROR: ip6tables ruleset incomplete; flushed HIVE_PROXY6 and left IPv6 egress gate disabled"
+          fi
+          unset _ip6_rules_ok
         else
-          echo "[entrypoint] ERROR: ip6tables chain creation failed after ${_ip6_try} attempts: $(cat /tmp/hive-ip6t-err.log 2>/dev/null)"
+          echo "[entrypoint] ERROR: ip6tables chain creation failed after ${_ip6_try} attempts: $(hive_iptables_error_text "$_ip6t_err_log")"
         fi
+        unset _ip6t_err_log
+        # HIVE-EGRESS-RULESET-V6-END
       else
         echo "[entrypoint] ERROR: ip6tables not found — IPv6 egress cannot be gated"
       fi
@@ -1115,6 +1808,26 @@ with open('/var/run/hive/uid-map.json', 'w') as f:
   # block (before the forced-egress FATAL check above) — reused here rather
   # than re-derived, since it can't have changed and the FATAL branch's exit
   # code already depends on the two staying the same value.
+
+  # ── System-wide git credential helper (#5343) ───────────────────────────
+  # MUST happen here, in the root phase: /etc is root-owned, and the dev phase
+  # below cannot write it. This is the ONLY git config any per-agent UID reads
+  # — their $HOME (/data/home/agents/<name>) has no .gitconfig of its own.
+  hive_write_system_gitconfig
+
+  # ── #5369: last chance to name a handover we missed ───────────────────
+  # This is the final instruction of the root phase. Every root-phase write
+  # under /data has happened and the sweep has run; the next statement execs
+  # as uid 1001 and can no longer chown anything. So verify HERE that the
+  # paths the hive process must read are readable by the user it is about to
+  # become, and if any is not, print WHICH ONE with its owner and mode.
+  #
+  # The config paths are included explicitly alongside the swept list because
+  # they are the ones whose failure is fatal — an unreadable
+  # /data/hive.yaml.runtime is #5360 verbatim, and it is the exact fault this
+  # assertion exists to name in one line instead of four merges.
+  hive_assert_runtime_readable $HIVE_DATA_ROOT_PHASE_PATHS \
+    "$HIVE_CONFIG_RUNTIME" "$HIVE_CONFIG_RUNTIME_LEGACY" /data/hive.yaml.dashboard
 
   # setpriv identity mirrors `gosu dev` exactly: reuid=dev (UID 1001), regid=node
   # (dev's PRIMARY login group, GID 1000 — there is NO group named `dev`), and
@@ -1210,7 +1923,25 @@ if [ -n "${HIVE_WIKI_GIT_URL:-}" ] && [ ! -d /data/vaults/hive-wiki/.git ]; then
 fi
 mkdir -p /data/vaults/hive-wiki
 
-# Configure git identity and credential helper for GitHub App token
+# Configure git identity and credential helper for GitHub App token.
+#
+# TWO LAYERS, DELIBERATELY (#5343):
+#
+#  1. /etc/gitconfig (SYSTEM) — written in the root phase above by
+#     hive_write_system_gitconfig. This is the layer that matters for AGENTS:
+#     every per-agent UID runs with its own $HOME (/data/home/agents/<name>)
+#     which has no .gitconfig, so the system file is the ONLY config they read.
+#
+#  2. ~dev/.gitconfig (GLOBAL, this block) — the dev user's own config, which
+#     the contributor-relay / local-mode / `just contribute-*` paths and any
+#     interactive `docker exec` shell have always used. Kept because those
+#     paths are not agent-UID paths, and because a hive that could not become
+#     root (the "continuing as root" / already-non-root boot) never reaches
+#     layer 1 at all — this block is then the only wiring there is.
+#
+# These do not fight: git precedence is system < global < local, and both
+# layers set the SAME helper for the SAME hosts, so the global layer shadows
+# nothing. What went wrong before was having ONLY layer 2.
 git config --global user.name "kubestellar-hive"
 git config --global user.email "hive-bot@kubestellar.io"
 git config --global --replace-all credential.helper ""
@@ -1229,39 +1960,32 @@ git config --global --replace-all "credential.https://github.com.helper" "/usr/l
 # and quality (which talk to the GitHub API, not git-over-HTTPS) worked fine
 # while guide's `git clone` could not authenticate at all.
 #
-# The host is derived the same way the Go binary's GitHubConfig.HostLabel()
-# derives it (pkg/config/config.go): prefer github.base_url, fall back to the
-# host portion of github.api_url, strip scheme and a trailing /api/v3, default
-# to github.com. Reading it here (from the same hive.yaml the Go binary reads)
-# rather than hardcoding "github.ibm.com" keeps this general for ANY configured
-# GHE host, and a no-op for a plain github.com hive (GHE_GIT_HOST resolves to
-# "github.com", which already has its helper wired above).
-GHE_GIT_HOST=""
-if [ -f "${HIVE_CONFIG:-/etc/hive/hive.yaml}" ]; then
-  GHE_GIT_HOST=$(python3 -c "
-import sys, yaml
-try:
-    with open(sys.argv[1]) as f:
-        cfg = yaml.safe_load(f) or {}
-except Exception:
-    sys.exit(0)
-gh = cfg.get('github') or {}
-pick = (gh.get('base_url') or gh.get('api_url') or '').strip()
-if pick.startswith('https://'):
-    pick = pick[len('https://'):]
-elif pick.startswith('http://'):
-    pick = pick[len('http://'):]
-pick = pick.rstrip('/')
-if pick.endswith('/api/v3'):
-    pick = pick[: -len('/api/v3')]
-host = pick.split('/', 1)[0]
-if host and host.lower() != 'api.github.com' and host.lower() != 'github.com':
-    print(host)
-" "${HIVE_CONFIG:-/etc/hive/hive.yaml}" 2>/dev/null) || true
-fi
+# The host derivation lives in hive_ghe_git_host() at the top of this file so
+# the system and global layers cannot drift apart.
+GHE_GIT_HOST="$(hive_ghe_git_host)"
 if [ -n "$GHE_GIT_HOST" ]; then
   git config --global --replace-all "credential.https://${GHE_GIT_HOST}.helper" "/usr/local/bin/git-credential-hive.sh"
   echo "[entrypoint] git credential helper wired for GitHub Enterprise host: ${GHE_GIT_HOST}"
+fi
+
+# ── Startup assertion: is the helper actually reachable from an AGENT UID? ──
+#
+# The whole point of #5343 is that the wiring LOOKED right (it was present in
+# ~dev/.gitconfig) while being invisible to every agent. So assert the property
+# that actually matters — "a process whose $HOME is not /home/dev resolves the
+# helper" — rather than "we ran git config successfully".
+#
+# HOME=/nonexistent is the cheapest faithful stand-in for an agent UID here:
+# it removes the global layer exactly the way an agent's own empty $HOME does,
+# leaving only the system layer under test. GIT_CONFIG_NOSYSTEM is explicitly
+# NOT set — the system layer is the thing being verified.
+_cred_probe_host="${GHE_GIT_HOST:-github.com}"
+_cred_probe="$(HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent \
+  git config --get-regexp "^credential\." 2>/dev/null | grep -c "git-credential-hive.sh" || true)"
+if [ "${_cred_probe:-0}" -gt 0 ]; then
+  echo "[entrypoint] git credential helper VERIFIED reachable without a per-user .gitconfig (system layer, ${_cred_probe} host entries; agent UIDs will resolve it for ${_cred_probe_host})"
+else
+  echo "[entrypoint] WARN: git credential helper is NOT reachable from a process without a per-user .gitconfig. Every per-agent UID will commit branches it cannot push, and hive-open-pr will report the branch as missing from the remote. Check that /etc/gitconfig exists and is mode 0644. See hivecommons/hive#5343."
 fi
 
 # Generate initial GitHub App token if credentials are available

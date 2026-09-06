@@ -34,7 +34,7 @@ would have been wrong.
 | Network backend | netavark, rootless helper `pasta` |
 | cgroups | v2 |
 | Kernel / host | 7.1.4-200.fc44.x86_64, Aurora (Fedora) 44.20260815.1, SELinux enforcing |
-| Image | `ghcr.io/kubestellar/hive:v4-latest`, digest `sha256:e1479d76c453cdd8271be76913a1544d5b70fd3569adebdd388bdd4632b4a263` |
+| Image | `ghcr.io/hivecommons/hive:v4-latest`, digest `sha256:e1479d76c453cdd8271be76913a1544d5b70fd3569adebdd388bdd4632b4a263` |
 | Architecture | `amd64` only |
 
 Every container, image, and volume went into a throwaway store with a private
@@ -229,7 +229,7 @@ that rootless cannot enforce; it does not finish the argument.
 
 ## References
 
-- [`src/deploy/entrypoint.sh`](https://github.com/kubestellar/hive/blob/v4/src/deploy/entrypoint.sh) — `EXIT_NET_ADMIN_REQUIRED`, the bounding-set probe, and the fail-closed branch.
+- [`src/deploy/entrypoint.sh`](https://github.com/hivecommons/hive/blob/v4/src/deploy/entrypoint.sh) — `EXIT_NET_ADMIN_REQUIRED`, the bounding-set probe, and the fail-closed branch.
 - [Podman support matrix](podman-support-matrix.md) — the support decision this spike feeds: rootless + enforcing started as **experimental** on this spike's evidence and was promoted to **supported** by #4487, which measured the three promotion criteria this spike named.
-- [NET_ADMIN requirement](https://github.com/kubestellar/hive/blob/v4/src/docs/net-admin-requirement.md)
-- [Security model](https://github.com/kubestellar/hive/blob/v4/src/docs/security-model.md)
+- [NET_ADMIN requirement](https://github.com/hivecommons/hive/blob/v4/src/docs/net-admin-requirement.md)
+- [Security model](https://github.com/hivecommons/hive/blob/v4/src/docs/security-model.md)

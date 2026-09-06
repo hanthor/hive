@@ -2,6 +2,8 @@
 
 Hive reports dashboard health from both the spoke and hub vantage points. The newer checks replace the old assumption that the public hub can always probe every spoke URL directly.
 
+This page covers *reachability* — HTTP probes of the dashboard URL and route. For the per-hive green/amber/red/unknown *output* verdict on `/fleet` (the WHY chip and remediation hints), see [fleet health](fleet-health.md): a hive can pass every probe here and still be red there.
+
 ## Kubernetes RBAC
 
 Apply the dashboard route RBAC manifest with the other Kubernetes resources:
@@ -45,3 +47,9 @@ Hive raises URL health alerts conservatively:
 
 Hub-side hysteresis requires consecutive failures, a minimum hive age, and repeated dashboard evaluations before a critical URL alert reaches the Attention panel. Cluster-wide outages are rolled up instead of paging every hive individually.
 
+
+## Spoke deep-health agent and token checks
+
+The spoke `HealthSummary` treats quiet-by-design agents as idle, not failed. A stopped agent whose config is `on_demand: true`, whose ACMM pack marks it on-demand, or whose current governor-mode cadence is paused/off-schedule is reported in the agents check as `idle (on-demand)` or `idle (off-schedule)` rather than `down`. Paused agents remain a separate non-failing bucket; only expected-active agents that are stopped or failed count as `down`.
+
+The token check no longer emits a bare `zero consumed` warning for every zero-token hive. It reports the best available reason, such as all agents paused, no agents due in the current governor mode, no model calls recorded, metering disabled or misconfigured, a parser/sink error, or live-capture/open sessions whose usage has not been accounted yet. All-paused and no-due windows are skipped instead of warning.

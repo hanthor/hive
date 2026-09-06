@@ -33,7 +33,7 @@ the target cluster.
 | | **Hub-reachable cluster** (vanilla Kubernetes) | **Heartbeat-only cluster** (OpenShift) |
 |---|---|---|
 | Hub reachability | Hub **can** `kubectl` → **automated** provisioning | Hub is **heartbeat-only** → **manual** provisioning |
-| Dashboard routing | nginx **Ingress**, host `<id>.hive.kubestellar.io` | OpenShift **Route**, host `<id>.apps.<your-cluster-domain>` |
+| Dashboard routing | nginx **Ingress**, host `<id>.hive.hivecommons.dev` | OpenShift **Route**, host `<id>.apps.<your-cluster-domain>` |
 | Auth in front of the dashboard | Hub's nginx ingress runs `auth-url` → `/api/saas/auth-check`, injecting `X-Hive-User` / `X-Hive-Role`. Spokes need **no** own OAuth. | No hub auth proxy. Each spoke runs its **own** GitHub device-flow login (`oauth_client_id`, `hub_proxied: false`). |
 | Pod security | Standard Kubernetes; empty `securityContext`. | OpenShift SCC. The pod **must** run under the `anyuid` SCC (the entrypoint `chown`s the PVC as root). Without it the pod lands on `restricted-v2` and crash-loops. |
 | Storage | RWX volume, default storage class. | RWX on `ocs-storagecluster-cephfs`. |
@@ -99,13 +99,13 @@ workload (`src/deploy/k8s`) and an in-cluster OpenAI-compatible inference backen
 model endpoint out of the box. See the overlay and its README here:
 
 - **Standalone overlay** —
-  [github.com/kubestellar/hive/tree/v4/src/deploy/kustomize/overlays/standalone](https://github.com/kubestellar/hive/tree/v4/src/deploy/kustomize/overlays/standalone)
+  [github.com/hivecommons/hive/tree/v4/src/deploy/kustomize/overlays/standalone](https://github.com/hivecommons/hive/tree/v4/src/deploy/kustomize/overlays/standalone)
   (annotated `patch-configmap.yaml`, `patch-pvc-storageclass.yaml`,
   `patch-advisory-mode.yaml`, and a
-  [`README.md`](https://github.com/kubestellar/hive/blob/v4/src/deploy/kustomize/overlays/standalone/README.md)
+  [`README.md`](https://github.com/hivecommons/hive/blob/v4/src/deploy/kustomize/overlays/standalone/README.md)
   with the full swap list).
 - **Filled-in example** ("Joe on Spyre") —
-  [github.com/kubestellar/hive/tree/v4/src/deploy/kustomize/overlays/standalone/example-joe-spyre](https://github.com/kubestellar/hive/tree/v4/src/deploy/kustomize/overlays/standalone/example-joe-spyre).
+  [github.com/hivecommons/hive/tree/v4/src/deploy/kustomize/overlays/standalone/example-joe-spyre](https://github.com/hivecommons/hive/tree/v4/src/deploy/kustomize/overlays/standalone/example-joe-spyre).
   Every value there is a placeholder — copy the shape, don't apply it verbatim.
 
 There are two flows. Pick based on whether you just want to *see it run* or
@@ -115,7 +115,7 @@ you're doing a *real* deployment.
 GitHub — no clone:
 
 ```bash
-kubectl apply -k "https://github.com/kubestellar/hive//src/deploy/kustomize/overlays/standalone?ref=v4"
+kubectl apply -k "https://github.com/hivecommons/hive//src/deploy/kustomize/overlays/standalone?ref=v4"
 ```
 
 (Note the `//` between the repo and the sub-path — kustomize needs it to find
@@ -131,7 +131,7 @@ swap first.
 because you **must** swap values before it works:
 
 ```bash
-git clone -b v4 https://github.com/kubestellar/hive.git
+git clone -b v4 https://github.com/hivecommons/hive.git
 cd hive/src/deploy/kustomize/overlays/standalone
 # Edit the placeholders — see "What you must swap" below:
 #   patch-configmap.yaml       (org/repos, owner login, OAuth client id, litellm endpoint)
@@ -143,31 +143,31 @@ kubectl -n hive rollout status deploy/hive
 kubectl -n hive-inference rollout status deploy/vllm
 ```
 
-**Upgrading the image.** The base tracks `ghcr.io/kubestellar/hive:stable`. To
+**Upgrading the image.** The base tracks `ghcr.io/hivecommons/hive:stable`. To
 pin (so upgrades are deliberate — there is no hub to auto-upgrade you), resolve
 the channel you reviewed to a **digest** and write it in from the overlay
 directory, then re-apply:
 
 ```bash
-TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:kubestellar/hive:pull" | jq -r .token)
+TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:hivecommons/hive:pull" | jq -r .token)
 DIGEST=$(curl -sI -H "Authorization: Bearer $TOKEN" \
   -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
-  https://ghcr.io/v2/kubestellar/hive/manifests/stable \
+  https://ghcr.io/v2/hivecommons/hive/manifests/stable \
   | awk 'tolower($1)=="docker-content-digest:" {print $2}' | tr -d '\r')
-kustomize edit set image ghcr.io/kubestellar/hive=ghcr.io/kubestellar/hive@"$DIGEST"
+kustomize edit set image ghcr.io/hivecommons/hive=ghcr.io/hivecommons/hive@"$DIGEST"
 kubectl apply -k .
 ```
 
-> **Which image tags exist.** `ghcr.io/kubestellar/hive` carries the channel
+> **Which image tags exist.** `ghcr.io/hivecommons/hive` carries the channel
 > tags (`stable`, `candidate`, `edge`, `v4-latest`) and a short-SHA tag per
 > merge. A `vX.Y.Z` **image** tag exists only when the automated tagged-release
-> workflow (`.github/workflows/release.yml`, see
+> workflow (`.github/workflows/tagged-release.yml`, see
 > [Tagged releases](releases.md)) has cut that version — it retags the merge's
 > short-SHA images. That workflow landed after the `v4.0.0` git tag, so there is
 > **no `:v4.0.0` image**; `newTag: v4.0.0` is an `ImagePullBackOff`. Pin a
 > version tag only after confirming it on the
-> [Releases page](https://github.com/kubestellar/hive/releases) or with
-> `curl -sI -H "Authorization: Bearer $TOKEN" https://ghcr.io/v2/kubestellar/hive/manifests/vX.Y.Z`
+> [Releases page](https://github.com/hivecommons/hive/releases) or with
+> `curl -sI -H "Authorization: Bearer $TOKEN" https://ghcr.io/v2/hivecommons/hive/manifests/vX.Y.Z`
 > (200 = exists). Digests always work.
 
 **Storage.** The base `hive-data` PVC is `ReadWriteOnce`. That is correct for
@@ -179,12 +179,12 @@ further down, whose template runs a surge rollout.)
 SCC. Two more pieces supply the OpenShift-only deltas:
 
 - The
-  [`overlays/openshift`](https://github.com/kubestellar/hive/tree/v4/src/deploy/kustomize/overlays/openshift)
+  [`overlays/openshift`](https://github.com/hivecommons/hive/tree/v4/src/deploy/kustomize/overlays/openshift)
   overlay — a `Route` exposing the `dashboard` port (3002) and the `anyuid` SCC
   RoleBinding (the pod starts as root to set up the ACMM iptables and chown the
   PVC).
 - The
-  [`overlays/openshift-netadmin`](https://github.com/kubestellar/hive/tree/v4/src/deploy/kustomize/overlays/openshift-netadmin)
+  [`overlays/openshift-netadmin`](https://github.com/hivecommons/hive/tree/v4/src/deploy/kustomize/overlays/openshift-netadmin)
   overlay — the dedicated `hive-netadmin` SCC + RoleBinding, applied **once by a
   cluster-admin**. This one is **not optional on OpenShift**: the base
   deployment *adds* capabilities (`NET_ADMIN` + the su-exec set), and no stock
@@ -203,7 +203,7 @@ app-level overlays, two equivalent ways:
 - **Combined overlay (recommended):** in your own copy of the standalone
   `kustomization.yaml`, add `route.yaml` and `anyuid-scc-rolebinding.yaml` as
   additional resources — this is exactly what the
-  [`example-joe-spyre`](https://github.com/kubestellar/hive/tree/v4/src/deploy/kustomize/overlays/standalone/example-joe-spyre)
+  [`example-joe-spyre`](https://github.com/hivecommons/hive/tree/v4/src/deploy/kustomize/overlays/standalone/example-joe-spyre)
   overlay does (it adds its own `route.yaml`; add the SCC binding the same way).
   Set the Route `spec.host` to your cluster's apps domain (or drop `host` to let
   OpenShift auto-generate one).
@@ -223,7 +223,7 @@ get upstream updates without ever committing private values anywhere public.
 
 #### Why not fork?
 
-Forking `kubestellar/hive` as a private repo is the instinct, but it's the
+Forking `hivecommons/hive` as a private repo is the instinct, but it's the
 wrong tool for this job:
 
 - A fork carries the entire hive source tree — 100k+ lines of Go, frontend, CI,
@@ -284,21 +284,21 @@ resources:
   # Bump the ref= value in a git commit when you want to upgrade; review the
   # diff of what changed upstream before you do. A git TAG (v4.0.0) or a full
   # commit SHA is immutable; a branch (v4) moves under you.
-  - https://github.com/kubestellar/hive//src/deploy/kustomize/overlays/standalone?ref=v4.0.0
+  - https://github.com/hivecommons/hive//src/deploy/kustomize/overlays/standalone?ref=v4.0.0
   #
   # OpenShift only: add your Route here alongside the remote base.
   # On plain Kubernetes, use an Ingress resource instead.
   - route.yaml
 
 # Pin the image for extra safety. Without this the base tracks
-# `ghcr.io/kubestellar/hive:stable`; pinning means upgrades are deliberate —
+# `ghcr.io/hivecommons/hive:stable`; pinning means upgrades are deliberate —
 # you bump this in git, review, and apply. Pin by DIGEST: a git tag does not
 # imply an image tag (there is no `:v4.0.0` image — see "Upgrading the image"
 # above for how to resolve `stable` to a digest and how to check whether a
 # `vX.Y.Z` image tag exists before using one).
 images:
-  - name: ghcr.io/kubestellar/hive
-    newName: ghcr.io/kubestellar/hive
+  - name: ghcr.io/hivecommons/hive
+    newName: ghcr.io/hivecommons/hive
     digest: sha256:<digest-you-resolved-from-stable>
 
 patches:
@@ -314,18 +314,18 @@ patches:
 > `?ref=<full-sha>` is immutable — the same apply produces the same result
 > every time. For a production cluster, always pin a tag or SHA; bump it
 > deliberately in a git commit so you have a record of every upgrade. Git tags
-> are listed at https://github.com/kubestellar/hive/tags — note they are a
+> are listed at https://github.com/hivecommons/hive/tags — note they are a
 > different thing from image tags (see "Which image tags exist" above).
 
 > **Double slash `//` in the URL:** kustomize requires `//` to separate the
-> repo root from the path inside it. `github.com/kubestellar/hive//src/...` is
-> correct; `github.com/kubestellar/hive/src/...` (single slash) won't resolve
+> repo root from the path inside it. `github.com/hivecommons/hive//src/...` is
+> correct; `github.com/hivecommons/hive/src/...` (single slash) won't resolve
 > the sub-path correctly.
 
 #### `patch-configmap.yaml` — your private values
 
 Copy the annotated template from
-[`overlays/standalone/patch-configmap.yaml`](https://github.com/kubestellar/hive/blob/v4/src/deploy/kustomize/overlays/standalone/patch-configmap.yaml)
+[`overlays/standalone/patch-configmap.yaml`](https://github.com/hivecommons/hive/blob/v4/src/deploy/kustomize/overlays/standalone/patch-configmap.yaml)
 into your private repo, then replace every `YOUR_*` placeholder with real
 values. The full patch — with comments stripped to show only what you actually
 need to swap:
@@ -535,13 +535,13 @@ kubectl apply -k overlays/spyre/
 
 ```bash
 # 1. Read the release notes for the new tag:
-#    https://github.com/kubestellar/hive/releases
+#    https://github.com/hivecommons/hive/releases
 
 # 2. Bump the ref and the image pin in kustomization.yaml:
 #    resources:
-#      - https://github.com/kubestellar/hive//src/deploy/kustomize/overlays/standalone?ref=<new git tag or sha>
+#      - https://github.com/hivecommons/hive//src/deploy/kustomize/overlays/standalone?ref=<new git tag or sha>
 #    images:
-#      - name: ghcr.io/kubestellar/hive
+#      - name: ghcr.io/hivecommons/hive
 #        digest: sha256:<digest resolved from stable, or from the release's image tag>
 #    (use `newTag: vX.Y.Z` only after confirming that IMAGE tag exists — see
 #    "Which image tags exist" above)
@@ -574,7 +574,7 @@ your private repo:
 ```bash
 # One-time: clone the public hive repo at the pinned tag and copy just the
 # kustomize overlay you need into a vendor/ directory:
-git clone -b v4.2.0 https://github.com/kubestellar/hive.git hive-upstream
+git clone -b v4.2.0 https://github.com/hivecommons/hive.git hive-upstream
 cp -r hive-upstream/src/deploy/kustomize overlays/spyre/vendor/
 rm -rf hive-upstream
 
@@ -636,13 +636,13 @@ forced-proxy-egress `iptables` REDIRECT that enforces the ACMM MITM egress proxy
   Two remedies:
   1. **Grant the capability (preferred — full gate).** On OpenShift, a
      cluster-admin applies the
-     [`overlays/openshift-netadmin`](https://github.com/kubestellar/hive/tree/v4/src/deploy/kustomize/overlays/openshift-netadmin)
+     [`overlays/openshift-netadmin`](https://github.com/hivecommons/hive/tree/v4/src/deploy/kustomize/overlays/openshift-netadmin)
      overlay (dedicated `hive-netadmin` SCC + RoleBinding); on plain Kubernetes,
      ensure the namespace's Pod Security admission allows the capability (see
      below).
   2. **Deliberately run degraded.** Set `HIVE_PROXY_ADVISORY_OK=true` via the
      **commented-out**
-     [`patch-advisory-mode.yaml`](https://github.com/kubestellar/hive/blob/v4/src/deploy/kustomize/overlays/standalone/patch-advisory-mode.yaml)
+     [`patch-advisory-mode.yaml`](https://github.com/hivecommons/hive/blob/v4/src/deploy/kustomize/overlays/standalone/patch-advisory-mode.yaml)
      — uncomment its `- path: patch-advisory-mode.yaml` line in your
      `kustomization.yaml`.
 
@@ -769,8 +769,10 @@ governor:
     default_model: qwen2.5-0.5b-instruct
 ```
 
-Swap `backend: vllm` to hit `HIVE_VLLM_ENDPOINT` directly (the base deployment
-wires both `HIVE_VLLM_ENDPOINT` and `HIVE_LLMD_ENDPOINT`). Verify any key against
+Swap `backend: vllm` to hit `HIVE_VLLM_ENDPOINT` directly. Hive does not
+default this to an in-cluster Service; set it only when the target cluster can
+resolve and reach that endpoint (hosted provisioning injects it from the
+cluster `inference_endpoint` setting). Verify any key against
 `src/pkg/config/config.go` before adding it.
 
 ---
@@ -814,7 +816,7 @@ Response:
 
 ```json
 {"id":"hosted-myorg-myrepo-ab12","status":"provisioning",
- "subdomain":"hosted-myorg-myrepo-ab12.hive.kubestellar.io"}
+ "subdomain":"hosted-myorg-myrepo-ab12.hive.hivecommons.dev"}
 ```
 
 The generated ID is `hosted-<org>-<primary_repo>-<4char>`.
@@ -897,7 +899,7 @@ CTX=<heartbeat-only-cluster>    # kubectl context for the target cluster
 ID=hosted-myorg-myrepo          # the hive ID
 NS=hive-hosted-$ID              # namespace is always hive-hosted-<id>
 ROUTE_HOST=$ID.apps.<your-cluster-domain>
-IMAGE=ghcr.io/kubestellar/hive:v4-latest   # what the hub provisioner stamps by default (saas_provision.go); use `stable` for production
+IMAGE=ghcr.io/hivecommons/hive:v4-latest   # what the hub provisioner stamps by default (saas_provision.go); use `stable` for production
 SC=ocs-storagecluster-cephfs
 
 # The hub heartbeat secret — the SAME for every spoke on a given hub. Copy it
@@ -1004,7 +1006,7 @@ by the hub's own wildcard domain. Anywhere else it is a guaranteed **503**: the
 wildcard resolves, so DNS looks healthy, but it sends the name to the **hub's**
 router, which has no backend for a hive living on another cluster. This was a
 live user-visible outage on the heartbeat-only pool — the hub minted links at
-`<id>.hive.kubestellar.io` while the spoke's Route served
+`<id>.hive.hivecommons.dev` while the spoke's Route served
 `<id>.apps.<your-cluster-domain>`.
 
 The spoke is the only party that **can** answer this on a heartbeat-only
@@ -1106,7 +1108,7 @@ data:
       hub_proxied: false              # heartbeat-only cluster has no hub auth proxy → direct device-flow
     hub:
       enabled: true
-      url: https://hive.kubestellar.io
+      url: https://hive.hivecommons.dev
       dashboard_url: https://${ROUTE_HOST}
       hive_type: hosted
       is_public: false
@@ -1275,7 +1277,7 @@ spec:
         # to a standalone (hub-less) hive — see "Standalone / self-hosted (no
         # hub)" at the top of this guide.
         - { name: HIVE_HUB_SECRET, value: "${HUB_SECRET}" }
-        - { name: HIVE_HUB_URL,    value: "https://hive.kubestellar.io" }
+        - { name: HIVE_HUB_URL,    value: "https://hive.hivecommons.dev" }
         # startupProbe keeps the liveness clock from starting until boot
         # finishes, so a slow start can't race liveness into a restart loop.
         startupProbe:

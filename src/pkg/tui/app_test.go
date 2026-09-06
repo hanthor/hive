@@ -169,7 +169,7 @@ func TestViewFillsTerminalExactly(t *testing.T) {
 			t.Fatalf("line %d is %d cells wide, want <= %d:\n%q", i, lw, w, line)
 		}
 	}
-	for _, want := range []string{headerText, footerText} {
+	for _, want := range []string{m.(model).headerText(), footerText} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("sized View() missing %q", want)
 		}
@@ -382,5 +382,16 @@ func TestFooterAdvertisesHelp(t *testing.T) {
 	m.width, m.height = 100, 30
 	if !strings.Contains(m.View(), "? help") {
 		t.Error("the rendered frame does not advertise ? help")
+	}
+}
+
+func TestFooterAdvertisesAttach(t *testing.T) {
+	if !strings.Contains(footerText, "a attach") {
+		t.Errorf("footerText = %q, want it to advertise the attach binding", footerText)
+	}
+	m := newModel()
+	m.width, m.height = 100, 30
+	if !strings.Contains(m.View(), "a attach") {
+		t.Error("the rendered frame does not advertise a attach")
 	}
 }

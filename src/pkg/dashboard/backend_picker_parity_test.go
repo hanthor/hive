@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
 )
 
 // The dashboard's embedded JS carries a THIRD backend list, independent of the
@@ -91,10 +91,10 @@ var pickerOnlyExceptions = []pickerOnlyException{
 // Direction matters: this asserts picker ⊆ registries, NOT the reverse. A name
 // the picker offers but nothing can launch is a broken promise to the operator
 // — the bug this issue reported. A supported backend the picker omits is only
-// under-advertisement, and whether `agy` or `pi` belong in the HUB's picker
-// depends on whether they can authenticate in a pod (agy's sign-in is an
-// interactive Google OAuth flow with no API-key mode), which is a question this
-// guard must not answer by implication.
+// under-advertisement. Some registered CLIs still target contributor-only or
+// otherwise separately constrained paths, so this generic safety guard must not
+// turn registry membership into a promise that every backend belongs here.
+// Backend-specific visibility requirements (including agy) get explicit tests.
 func TestBackendPickerOffersOnlyDispatchableBackends(t *testing.T) {
 	picker := jsBackendList(t, backendPickerSource(t), "KNOWN_BACKENDS")
 
@@ -191,7 +191,14 @@ func TestCLIPinTooltipNamesNoUndispatchableBackend(t *testing.T) {
 	const marker = "Which CLI backend to pin this agent to when CLI Pinned is on. Options:"
 	i := strings.Index(src, marker)
 	if i < 0 {
-		t.Skip("CLI Pin Value tooltip not found; it was reworded and this guard needs re-pointing")
+		// Fail rather than skip (#5388): the tooltip text is repo content, so
+		// this condition is identical on every machine and a skip could never
+		// mean "unsuitable environment" — it means the marker moved and the
+		// prose guard #4988 asked for silently stopped covering anything.
+		// Rewording the tooltip is fine; re-point the marker in the same PR.
+		t.Fatal("CLI Pin Value tooltip marker not found; the tooltip was reworded — " +
+			"re-point the marker in TestCLIPinTooltipNamesNoUndispatchableBackend " +
+			"in the PR that reworded it")
 	}
 	rest := src[i+len(marker):]
 	if end := strings.Index(rest, "."); end >= 0 {

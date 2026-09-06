@@ -793,6 +793,44 @@
     }
     .terminal-copy-hint-dismiss:hover { color: var(--text); }
     .terminal-copy-hint-dismiss:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    /* #5327: the ⇧-drag / Ctrl+Shift+C advice used to be a full sentence on
+       every agent card. It is now this one small affordance carrying the
+       advice in its tooltip, so the row costs a few characters instead of a
+       line of permanent chrome. */
+    .terminal-copy-hint-help {
+      padding: 0; border: 0; background: transparent; color: var(--muted);
+      cursor: help; font: inherit; text-decoration: underline dotted;
+      text-underline-offset: 2px;
+    }
+    .terminal-copy-hint-help:hover { color: var(--text); }
+    .terminal-copy-hint-help:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    /* Sits after the message and before the ×, so the working control is the
+       last thing read before the dismissal. margin-left:auto pushes it right
+       when the hint text has been dismissed and it is the only child. */
+    .terminal-copy-url-btn {
+      margin-left: auto; flex: none; padding: 2px 8px;
+      border: 1px solid color-mix(in srgb, var(--text) 20%, transparent);
+      border-radius: var(--radius); background: var(--panel);
+      color: var(--text); cursor: pointer; font: inherit; white-space: nowrap;
+    }
+    .terminal-copy-url-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .terminal-copy-url-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    /* The × must stay rightmost even though the button also claims auto. */
+    .terminal-copy-url-btn + .terminal-copy-hint-dismiss { margin-left: 0; }
+    /* The operator's copy surface inside the login-URL toast (#5327): shown
+       first, not as a fallback, because a programmatic write is blocked in
+       any non-secure context. */
+    .terminal-copy-url-fallback {
+      display: block; width: 100%; margin-top: 8px; padding: 4px 6px;
+      border: 1px solid color-mix(in srgb, var(--text) 25%, transparent);
+      border-radius: var(--radius); background: var(--bg-soft);
+      color: var(--text); font-family: var(--font-mono); font-size: 0.72rem;
+    }
+    /* Reports whether the automatic clipboard write also landed. Secondary to
+       the field above it, which always works. */
+    .terminal-copy-url-note {
+      margin-top: 6px; font-size: 0.7rem; line-height: 1.4; opacity: 0.85;
+    }
     .cli-login-btn { border: none; padding: 2px 10px; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 0.75rem; display: inline-flex; align-items: center; gap: 4px; }
     .cli-login-btn.claude { background: #d97706; color: #fff; }
     .cli-login-btn.claude:hover { background: #f59e0b; }
@@ -1009,6 +1047,15 @@
     /* Last upstream/launch error — stacked below .agent-state, never under the
        working-indicator dot, so a retry in progress cannot hide it (#3604). */
     .agent-error { font-size: 0.72rem; color: var(--red); margin-top: 4px; text-align: right; word-break: break-word; }
+    .agent-blockers { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 2px 6px; font-size: 0.68rem; margin-top: 4px; color: var(--muted); }
+    .agent-blockers .ab-key { opacity: 0.65; margin-right: 3px; }
+    .agent-blockers .ab-seg { white-space: nowrap; }
+    .agent-blockers .ab-sep { opacity: 0.35; }
+    .agent-blockers .ab-ok { color: var(--green); }
+    .agent-blockers .ab-bad { color: var(--red); font-weight: 600; }
+    .oc-detail-blockers { margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .never-scheduled-chip { font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: var(--yellow); background: none; border: 1px solid var(--yellow); border-radius: 3px; padding: 1px 5px; margin-left: 6px; cursor: pointer; vertical-align: middle; white-space: nowrap; }
+    .never-scheduled-chip:hover { background: color-mix(in srgb, var(--yellow) 18%, transparent); }
     .agent-name { font-size: 1.1rem; font-weight: 700; margin-bottom: 8px; }
     .agent-name .dot {
       display: inline-block; width: 8px; height: 8px;
@@ -1142,7 +1189,7 @@
     .reco-advisory-note { margin-top: 12px; font-size: 0.68rem; color: var(--muted); font-style: italic; }
     .reco-calm { color: var(--muted); font-size: 0.85rem; }
 
-    .lc-fleet { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+    .lc-fleet { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
     .lc-fleet-stat { flex: 1 1 100px; min-width: 90px; background: var(--bg); border: 1px solid var(--border);
       border-radius: 6px; padding: 8px 12px; }
     .lc-fleet-stat .val { font-size: 1.3rem; font-weight: 700; }
@@ -1150,9 +1197,10 @@
     .lc-fleet-stat .val.merged { color: var(--green); }
     .lc-fleet-stat .val.blocked { color: var(--red); }
     .lc-fleet-stat .lbl { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-top: 2px; }
-    .lc-events { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px;
+    .lc-window { color: var(--muted); font-size: 0.68rem; margin-bottom: 12px; }
+    .lc-journeys { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px;
       max-height: 320px; overflow-y: auto; }
-    .lc-event { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; padding: 5px 8px;
+    .lc-journey { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; padding: 5px 8px;
       border-radius: 6px; background: var(--bg); border: 1px solid var(--border); }
     .lc-kind { flex: 0 0 auto; font-size: 0.6rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
       padding: 2px 7px; border-radius: 8px; }
@@ -1160,10 +1208,13 @@
     .lc-kind.blue { background: color-mix(in srgb, var(--blue) 18%, transparent); color: var(--blue); }
     .lc-kind.green { background: var(--green-bg); color: var(--green); }
     .lc-kind.red { background: var(--red-bg); color: var(--red); }
-    .lc-event .lc-ref { color: var(--text); font-weight: 600; font-family: var(--font-mono); font-size: 0.72rem;
+    .lc-journey .lc-ref { color: var(--text); font-weight: 600; font-family: var(--font-mono); font-size: 0.72rem;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .lc-event .lc-agent { color: var(--muted); font-size: 0.72rem; }
-    .lc-event .lc-time { color: var(--muted); font-size: 0.7rem; margin-left: auto; flex: 0 0 auto; }
+    .lc-stages { display: flex; align-items: center; gap: 3px; flex: 0 1 auto; min-width: 0; flex-wrap: wrap; }
+    .lc-stage-arrow { color: var(--muted); font-size: 0.6rem; }
+    .lc-stage.past { opacity: 0.55; }
+    .lc-journey .lc-agent { color: var(--muted); font-size: 0.72rem; }
+    .lc-journey .lc-time { color: var(--muted); font-size: 0.7rem; margin-left: auto; flex: 0 0 auto; }
     .lc-empty { color: var(--muted); font-size: 0.85rem; padding: 6px 0; }
 
     /* Repos */
@@ -1203,6 +1254,16 @@
     .repo-pr-pill .pill-num { font-weight: 700; white-space: nowrap; }
     .repo-pr-pill .pill-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .repo-pr-pill .pill-merge-icon { font-size: 0.6rem; margin-left: 1px; }
+    /* needs-human: the escalation ledger (pkg/escalation) applies the
+       `needs-human` GitHub label to a PR once automated fix attempts are
+       exhausted. The pill turns status-alert orange (NOT brand amber) and a
+       compact companion badge names the state, so parked PRs stand out
+       instead of blending into the purple PR list — nine escalated PRs were
+       invisible to the operator for a week without this. */
+    .repo-pr-pill.needs-human { --pill-c: var(--orange); }
+    .pill-needs-human-badge { flex: 0 0 auto; font-weight: 600; white-space: nowrap; }
+    /* Section-header counter: "· N need human review" next to the host badge. */
+    .repos-needs-human-count { display: none; font-size: 0.62em; font-weight: 600; vertical-align: middle; margin-left: 6px; color: var(--orange); }
 
     /* Sparklines */
     .sparkline { display: inline-block; vertical-align: middle; margin-left: 6px; flex-shrink: 0; }
@@ -2853,7 +2914,7 @@
         <ol>
           <li>Go to <a id="setup-custom-apps-link" href="https://github.com/settings/apps/new" target="_blank" rel="noopener" style="color:var(--green)">github.com/settings/apps/new</a> (or your org's Settings &rarr; Developer settings &rarr; GitHub Apps)</li>
           <li>Set the app name (e.g. <code>my-hive</code>)</li>
-          <li>Homepage URL: any URL (e.g. <code>https://github.com/kubestellar/hive</code>)</li>
+          <li>Homepage URL: any URL (e.g. <code>https://github.com/hivecommons/hive</code>)</li>
           <li>Uncheck "Webhook &rarr; Active" (not needed)</li>
           <li>Under "Device Flow", check <strong>Enable Device Flow</strong></li>
           <li>Set the permissions below, then click "Create GitHub App"</li>
@@ -3006,7 +3067,7 @@
       <a class="oc-nav-item" id="welcome-nav-item" style="display:none" data-action="openWelcomeDialog" title="Open the Getting Started checklist — one-time setup steps for a new hive"><span class="oc-nav-emoji">🚀</span><span class="oc-nav-text">Getting Started</span></a>
       <a class="oc-nav-item" href="/api/docs" target="_blank"><span class="oc-nav-emoji">📘</span><span class="oc-nav-text">API Spec (Redoc)</span></a>
       <a class="oc-nav-item" href="https://docs.kubestellar.io/docs/hive/getting-started" target="_blank" rel="noopener noreferrer" title="Zero to Automation: the beginner guide to running your hive, level by level"><span class="oc-nav-emoji">📖</span><span class="oc-nav-text">Getting Started Guide</span></a>
-      <a class="oc-nav-item" href="https://github.com/kubestellar/hive/issues" target="_blank" rel="noopener noreferrer"><span class="oc-nav-emoji">🐛</span><span class="oc-nav-text">Report an Issue</span></a>
+      <a class="oc-nav-item" href="https://github.com/hivecommons/hive/issues" target="_blank" rel="noopener noreferrer"><span class="oc-nav-emoji">🐛</span><span class="oc-nav-text">Report an Issue</span></a>
     </div>
     <div class="system-gauges" id="system-gauges">
       <div class="sys-gauge-row" id="sys-gauge-disk" title="Disk usage">
@@ -3181,7 +3242,7 @@
   <div class="cost-usage" id="cost-panel" style="margin-bottom: 24px;"></div>
 
   <div class="repos" id="repos-section">
-    <h2 class="section-header-toggle" data-action="toggleSection" data-arg0="repos-section"><span class="section-chevron">▼</span> Repositories <span id="repos-host-badge" title="Every repo in this hive is on this single GitHub host" style="font-size:0.62em;font-weight:600;vertical-align:middle;padding:2px 7px;border-radius:10px;margin-left:6px"></span> <button class="config-gear" data-action="gh1" data-stop="1" title="Manage monitored repositories" style="font-size:0.7em;vertical-align:middle">⚙️</button></h2>
+    <h2 class="section-header-toggle" data-action="toggleSection" data-arg0="repos-section"><span class="section-chevron">▼</span> Repositories <span id="repos-host-badge" title="Every repo in this hive is on this single GitHub host" style="font-size:0.62em;font-weight:600;vertical-align:middle;padding:2px 7px;border-radius:10px;margin-left:6px"></span> <span id="repos-needs-human" class="repos-needs-human-count" title="Open PRs labeled needs-human: automated fix attempts exhausted — operator review required"></span> <button class="btn" id="repos-rescan-btn" data-action="reposForceRescan" data-stop="1" title="Scan the monitored repositories for issue/PR changes now instead of waiting for the governor's next eval cycle (read-only — no agents are kicked; server-debounced)" style="font-size:0.62em;vertical-align:middle;margin-left:8px;font-weight:400">🔄 Rescan</button> <button class="config-gear" data-action="gh1" data-stop="1" title="Manage monitored repositories" style="font-size:0.7em;vertical-align:middle">⚙️</button></h2>
     <div class="section-body">
       <!-- Read-only view of project.issue_filter: which issues agents may
            initiate work on, by label. Hidden unless a filter is configured;
@@ -3200,19 +3261,31 @@
   </div>
 
   <div id="acmm-eval-section" style="margin-top: 16px; margin-bottom: 24px;">
-    <h2 style="margin-bottom: 8px;" class="section-label section-header-toggle" data-action="toggleSection" data-arg0="acmm-eval-section"><span class="section-chevron">▼</span> 🎯 ACMM Evaluation <button class="btn" data-action="openACMMDialog" data-stop="1" title="Click to change maturity level" style="vertical-align:middle;margin-left:8px;font-weight:400">Change level ▾</button></h2>
+    <h2 style="margin-bottom: 8px;" class="section-label section-header-toggle" data-action="toggleSection" data-arg0="acmm-eval-section"><span class="section-chevron">▼</span> 🎯 ACMM Evaluation <button class="btn" data-action="openACMMDialog" data-stop="1" title="Click to change maturity level" style="vertical-align:middle;margin-left:8px;font-weight:400">Change level ▾</button> <button class="btn" id="acmm-refresh-btn" data-action="acmmForceRefresh" data-stop="1" title="Re-run the criteria evaluation now instead of waiting out the hourly cache (server-debounced)" style="vertical-align:middle;margin-left:4px;font-weight:400">🔄 Re-evaluate</button></h2>
     <div class="section-body">
       <div id="acmm-eval-card" style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:16px">
         <div class="kb-stat-grid" id="acmm-eval-stats">
-          <div class="kb-stat" data-action="acmmShowCodebaseDialog" style="cursor:pointer"><div class="val" id="acmm-codebase-level">--</div><div class="lbl">Codebase Readiness</div></div>
-          <div class="kb-stat" data-action="acmmShowOpsDialog" style="cursor:pointer"><div class="val" id="acmm-ops-level">--</div><div class="lbl">Operational Autonomy</div></div>
-          <div class="kb-stat" data-action="acmmShowOverallDialog" style="cursor:pointer"><div class="val" id="acmm-overall-level">--</div><div class="lbl">Overall ACMM</div></div>
-          <div class="kb-stat" data-action="acmmShowAllCriteriaDialog" style="cursor:pointer"><div class="val" id="acmm-criteria-ratio">--</div><div class="lbl">Criteria Passed</div></div>
+          <div class="kb-stat" data-action="acmmShowCodebaseDialog" style="cursor:pointer"><div class="val" id="acmm-codebase-level">--</div><div class="lbl" id="acmm-lbl-codebase">Codebase Readiness</div></div>
+          <div class="kb-stat" data-action="acmmShowOpsDialog" style="cursor:pointer"><div class="val" id="acmm-ops-level">--</div><div class="lbl" id="acmm-lbl-ops">Operational Autonomy</div></div>
+          <div class="kb-stat" data-action="acmmShowOverallDialog" style="cursor:pointer"><div class="val" id="acmm-overall-level">--</div><div class="lbl" id="acmm-lbl-overall">Overall ACMM</div></div>
+          <div class="kb-stat" data-action="acmmShowAllCriteriaDialog" style="cursor:pointer"><div class="val" id="acmm-criteria-ratio">--</div><div class="lbl" id="acmm-lbl-criteria">Criteria Passed</div></div>
         </div>
-        <div id="acmm-repo-selector" style="display:none;margin-top:8px;font-size:0.75rem;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <!-- #5822: the selector carried BOTH display:none and display:flex in one
+             style attribute. The later declaration wins, so it rendered visible —
+             holding only the "All (aggregate)" chip — until the first evaluation
+             response let acmmRenderCard hide it. Only display:none belongs here;
+             the flex layout arrives with the display:flex the renderer sets when
+             there is actually something to select. -->
+        <div id="acmm-repo-selector" style="display:none;margin-top:8px;font-size:0.75rem;align-items:center;gap:6px;flex-wrap:wrap">
           <span class="muted">Repo:</span>
           <button data-action="gh2" id="acmm-repo-btn-all" class="repo-chip-btn" style="font-weight:600">All (aggregate)</button>
         </div>
+        <!-- #5822: the aggregate is a UNION across repos, and the panel used to
+             say so nowhere — only the Codebase Readiness dialog mentioned it, in
+             passing. An operator reading L3 reasonably assumes every watched repo
+             is at L3. -->
+        <div id="acmm-scope-note" style="display:none;margin-top:8px;font-size:0.7rem;color:var(--muted)"></div>
+        <div id="acmm-repo-table" style="display:none;margin-top:10px"></div>
         <div id="acmm-level-bars" style="margin-top:12px"></div>
         <div id="acmm-eval-meta" style="margin-top:10px;font-size:0.7rem;color:var(--muted);display:flex;justify-content:space-between">
           <span id="acmm-eval-source"></span>
@@ -4375,14 +4448,24 @@
         // button would otherwise persist until the user navigates away.
         const fastToggle = detail.querySelector('.oc-detail-actions .btn-toggle');
         if (fastToggle && !isOnDemand) {
-          fastToggle.className = `btn-toggle ${isPaused ? 'paused' : isOff ? 'off' : 'running'}`;
-          fastToggle.textContent = isPaused ? '▶ resume' : isOff ? '▶ start' : '⏸ pause';
-          fastToggle.dataset.paused = String(isPaused);
-          fastToggle.title = isPaused ? 'Resume this agent — it will start running on its configured cadence' : isOff ? 'Start this agent — it is currently off in this governor mode' : 'Pause this agent — stops governor from kicking it until resumed';
+          if (isPaused) {
+            // Paused gets the full combined-action rebuild — '▶ start &
+            // resume' when the session is also down — so data-action tracks
+            // the session state too, not just the label (#5594 follow-up).
+            fastToggle.outerHTML = pausedAgentActionHtml(a);
+          } else {
+            fastToggle.className = `btn-toggle ${isOff ? 'off' : 'running'}`;
+            fastToggle.textContent = isOff ? '▶ start' : '⏸ pause';
+            fastToggle.dataset.action = 'toggleAgent';
+            fastToggle.dataset.paused = 'false';
+            fastToggle.title = agentToggleTitle(a, false, isOff);
+          }
         }
-        // Same for the stat fields and indicators — they live outside the
-        // scroll region, so replacing them wholesale cannot cause the scroll
-        // jumps the fast path exists to prevent.
+        // Same for the blockers line, the stat fields and the indicators — they
+        // live outside the scroll region, so replacing them wholesale cannot
+        // cause the scroll jumps the fast path exists to prevent.
+        const blockersEl = detail.querySelector('.oc-detail-blockers');
+        if (blockersEl) blockersEl.innerHTML = agentBlockerLineHtml(a) + neverScheduledChipHtml(a, a.name);
         const fieldsEl = detail.querySelector('.oc-detail-fields');
         if (fieldsEl) fieldsEl.outerHTML = ocDetailFieldsHtml(a, isPaused, isOff, isOnDemand);
         const indEl = detail.querySelector('.oc-detail-indicators');
@@ -4482,11 +4565,13 @@
             ? '<button class="btn-toggle on-demand" title="On-demand agent — kicked manually, not by governor cadence">⚡ on demand</button>'
             : !dashboardRoleAtLeast(window._hiveRole || 'read', 'owner')
             ? ''
-            : `<button class="btn-toggle ${isPaused ? 'paused' : isOff ? 'off' : 'running'}" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="${isPaused}" title="${isPaused ? 'Resume this agent — it will start running on its configured cadence' : isOff ? 'Start this agent — it is currently off in this governor mode' : 'Pause this agent — stops governor from kicking it until resumed'}">${isPaused ? '▶ resume' : isOff ? '▶ start' : '⏸ pause'}</button>`}
+            : isPaused
+            ? pausedAgentActionHtml(a)
+            : `<button class="btn-toggle ${isOff ? 'off' : 'running'}" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="false" title="${esc(agentToggleTitle(a, false, isOff))}">${isOff ? '▶ start' : '⏸ pause'}</button>`}
           ${sessionChip(a, '▶ terminal', `<a href="${terminalUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" data-action="openTerminal" data-agent="${esc(a.name)}" title="Open the live tmux terminal session for this agent in a new tab">▶ terminal</a>`)}
-          ${sessionChip(a, '📄 full log', `<a href="${fullLogUrl(a.name, false)}" target="_blank" rel="noopener" class="terminal-link" title="Open the full retained log of this agent's latest run as selectable, searchable text in a new tab">📄 full log</a>`)}
-          ${sessionChip(a, '⬇ log', `<a href="${fullLogUrl(a.name, true)}" download class="terminal-link" title="Download the full retained log of this agent's latest run as a text file">⬇ log</a>`)}
-          <a href="${kickHistoryUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" title="Browse archived logs of this agent's previous kicks — history survives restarts and hive upgrades">🕘 past kicks</a>
+          ${sessionChip(a, '📄 full log', `<a href="${fullLogUrl(a.name, false)}" target="_blank" rel="noopener" class="terminal-link" data-action="openAuthenticatedLink" title="Open the full retained log of this agent's latest run as selectable, searchable text in a new tab">📄 full log</a>`)}
+          ${sessionChip(a, '⬇ log', `<a href="${fullLogUrl(a.name, true)}" download class="terminal-link" data-action="openAuthenticatedLink" title="Download the full retained log of this agent's latest run as a text file">⬇ log</a>`)}
+          <a href="${kickHistoryUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" data-action="openAuthenticatedLink" title="Browse archived logs of this agent's previous kicks — history survives restarts and hive upgrades">🕘 past kicks</a>
           <button class="restart-btn" data-action="restartAgent" data-agent="${esc(a.name)}" title="Kill this agent's tmux session — supervisor will respawn it with fresh context">↻ restart</button>
           <button class="config-gear" data-action="openConfigDialog" data-config-type="agent" data-agent="${esc(a.name)}" style="font-size:1rem;opacity:0.7" title="Open configuration dialog for this agent (cadences, model, pipeline, hooks, etc.)">⚙️</button>
           <button class="btn" data-action="kickEmpty" data-agent="${esc(a.name)}" style="margin-left:auto" title="Kick this agent now with its default prompt, bypassing the governor cadence timer">kick</button>
@@ -4499,7 +4584,8 @@
             ${modelOptionsHtml(a.cli, a.model)}
           </select>
         </div>
-        ${terminalCopyHintHtml(needsLoginDown, agentSessionUnavailable(a))}
+        <div class="oc-detail-blockers">${agentBlockerLineHtml(a)}${neverScheduledChipHtml(a, a.name)}</div>
+        ${terminalCopyHintHtml(needsLoginDown, agentSessionUnavailable(a), a.name)}
         ${ocDetailFieldsHtml(a, isPaused, isOff, isOnDemand)}
         <div class="oc-detail-indicators">${agentIndicators(a.name)}</div>
         <div class="oc-detail-summary-wrap">
@@ -4552,11 +4638,18 @@
       const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' } };
       if (prompt) opts.body = JSON.stringify({ prompt });
       try {
-        const res = await fetch('/api/kick/' + name, opts);
-        const data = await res.json();
+        const data = await postJSON('/api/kick/' + name, opts);
         if (!data.ok) { showToast('Kick failed: ' + (data.error || 'unknown'), 'error'); return; }
-        showToast(prompt ? 'Sent to ' + name : 'Kicked ' + name, 'success');
         input.value = '';
+        if (data.status === 'in-flight') {
+          showToast('A kick is already being delivered to ' + name, 'info');
+          return;
+        }
+        // 202 means queued, not delivered (#5325). Hold a persistent toast and
+        // rewrite it once the poll settles, so the card never claims success
+        // the server has not confirmed — nor failure it has not observed.
+        const toast = showToast((prompt ? 'Sending to ' : 'Kicking ') + name + '...', 'info', true);
+        await reportKickOutcome(name, toast, 'Queued for ' + name);
       } catch (e) { showToast('Kick failed: ' + e.message, 'error'); }
     }
 
@@ -5997,12 +6090,12 @@
     const TMUX_SESSION_PREFIX = 'hive-';
     const TTYD_PORT = 7681;
     const TERMINAL_ASSERTION_RENEW_PATH = '/api/terminal/assertion/renew';
+    const TERMINAL_HANDOFF_PATH = '/api/terminal/handoff';
     function terminalUrl(agentName) {
       const session = TMUX_SESSION_PREFIX + agentName;
       const proto = window.location.protocol;
       const host = window.location.host;
-      const t = localStorage.getItem('hive-token'); const tokenParam = t ? `&token=${encodeURIComponent(t)}` : '';
-      return `${proto}//${host}/terminal/?arg=${encodeURIComponent(session)}${tokenParam}`;
+      return `${proto}//${host}/terminal/?arg=${encodeURIComponent(session)}`;
     }
     function isHostedHiveHost() {
       return (window.location.hostname || '').toLowerCase().endsWith('.hive.kubestellar.io');
@@ -6023,6 +6116,34 @@
         showToast('Could not refresh terminal access: ' + e.message, 'error');
       }
       return false;
+    }
+
+    async function dashboardTokenConfigured() {
+      try {
+        const r = await fetch('/api/auth/token', { cache: 'no-store' });
+        if (!r.ok) return true;
+        const d = await r.json().catch(() => ({}));
+        return d.configured === true || d.configured === 'true';
+      } catch {
+        return true;
+      }
+    }
+
+    async function createTerminalHandoff() {
+      try {
+        const resp = await fetch(TERMINAL_HANDOFF_PATH, {
+          method: 'POST',
+          credentials: 'same-origin',
+          cache: 'no-store',
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        if (!data.code) throw new Error('server returned no handoff code');
+        return data.code;
+      } catch (e) {
+        showToast('Could not prepare terminal access: ' + (e.message || e), 'error');
+        return '';
+      }
     }
     /* A DISABLED agent (enabled:false) is never started, so it has no tmux
        session and no pane to capture. Its ▶ terminal dead-ends on
@@ -6060,32 +6181,274 @@
     /* ttyd 1.7.7 does not handle OSC52 writes in its browser client, while
        tmux mouse mode owns ordinary drag selection. Put the escape hatch next
        to the terminal control rather than in a first-open toast that is gone
-       by the time it matters. A login prompt always wins over the persisted
-       baseline dismissal because it predicts an OAuth URL must be copied. */
-    function terminalCopyHintHtml(needsLogin, sessionUnavailable) {
+       by the time it matters.
+
+       #5327: the ⇧-drag / Ctrl+Shift+C advice is useful the first time and
+       pure noise on every agent card thereafter, so the baseline row is now a
+       single small "keyboard copy" affordance carrying the advice in its
+       tooltip, dismissible for good. The login-blocked row keeps its full
+       sentence — that one predicts an OAuth URL must be copied right now, so
+       it earns the space and always wins over the persisted dismissal. */
+    const TERMINAL_KEYBOARD_COPY_HINT = 'Selecting text in the terminal: hold ⇧ (Shift) while dragging — tmux mouse mode owns an ordinary drag. Then Ctrl+Shift+C copies and Ctrl+Shift+V pastes.';
+    function terminalCopyHintHtml(needsLogin, sessionUnavailable, agentName) {
       if (sessionUnavailable) return '';
-      if (!needsLogin && terminalCopyHintDismissed()) return '';
-      const message = needsLogin
-        ? 'You’ll be copying a URL: hold <strong>Shift</strong> while selecting · <strong>Ctrl+Shift+V</strong> pastes. Wrapped URLs may copy with line breaks — check before submitting.'
-        : 'Terminal copy: <strong>⇧-drag</strong> to select · <strong>Ctrl+Shift+C / Ctrl+Shift+V</strong>';
-      const dismiss = needsLogin ? '' : '<button type="button" class="terminal-copy-hint-dismiss" data-action="dismissTerminalCopyHint" aria-label="Dismiss terminal copy hint" title="Don’t show this hint again">×</button>';
-      return `<div class="terminal-copy-hint${needsLogin ? ' needs-login' : ''}" role="note">${message}${dismiss}</div>`;
+      /* #5327: the copy control is for a LOGIN link. It is rendered only
+         where one is expected — see terminalCopyUrlButtonHtml — rather than
+         standing on every card offering whatever URL the pane happens to
+         hold. */
+      if (!needsLogin) {
+        /* Dismissed means gone. Before #5327 the row survived dismissal to
+           keep the copy button alive; now that button only exists on a
+           login-blocked card, which never reaches this branch, so there is
+           nothing left to preserve. */
+        if (terminalCopyHintDismissed()) return '';
+        const help = `<button type="button" class="terminal-copy-hint-help" data-action="showTerminalKeyboardHint" title="${esc(TERMINAL_KEYBOARD_COPY_HINT)}" aria-label="How to copy text out of this terminal">⌨ keyboard copy</button>`;
+        const dismiss = '<button type="button" class="terminal-copy-hint-dismiss" data-action="dismissTerminalCopyHint" aria-label="Dismiss terminal copy hint" title="Don’t show this hint again">×</button>';
+        return `<div class="terminal-copy-hint" role="note">${help}${dismiss}</div>`;
+      }
+      const copyBtn = terminalCopyUrlButtonHtml(agentName, needsLogin);
+      const message = 'This agent is waiting on a login. The URL is on its terminal — use the button to copy it whole (wrapped lines are rejoined), or hold <strong>Shift</strong> while selecting.';
+      return `<div class="terminal-copy-hint needs-login" role="note">${message}${copyBtn}</div>`;
+    }
+    /* The tooltip is the primary surface; this is the click-through for
+       touch and keyboard users, who never get a hover. */
+    function showTerminalKeyboardHint() {
+      showToast(TERMINAL_KEYBOARD_COPY_HINT, 'info');
     }
     function dismissTerminalCopyHint() {
       try { localStorage.setItem(TERMINAL_COPY_HINT_LS_KEY, '1'); } catch {}
+      /* Remove the baseline row, matching what terminalCopyHintHtml renders
+         on the next full re-render — the two paths must agree or the hint
+         reappears on the next poll. The :not(.needs-login) selector is what
+         protects the login-blocked row, which carries the copy control and is
+         never dismissible. */
       document.querySelectorAll('.terminal-copy-hint:not(.needs-login)').forEach(el => el.remove());
     }
 
+    /* Copies the LOGIN URL off the agent's pane. The capture is server-side
+       with `capture-pane -J`, which rejoins terminal-wrapped lines, so a
+       wrapped OAuth URL comes back whole — Shift-drag cannot do that, it
+       copies the wrap's newlines along with the URL, which is the failure
+       mode that makes a pasted login URL silently invalid.
+
+       #5327: rendered ONLY when a login is actually in flight. needsLogin is
+       the pane poller's own observation that a login prompt is on screen (see
+       _agentNeedsLogin), which is the same condition that paints the 🔑 badge
+       — so the control appears exactly when there is a login URL worth
+       offering, and is absent (not merely disabled) the rest of the time.
+       Naming the case rather than the mechanism is the other half: an
+       operator who sees "Copy login URL" beside a 🔑 agent does not have to
+       hover a tooltip to find out what it is for. */
+    function terminalCopyUrlButtonHtml(agentName, needsLogin) {
+      if (!agentName || !needsLogin) return '';
+      return `<button type="button" class="terminal-copy-url-btn" data-action="copyTerminalUrl" data-agent="${esc(agentName)}" title="Show this agent\u2019s sign-in URL, captured whole from its terminal — wrapped lines are rejoined so the OAuth link is not broken by the wrap">🔑 Copy login URL</button>`
+        + `<button type="button" class="terminal-copy-url-btn" data-action="submitLoginCode" data-agent="${esc(agentName)}" title="Paste the authorization code the sign-in page gave you. It is typed into the agent\u2019s terminal by the server, so the browser terminal cannot mangle it.">↩ Submit login code</button>`;
+    }
+
+    /* Writes text to the clipboard, reporting honestly when it cannot.
+       navigator.clipboard exists only in a secure context, and a hive reached
+       over plain http:// on a LAN address is not one — which is exactly how
+       self-hosted hives are usually reached, so this is the common case, not
+       the edge case. The execCommand fallback works there; when BOTH fail the
+       caller gets false and must say so rather than pretend it copied. */
+    async function writeClipboardText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        try { await navigator.clipboard.writeText(text); return true; } catch {}
+      }
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      // Off-screen but still focusable: execCommand('copy') ignores a hidden
+      // or display:none element.
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      let ok = false;
+      try {
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);
+        ok = document.execCommand('copy');
+      } catch { ok = false; }
+      ta.remove();
+      return ok;
+    }
+
+    /* The write-side twin of copyTerminalUrl.
+
+       Copying OUT of the dashboard terminal is broken (#5188) and this is the
+       same defect in the other direction: an operator who has opened the
+       sign-in URL must paste a code BACK, and ttyd/xterm.js over tmux mangles
+       it. Without this the only route left is a host shell and `tmux
+       send-keys`, which is not an answer for an operator whose interface is a
+       web dashboard.
+
+       The code goes to the server, which types it into the pane — the browser
+       terminal is never involved. It is refused rather than sanitised if it
+       carries whitespace or control characters, so a value that could submit a
+       second command into the agent's shell cannot be typed at all; the reason
+       is surfaced verbatim rather than as a generic failure. */
+    async function submitLoginCode(agentName) {
+      if (!agentName) return;
+      const code = prompt(`Paste the authorization code for "${agentName}".\n\nIt is sent to the server and typed into the agent's terminal, so the browser terminal cannot corrupt it.`);
+      if (code === null) return;
+      if (!code.trim()) { showToast('No code entered', 'error'); return; }
+      try {
+        const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/login-code`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: code.trim() }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { showToast(d.error || `Could not submit the code (HTTP ${r.status})`, 'error'); return; }
+        showToast(`Code submitted to ${agentName}`, 'success');
+      } catch (err) {
+        showToast(`Could not submit the code: ${err && err.message ? err.message : err}`, 'error');
+      }
+    }
+
+    async function copyTerminalUrl(agentName) {
+      let urls = [];
+      try {
+        const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/terminal-urls`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        /* #5327: authUrls is the sign-in subset. The unfiltered `urls` list
+           is deliberately NOT used as a fallback — offering "the newest URL
+           on the pane" under a button labelled "Copy login URL" is precisely
+           the mislabelling being fixed. */
+        urls = Array.isArray(d.authUrls) ? d.authUrls : [];
+      } catch (e) {
+        showToast(`Could not read ${agentName}'s terminal: ${e.message || e}`, 'error');
+        return;
+      }
+      if (!urls.length) {
+        showToast(`No login URL on ${agentName}'s terminal right now`, 'info');
+        return;
+      }
+      /* #5327: lead with the pre-selected field rather than a programmatic
+         write. A self-hosted hive is routinely reached over plain http:// on
+         a LAN address, which is not a secure context, so the write is BLOCKED
+         more often than it succeeds here — and a blocked write spends the
+         operator's click and returns instructions. Showing the URL, selected
+         and ready for one Cmd/Ctrl+C, always works; the automatic write is
+         still attempted underneath, and when it lands the panel just says so.
+         Either way the operator ends the click holding the URL. */
+      showTerminalUrlPanel(agentName, urls[0]);
+    }
+
+    /* Presents the login URL in a selectable, pre-selected input and reports
+       whether the clipboard write also succeeded. This is the PRIMARY surface
+       (#5327), not a last resort: it is the only path that works in every
+       browser context this dashboard is served from. */
+    async function showTerminalUrlPanel(agentName, url) {
+      const toast = showToast(`Login URL from ${agentName}'s terminal — press Cmd/Ctrl+C to copy the selected text.`, 'info');
+      /* An info toast self-dismisses on a timer, which would take the URL
+         away mid-read. Stick it explicitly: this panel is the operator's copy
+         surface and closes only when they say so. Sticking it directly rather
+         than raising the toast to 'error' keeps it from reading as a failure
+         — in the common path nothing failed. */
+      if (toast) makeToastSticky(toast);
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.readOnly = true;
+      input.value = url;
+      input.className = 'terminal-copy-url-fallback';
+      input.setAttribute('aria-label', `Login URL from ${agentName}'s terminal`);
+      /* An error toast is made sticky, and makeToastSticky puts a
+         dismiss-on-click listener on the WHOLE toast. Without this the first
+         click into the input — the one action this panel exists to invite —
+         would close the toast and take the URL with it. */
+      input.addEventListener('click', e => e.stopPropagation());
+      if (toast) toast.appendChild(input);
+      else document.body.appendChild(input);
+      input.focus();
+      input.select();
+
+      /* Try the clipboard too, but only report the OUTCOME — never let a
+         refused write become the whole result of the click. */
+      const ok = await writeClipboardText(url);
+      // Re-select: the off-screen textarea execCommand uses steals the
+      // selection, which would leave the operator's Cmd/Ctrl+C copying
+      // nothing if the write was refused.
+      input.focus();
+      input.select();
+      if (!toast || !toast.isConnected) return;
+      const note = document.createElement('div');
+      note.className = 'terminal-copy-url-note';
+      note.textContent = ok
+        ? '✓ Also copied to your clipboard.'
+        : (window.isSecureContext
+          ? 'This browser blocked the automatic clipboard write, so copy it by hand above.'
+          : 'Automatic copying needs HTTPS or localhost and this hive is served over plain http, so copy it by hand above.');
+      note.addEventListener('click', e => e.stopPropagation());
+      toast.appendChild(note);
+    }
+
     async function openTerminal(agentName, href) {
-      const url = href || terminalUrl(agentName);
+      const baseUrl = href || terminalUrl(agentName);
       const tab = window.open('about:blank', '_blank');
       if (tab) tab.opener = null;
-      const ok = await renewTerminalAssertion();
-      if (ok) {
-        if (tab) tab.location.href = url;
-        else window.open(url, '_blank', 'noopener');
+      await renewTerminalAssertion();
+      // Token-secured self-hosted hives do not have a hive_session cookie for
+      // assertion renewal, but the handoff POST authenticates with the
+      // Authorization header that the fetch wrapper attaches to mutations.
+      const code = await createTerminalHandoff();
+      if (code) {
+        const url = new URL(baseUrl, window.location.href);
+        url.searchParams.set('code', code);
+        if (tab) tab.location.href = url.toString();
+        else window.open(url.toString(), '_blank', 'noopener');
+      } else if (!(await dashboardTokenConfigured())) {
+        if (tab) tab.location.href = baseUrl;
+        else window.open(baseUrl, '_blank', 'noopener');
       } else if (tab) {
         tab.close();
+      }
+    }
+
+
+    window.hiveOpenAuthenticatedChildLink = function(href, download) {
+      const url = new URL(href, window.location.href).toString();
+      openAuthenticatedLink(url, download);
+    };
+    async function openAuthenticatedLink(href, download) {
+      try {
+        const headers = {};
+        const t = localStorage.getItem('hive-token');
+        if (t) headers['Authorization'] = 'Bearer ' + t;
+        const resp = await fetch(href, { credentials: 'same-origin', cache: 'no-store', headers });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const contentType = resp.headers.get('Content-Type') || '';
+        if (!download && contentType.includes('text/html')) {
+          const html = await resp.text();
+          const tab = window.open('about:blank', '_blank');
+          if (!tab) throw new Error('popup blocked');
+          tab.document.open();
+          tab.document.write(html + `<script>(function(){document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a)return;var h=a.getAttribute('href')||'';if(h.indexOf('/api/agents/')===0&&window.opener&&window.opener.hiveOpenAuthenticatedChildLink){e.preventDefault();window.opener.hiveOpenAuthenticatedChildLink(h,a.href.indexOf('download=1')!==-1);}});})();<\/script>`);
+          tab.document.close();
+          return;
+        }
+        const blob = await resp.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        if (download) {
+          const a = document.createElement('a');
+          a.href = objectUrl;
+          a.download = '';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+        } else {
+          const tab = window.open(objectUrl, '_blank', 'noopener');
+          if (!tab) {
+            URL.revokeObjectURL(objectUrl);
+            throw new Error('popup blocked');
+          }
+          setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+        }
+      } catch (e) {
+        showToast('Could not open link: ' + (e.message || e), 'error');
       }
     }
 
@@ -6093,28 +6456,24 @@
     // full retained tmux scrollback (issue #3693). The live "▶ terminal" only
     // shows the last screenful; this returns the whole latest-run buffer as
     // plain, selectable, searchable text. download=1 makes the browser save it
-    // as a .log file instead of rendering it inline. The token param mirrors
-    // terminalUrl so it authenticates on direct-route spokes.
+    // as a .log file instead of rendering it inline. Dashboard navigations never
+    // carry the shared token in the URL; token-secured spokes use
+    // authenticated fetches for API calls instead.
     function fullLogUrl(agentName, download) {
       const proto = window.location.protocol;
       const host = window.location.host;
-      const t = localStorage.getItem('hive-token');
       const dl = download ? 'download=1' : '';
-      const tok = t ? `token=${encodeURIComponent(t)}` : '';
-      const qs = [dl, tok].filter(Boolean).join('&');
-      return `${proto}//${host}/api/agents/${encodeURIComponent(agentName)}/log${qs ? '?' + qs : ''}`;
+      return `${proto}//${host}/api/agents/${encodeURIComponent(agentName)}/log${dl ? '?' + dl : ''}`;
     }
 
     // kickHistoryUrl points at the server-rendered index of the agent's
     // durable per-kick log archives (issue #4296): the last several kicks'
-    // logs, surviving agent restarts and hive upgrades. The token param
-    // mirrors fullLogUrl so it authenticates on direct-route spokes.
+    // logs, surviving agent restarts and hive upgrades. Dashboard navigations never
+    // carry the shared token in the URL.
     function kickHistoryUrl(agentName) {
       const proto = window.location.protocol;
       const host = window.location.host;
-      const t = localStorage.getItem('hive-token');
-      const tok = t ? `?token=${encodeURIComponent(t)}` : '';
-      return `${proto}//${host}/agents/${encodeURIComponent(agentName)}/kicks${tok}`;
+      return `${proto}//${host}/agents/${encodeURIComponent(agentName)}/kicks`;
     }
 
     /* SINGLE source of truth for the 🔑 "needs login" badge. Mirrors the
@@ -6143,6 +6502,108 @@
       return down && a.authKnown === true && a.authAvailable !== true;
     }
 
+    /* Agent blockers (#5594). THREE orthogonal flags decide whether an agent
+       will ever do work: is its session up, has an operator paused it, and is
+       a cadence configured at all. The card used to reveal them one at a
+       time — a single action button cleared the first, which uncovered the
+       second, and the third (no cadence in any mode) was not on the card at
+       all — so operators walked a serial treasure hunt and still ended up
+       with an agent that never ran.
+
+       These read the RAW server flags rather than the mutually-exclusive
+       display state (isPaused/isOff/isStopped, which deliberately suppress
+       one another for styling), so every live blocker is legible BEFORE the
+       first click. agentSchedulingBlockers returns them in the order an
+       operator must clear them; empty means the governor really will kick
+       this agent. */
+    function agentSchedulingBlockers(a) {
+      const out = [];
+      if (a.paused === true) out.push('paused');
+      if (a.offByCadence === true) {
+        const mode = (window._lastStatus?.governor?.mode || '').toLowerCase();
+        out.push(mode ? `off in ${mode} mode` : 'off in this governor mode');
+      }
+      if (a.noCadence === true) out.push('never scheduled');
+      return out;
+    }
+    function agentToggleTitle(a, isPaused, isOff) {
+      if (isPaused) {
+        const rest = [];
+        if (a.state !== 'running') rest.push('its session is down (use \u21bb restart)');
+        if (a.offByCadence === true) rest.push('its cadence for the current governor mode is off (\u2699\uFE0F \u2192 Cadences)');
+        if (a.noCadence === true) rest.push('no governor mode gives it a cadence (\u2699\uFE0F \u2192 Cadences)');
+        const base = 'Resume this agent \u2014 it will start running on its configured cadence';
+        if (rest.length === 0) return base;
+        return `${base}. Resuming alone is NOT enough: ${rest.join('; ')}.`;
+      }
+      if (isOff) return 'Start this agent \u2014 it is currently off in this governor mode';
+      return 'Pause this agent \u2014 stops governor from kicking it until resumed';
+    }
+    /* Combined primary action for a PAUSED agent \u2014 the follow-up to
+       resume-leads (#5594). Resume-leads guarantees the pause is never
+       hidden, and its tooltip names the session as a blocker resuming will
+       not clear; this removes that residual two-step dance: when the session
+       is ALSO down, the one button reads '\u25b6 start & resume' and clears both
+       flags in a single click via startResumeAgent (a client-side chain of
+       the two existing endpoints \u2014 resume, then restart \u2014 no new backend
+       surface). A session-up paused agent keeps the plain '\u25b6 resume' with
+       agentToggleTitle's blocker-naming tooltip. Every render site (card
+       grid, detail panel, detail fast path) builds the paused action here,
+       which is the single place that guarantees a paused agent never shows
+       a bare Start. */
+    function pausedAgentActionHtml(a) {
+      if (a.state === 'running') {
+        return `<button class="btn-toggle paused" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="true" title="${esc(agentToggleTitle(a, true, false))}">\u25b6 resume</button>`;
+      }
+      const rest = [];
+      if (a.offByCadence === true) rest.push('its cadence for the current governor mode is off (\u2699\ufe0f \u2192 Cadences)');
+      if (a.noCadence === true) rest.push('no governor mode gives it a cadence (\u2699\ufe0f \u2192 Cadences)');
+      let title = 'This agent is paused AND its session is down \u2014 one click resumes it and asks the supervisor to start the session. No second Resume step.';
+      if (rest.length > 0) title += ` Still not enough on its own: ${rest.join('; ')}.`;
+      return `<button class="btn-toggle paused" data-action="startResumeAgent" data-agent="${esc(a.name)}" data-paused="true" title="${esc(title)}">\u25b6 start &amp; resume</button>`;
+    }
+    function neverScheduledChipHtml(a, configTarget) {
+      if (a.noCadence !== true) return '';
+      const who = a.displayName || a.name;
+      const tip = `${who} is enabled but NO governor mode gives it a cadence, and it has never been kicked \u2014 it will sit idle forever. Click to set cadences.`;
+      return `<button class="never-scheduled-chip" data-action="openConfigDialog" data-config-type="agent" data-agent="${esc(configTarget)}" data-tab="Cadences" title="${esc(tip)}">\u23F1 never scheduled \u2014 set cadences</button>`;
+    }
+    function agentBlockerLineHtml(a) {
+      const onDemand = a.onDemand === true;
+      let session = 'up', sessionCls = 'ab-ok';
+      let sessionTip = 'The tmux session is alive.';
+      if (agentIsDisabled(a)) {
+        session = 'disabled'; sessionCls = 'ab-bad';
+        sessionTip = 'Disabled in config \u2014 the governor never starts this agent. Enable it with \u2699\uFE0F.';
+      } else if (a.state !== 'running') {
+        session = 'down'; sessionCls = 'ab-bad';
+        sessionTip = 'No live tmux session \u2014 \u21bb restart asks the supervisor to respawn it.';
+      }
+      const blockers = agentSchedulingBlockers(a);
+      let sched = a.cadence || '\u2014', schedCls = 'ab-ok';
+      let schedTip = 'Governor cadence for the current mode.';
+      if (onDemand) {
+        sched = 'on demand'; schedCls = '';
+        schedTip = 'On-demand agent \u2014 kicked manually, never by governor cadence.';
+      } else if (blockers.length > 0) {
+        sched = blockers.join(' + '); schedCls = 'ab-bad';
+        schedTip = `EVERY reason the governor will not kick ${a.displayName || a.name} right now \u2014 all of them must be cleared: ${blockers.join('; ')}.`;
+      }
+      let next = a.nextKickIn ? `in ${a.nextKickIn}` : (a.nextKick || '\u2014');
+      let nextCls = '';
+      if (onDemand) next = 'on demand';
+      else if (blockers.length > 0) { next = 'never'; nextCls = 'ab-bad'; }
+      const nextTip = (!onDemand && blockers.length === 0 && a.nextKick)
+        ? `Next governor kick at ${a.nextKick}.`
+        : 'Nothing is scheduled to kick this agent.';
+      return `<div class="agent-blockers">`
+        + `<span class="ab-seg ${sessionCls}" title="${esc(sessionTip)}"><span class="ab-key">session</span>${esc(session)}</span>`
+        + `<span class="ab-sep">\u00B7</span>`
+        + `<span class="ab-seg ${schedCls}" title="${esc(schedTip)}"><span class="ab-key">scheduling</span>${esc(sched)}</span>`
+        + `<span class="ab-sep">\u00B7</span>`
+        + `<span class="ab-seg ${nextCls}" title="${esc(nextTip)}"><span class="ab-key">next kick</span>${esc(next)}</span>`
+        + `</div>`;
+    }
     function renderAgents(agents) {
       const el = document.getElementById('agents');
       // Preserve custom prompt input values across re-renders
@@ -6177,12 +6638,22 @@
         const dotState = isOff ? 'off-healthy' : dotCls;
         const canToggle = a.beadRole !== 'supervisor';
         const canPauseToggle = canToggle && dashboardRoleAtLeast(window._hiveRole || 'read', 'owner');
-        const toggleBtn = canToggle ? (isOff
+        /* RESUME LEADS (#5594). A paused agent's card offers its pause toggle
+           FIRST and unconditionally; the governor-cadence gear must never take
+           the slot, or the pause stays hidden until the gear's blocker is
+           cleared and a second button appears. isOff already excludes isPaused
+           today, so this renders identically — stating the order here is what
+           keeps it true if that derivation ever changes. The remaining
+           blockers ride in the tooltip and on the blockers line below, so the
+           operator learns them before the click, not after. */
+        const toggleBtn = canToggle ? (isPaused && canPauseToggle
+          ? pausedAgentActionHtml(a)
+          : isOff
           ? `<button class="btn-toggle off" data-action="openConfigDialog" data-config-type="agent" data-agent="${esc(a.name)}" title="Agent is off in this governor mode — click to configure per-mode cadences">⚙ off</button>`
           : isOnDemand
           ? `<button class="btn-toggle on-demand" title="On-demand agent — kicked manually, not by governor cadence">⚡ on demand</button>`
           : canPauseToggle
-          ? `<button class="btn-toggle ${isPaused ? 'paused' : 'running'}" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="${isPaused}" title="${isPaused ? 'Resume this agent — it will start running on its configured cadence' : 'Pause this agent — stops governor from kicking it until resumed'}">${isPaused ? '▶ resume' : '⏸ pause'}</button>`
+          ? `<button class="btn-toggle running" data-action="toggleAgent" data-agent="${esc(a.name)}" data-paused="false" title="${esc(agentToggleTitle(a, false, false))}">⏸ pause</button>`
           : '') : '';
         // liveSummary is pushed via SSE every 5s — no separate fetch needed
         let summaryEl = '';
@@ -6209,8 +6680,8 @@
         const disabledBadge = agentIsDisabled(a) ? ` <span class="status-badge disabled" title="Disabled in config — the governor never starts this agent. Configure it with the gear to enable.">disabled</span>` : '';
         return `<div class="agent-card ${cls}${compactCls}" data-agent="${esc(a.name)}">
           <span class="working-indicator"></span>
-          <div class="agent-name"><span class="dot ${dotState}"${isOff ? ` title="${esc(OFF_HEALTHY_TITLE)}"` : ''}></span>${a.emoji ? a.emoji + ' ' : ''}${esc(a.displayName || a.name)}${needsLogin ? ' <span title="CLI needs login">\uD83D\uDD11</span>' : ''}${a.sandboxed ? ' <span class="status-badge done" title="Sandboxed runner active">sandboxed</span>' : ''}${disabledBadge}${replicaBadge} ${toggleBtn} <button class="compact-toggle" data-action="toggleAgentCompact" data-arg0="${esc(a.name)}" data-stop="1" title="Toggle compact/expanded view for this agent card">${isAgentCompact(a.name) ? '&#9655; expand' : '&#9661; compact'}</button> ${sessionChip(a, '▶ terminal', `<a href="${terminalUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" data-action="openTerminal" data-agent="${esc(a.name)}" title="Open tmux session">▶ terminal</a>`)} ${sessionChip(a, '📄 full log', `<a href="${fullLogUrl(a.name, false)}" target="_blank" rel="noopener" class="terminal-link" title="Full log of the latest run as selectable, searchable text">📄 full log</a>`)} <a href="${kickHistoryUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" title="Archived logs of previous kicks — survives restarts and upgrades">🕘 past kicks</a> <button class="restart-btn" data-action="restartAgent" data-agent="${esc(a.name)}" title="Kill tmux session — supervisor will respawn with fresh context">↻ restart</button> <button class="config-gear" data-action="openConfigDialog" data-config-type="agent" data-agent="${esc(configTarget)}" title="Configure ${esc(a.replicaBase ? (a.replicaBase + ' (base for ' + a.name + ')') : (a.displayName || a.name))}">⚙️</button></div>
-          ${terminalCopyHintHtml(needsLogin, agentSessionUnavailable(a))}
+          <div class="agent-name"><span class="dot ${dotState}"${isOff ? ` title="${esc(OFF_HEALTHY_TITLE)}"` : ''}></span>${a.emoji ? a.emoji + ' ' : ''}${esc(a.displayName || a.name)}${needsLogin ? ' <span title="CLI needs login">\uD83D\uDD11</span>' : ''}${a.sandboxed ? ' <span class="status-badge done" title="Sandboxed runner active">sandboxed</span>' : ''}${disabledBadge}${replicaBadge} ${toggleBtn}${neverScheduledChipHtml(a, configTarget)} <button class="compact-toggle" data-action="toggleAgentCompact" data-arg0="${esc(a.name)}" data-stop="1" title="Toggle compact/expanded view for this agent card">${isAgentCompact(a.name) ? '&#9655; expand' : '&#9661; compact'}</button> ${sessionChip(a, '▶ terminal', `<a href="${terminalUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" data-action="openTerminal" data-agent="${esc(a.name)}" title="Open tmux session">▶ terminal</a>`)} ${sessionChip(a, '📄 full log', `<a href="${fullLogUrl(a.name, false)}" target="_blank" rel="noopener" class="terminal-link" data-action="openAuthenticatedLink" title="Full log of the latest run as selectable, searchable text">📄 full log</a>`)} <a href="${kickHistoryUrl(a.name)}" target="_blank" rel="noopener" class="terminal-link" data-action="openAuthenticatedLink" title="Archived logs of previous kicks — survives restarts and upgrades">🕘 past kicks</a> <button class="restart-btn" data-action="restartAgent" data-agent="${esc(a.name)}" title="Kill tmux session — supervisor will respawn with fresh context">↻ restart</button> <button class="config-gear" data-action="openConfigDialog" data-config-type="agent" data-agent="${esc(configTarget)}" title="Configure ${esc(a.replicaBase ? (a.replicaBase + ' (base for ' + a.name + ')') : (a.displayName || a.name))}">⚙️</button></div>
+          ${terminalCopyHintHtml(needsLogin, agentSessionUnavailable(a), a.name)}
           <div class="agent-state ${isOnDemand ? 'on-demand' : isPaused ? 'paused' : isOff ? 'off' : a.busy}">${isOnDemand ? 'on demand' : isPaused ? 'paused' : isOff ? 'off' : a.busy}${pauseInfoIcon(a)}${(() => {
             if (a.structuredStatus === 'BLOCKED') return '<span class="status-badge blocked" title="' + esc(a.statusEvidence) + '">blocked</span>';
             if (a.structuredStatus === 'NEEDS_CONTEXT') return '<span class="status-badge needs-context" title="' + esc(a.statusEvidence) + '">needs context</span>';
@@ -6219,6 +6690,7 @@
             if (isStale) return '<span class="status-badge needs-context">stale</span>';
             return '';
           })()}${agentSpendChip(a.name)}</div>
+          ${agentBlockerLineHtml(a)}
           ${(() => {
             // Last upstream/launch error stays on its own line below the state
             // badge, never behind the working-indicator dot — previously the
@@ -7255,6 +7727,22 @@
         badge.style.color = isPublic ? 'var(--green)' : 'var(--indigo)';
         badge.title = 'Every repo in this hive is on ' + hostLabel + (isPublic ? '' : ' (GitHub Enterprise)') + ' — this hive is single-host';
       }
+      // Section-header escalation counter: "· N need human review". Escalated
+      // PRs (needs-human label from the escalation ledger) previously had no
+      // section-level signal — nine parked PRs sat invisible to the operator
+      // for a week (kubestellar/console, 2026-09-01). Hidden at zero so a
+      // healthy hive shows nothing extra.
+      const needHumanTotal = repos.reduce((n, r) => n + (r.openPrs || []).filter(p => (p.labels || []).map(l => String(l)).includes('needs-human')).length, 0);
+      const nhEl = document.getElementById('repos-needs-human');
+      if (nhEl) {
+        if (needHumanTotal > 0) {
+          nhEl.textContent = '· ' + needHumanTotal + ' need' + (needHumanTotal === 1 ? 's' : '') + ' human review';
+          nhEl.style.display = 'inline';
+        } else {
+          nhEl.textContent = '';
+          nhEl.style.display = 'none';
+        }
+      }
       setIfChanged(el, repos.map(r => {
         const iSpark = sparkSvg(historyData.map(s => s.repos?.[r.name]?.issues ?? 0), 'var(--blue)');
         const pSpark = sparkSvg(historyData.map(s => s.repos?.[r.name]?.prs ?? 0), 'var(--purple)');
@@ -7279,17 +7767,34 @@
           const prAge = pillAge(p.created_at);
           const labels = (p.labels || []).map(l => String(l));
           const queued = labels.includes(window._hiveAutoMergeLabel || 'lgtm');
-          const prTip = (p.title || '') + (p.author ? ' — @' + p.author : '') + (prAge ? ' (' + prAge + ')' : '') + (p.mergeable ? ' (merge eligible)' : '') + (queued ? ' (queued for auto-merge)' : '');
+          // Escalated out of the automated fix lane: the escalation ledger
+          // (pkg/escalation) applies the `needs-human` label once automated
+          // fix attempts are exhausted. The label list is the single source
+          // of truth — the same signal the ledger writes to GitHub — so this
+          // view cannot drift from the ledger.
+          const needsHuman = labels.includes('needs-human');
+          const prTip = (p.title || '') + (p.author ? ' — @' + p.author : '') + (prAge ? ' (' + prAge + ')' : '') + (p.mergeable ? ' (merge eligible)' : '') + (queued ? ' (queued for auto-merge)' : '') + (needsHuman ? ' (needs human review)' : '');
           const canQueue = dashboardRoleAtLeast(window._hiveRole || 'read', 'merger') && (window._hiveUser || dashboardRoleAtLeast(window._hiveRole || 'read', 'owner')) && !(p.author && window._hiveUser && p.author.toLowerCase() === window._hiveUser.toLowerCase());
           const parts = (r.full || r.name || '').split('/');
           const owner = parts.length > 1 ? parts[0] : '';
           const repoName = parts.length > 1 ? parts.slice(1).join('/') : (r.name || '');
-          const queueBtn = canQueue
-            ? (queued
-                ? '<span class="repo-pr-pill mergeable" title="Already queued for Hive auto-merge on green CI">Queued</span>'
-                : `<button class="repo-pr-pill" style="cursor:pointer" data-action="queuePRAutoMerge" data-arg0="${esc(owner)}" data-arg1="${esc(repoName)}" data-arg2="${p.number}" data-arg-types="s,s,j,t" data-stop="1" data-prevent="1">Queue auto-merge</button>`)
-            : '';
-          return `<a class="repo-pr-pill${mergeClass}" href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(prTip)}"><span class="pill-num">#${p.number}</span><span class="pill-title">${esc(title)}</span>${mergeIcon}</a>${queueBtn}`;
+          // The action-chip slot after the PR pill. needs-human takes
+          // precedence over the Queue auto-merge action: an escalated PR is
+          // out of the automated lane by definition, so offering to queue it
+          // for auto-merge would contradict the escalation. Removing the
+          // needs-human label on GitHub returns the PR to the automated lane
+          // and brings the queue action back on the next refresh.
+          const queueBtn = needsHuman
+            ? '<span class="repo-pr-pill needs-human pill-needs-human-badge" title="Automated fix attempts exhausted — a human must review this PR. Remove the needs-human label after addressing the root cause to return it to the automated fix lane.">⚠ needs human</span>'
+            : (canQueue
+                ? (queued
+                    ? '<span class="repo-pr-pill mergeable" title="Already queued for Hive auto-merge on green CI">Queued</span>'
+                    : `<button class="repo-pr-pill" style="cursor:pointer" data-action="queuePRAutoMerge" data-arg0="${esc(owner)}" data-arg1="${esc(repoName)}" data-arg2="${p.number}" data-arg-types="s,s,j,t" data-stop="1" data-prevent="1">Queue auto-merge</button>`)
+                : '');
+          // needs-human wins the pill tint over mergeable green: a PR can be
+          // technically mergeable AND escalated, and the escalation is what
+          // the operator must see.
+          return `<a class="repo-pr-pill${needsHuman ? ' needs-human' : mergeClass}" href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(prTip)}"><span class="pill-num">#${p.number}</span><span class="pill-title">${esc(title)}</span>${mergeIcon}</a>${queueBtn}`;
         }).join('');
         const allPills = issuePills + prPills;
         const pillsHtml = allPills ? `<div class="repo-issues">${allPills}</div>` : '';
@@ -7303,6 +7808,48 @@
           </div>${pillsHtml}
         </div>`;
       }).join(''));
+    }
+
+    // Operator-initiated repository rescan. The REPOSITORIES cards repaint
+    // from the governor's eval cycle, whose cadence stretches to minutes on a
+    // quiet hive — so an operator who has just closed an issue or opened a PR
+    // is stuck looking at stale pills with no way to ask for a fresh read.
+    // This button asks for one.
+    //
+    // Modelled on the ACMM Re-evaluate button next door: the server enforces
+    // its own debounce, so holding this down cannot spend the GitHub API
+    // budget, and a debounced reply means "already this fresh" — it is
+    // reported as such, never as a failure. The scan is read-only: it
+    // re-enumerates issues and PRs and does NOT kick any agent.
+    async function reposForceRescan() {
+      const btn = document.getElementById('repos-rescan-btn');
+      if (btn && btn.disabled) return;
+      const prev = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = '\u23f3 Scanning...'; }
+      try {
+        const r = await fetch('/api/repos/rescan', { method: 'POST', headers: _inceptionAuthHeaders() });
+        let d = {};
+        try { d = await r.json(); } catch { d = {}; }
+        if (!r.ok) {
+          showToast('Repository rescan failed: ' + (d.error || ('HTTP ' + r.status)), 'error');
+          return;
+        }
+        // The server republishes the status snapshot as part of the scan, so
+        // re-fetch it here rather than waiting for the next poll to repaint.
+        await refreshStatus();
+        if (d.status === 'debounced') {
+          showToast('Repositories are already up to date - next scan in ' + (d.retry_after_s || 0) + 's', 'info');
+        } else if (d.status === 'in-progress') {
+          showToast('A repository scan is already running', 'info');
+        } else {
+          const n = d.repos || 0;
+          showToast('Scanned ' + n + ' repositor' + (n === 1 ? 'y' : 'ies') + ' - ' + (d.issues || 0) + ' issues, ' + (d.prs || 0) + ' PRs', 'success');
+        }
+      } catch (e) {
+        showToast('Repository rescan failed: ' + e.message, 'error');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = prev; }
+      }
     }
 
     // Contributors-style empty-state card, reused by sections that would
@@ -7566,7 +8113,7 @@
     // 'openrouter' is a first-class inference method (an OpenAI-compatible gateway
     // preset), so it appears in every backend/method picker even before a matching
     // Model Gateway is configured — the user picks it, then funds/configures it.
-    const KNOWN_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'codex', 'goose', 'aider', 'vllm', 'llm-d', 'litellm', 'openrouter', 'watsonx'];
+    const KNOWN_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'agy', 'codex', 'goose', 'aider', 'vllm', 'llm-d', 'litellm', 'openrouter', 'watsonx'];
     const FREE_BACKENDS = ['copilot', 'goose'];
     const INFERENCE_BACKENDS = ['vllm', 'llm-d', 'litellm', 'openrouter', 'watsonx'];
     // Names of Model Gateways configured under Settings → Model Gateways
@@ -7664,12 +8211,29 @@
     const BOB_CLI_MODELS = [
       { value: 'auto', label: 'Auto (bob picks)' },
     ];
+    // Google Antigravity exposes an account-aware catalog through `agy models`.
+    // This is the first-paint / failed-probe fallback, captured from agy 1.1.18
+    // on 2026-08-31 in the CLI's own order. Keep in sync with agyStaticModels
+    // in cli_models_agy.go.
+    const AGY_CLI_MODELS = [
+      { value: 'gemini-3.7-flash-high', label: 'Gemini 3.7 Flash (High)' },
+      { value: 'gemini-3.7-flash-medium', label: 'Gemini 3.7 Flash (Medium)' },
+      { value: 'gemini-3.7-flash-low', label: 'Gemini 3.7 Flash (Low)' },
+      { value: 'gemini-3.6-flash-high', label: 'Gemini 3.6 Flash (High)' },
+      { value: 'gemini-3.6-flash-medium', label: 'Gemini 3.6 Flash (Medium)' },
+      { value: 'gemini-3.6-flash-low', label: 'Gemini 3.6 Flash (Low)' },
+      { value: 'gemini-3.1-pro-high', label: 'Gemini 3.1 Pro (High)' },
+      { value: 'gemini-3.1-pro-low', label: 'Gemini 3.1 Pro (Low)' },
+      { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (Thinking)' },
+      { value: 'claude-opus-4-6-thinking', label: 'Claude Opus 4.6 (Thinking)' },
+      { value: 'gpt-oss-120b-medium', label: 'GPT-OSS 120B (Medium)' },
+    ];
     const KNOWN_MODELS = COPILOT_CLI_MODELS;
     // CLI_BACKENDS gates which /api/config/backends entries populate
-    // BACKEND_MODELS. bob is included so its server-served single-option list
-    // is honored; without it bob's entry would be dropped and modelsForBackend
-    // would fall through to the copilot catalog.
-    const CLI_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'goose', 'codex'];
+    // BACKEND_MODELS. Every CLI with a server-served inventory must appear
+    // here; otherwise its entry is dropped and modelsForBackend falls back to
+    // the pre-discovery catalog (or, for an omitted unknown CLI, Copilot's).
+    const CLI_BACKENDS = ['claude', 'copilot', 'bob', 'gemini', 'agy', 'goose', 'codex'];
     // BACKEND_MODELS holds the live-discovered model list for every backend
     // (inference AND cli), keyed by backend id. INFERENCE_MODELS is kept as
     // an alias to the same object for backward compatibility with existing
@@ -7685,6 +8249,7 @@
       copilot: COPILOT_CLI_MODELS,
       bob: BOB_CLI_MODELS,
       gemini: COPILOT_CLI_MODELS,
+      agy: AGY_CLI_MODELS,
       goose: COPILOT_CLI_MODELS,
       codex: CODEX_CLI_MODELS,
     };
@@ -7692,6 +8257,7 @@
       // Configured gateways (e.g. openrouter) are inference/gateway backends,
       // so they carry the same ⚡ marker as vllm/llm-d/litellm.
       if (INFERENCE_BACKENDS.includes(b) || _configuredGateways.includes(b)) return b + ' ⚡';
+      if (b === 'agy') return 'Google Antigravity (agy)';
       return b;
     }
     // Auto-select sentinels: values meaning "let the CLI pick its own model"
@@ -7910,12 +8476,55 @@
     // when the model is observed available again.
     const _modelHealFired = {};
 
+    // Auto-heal HEAL TARGETS, per backend. Appearing in a discovery catalog is
+    // NOT proof the backend's CLI can run a model, and auto-heal pins an agent
+    // to its target for real work — so the target is drawn from a known-good
+    // set rather than from `available[0]` (#5338).
+    //
+    // The claude catalog is the strict case that motivated this: it is
+    // discovered from api.anthropic.com/v1/models, which enumerates what the
+    // ACCOUNT may call over the HTTP API — a superset of what the bundled
+    // `claude` CLI can drive. A model the CLI advertises but whose adapter
+    // cannot build a request still lists cleanly, and because /v1/models is
+    // newest-first, that model lands at available[0] — exactly the slot the
+    // old code auto-assigned. On the reporting hive that pinned the only
+    // write-capable agent to a model whose every call died in the CLI's
+    // request builder, and re-applied it at each boot, defeating config-file
+    // remediation.
+    //
+    // The bare aliases are the safe targets: `claude --model opus|sonnet|haiku`
+    // resolves through the CLI's OWN current-model mapping, so the CLI can only
+    // ever select something it can actually drive. They are also in
+    // claudeAlwaysIncludeModels (cli_models.go), so they are present in every
+    // served claude list — live-discovered or static fallback.
+    //
+    // Backends absent from this map keep the previous first-available
+    // behavior: this narrows the blast radius to the backend the failure was
+    // reported against rather than re-tuning heal targets fleet-wide.
+    const MODEL_HEAL_PREFERRED_TARGETS = {
+      claude: ['sonnet', 'opus', 'haiku'],
+    };
+
+    // healTargetFor picks the model auto-heal should switch an agent TO.
+    // Returns '' when no vetted target is available, which SUPPRESSES the heal
+    // — leaving a model that is merely absent from one catalog beats pinning
+    // the agent to one its CLI cannot run.
+    function healTargetFor(backend, available) {
+      const preferred = MODEL_HEAL_PREFERRED_TARGETS[backend];
+      if (!preferred) return available[0] || '';
+      for (const want of preferred) {
+        const hit = available.find(v => _modelIdMatches(v, want));
+        if (hit) return hit;
+      }
+      return '';
+    }
+
     function reconcileModelsAfterDiscovery(backend, models, fallback) {
       // Guard: only act on a genuinely successful discovery. Never switch
       // based on unverified static aliases or an empty list.
       if (fallback || !models || !models.length) return;
       const available = models.map(m => m.value);
-      const first = available[0];
+      const first = healTargetFor(backend, available);
       const isAvailable = (m) => available.some(v => _modelIdMatches(v, m));
       const now = Date.now();
 
@@ -7952,6 +8561,14 @@
         if (isAutoModelSentinel(backend, a.model)) return; // auto-select value — never a concrete id, never healed
         const key = `${backend}|${a.name}`;
         if (isAvailable(a.model)) { _markAvailable(key, a.model); return; } // still valid — leave untouched (idempotent)
+        // No vetted heal target for this backend — keep the current model.
+        // Checked BEFORE _confirmAbsent so the absence clock and the
+        // once-per-disappearance guard are not consumed by a heal that cannot
+        // fire; a target appearing later still gets its chance (#5338).
+        if (!first) {
+          console.warn(`model ${a.model} missing from ${backend} discovery but no vetted heal target is available — keeping selection`);
+          return;
+        }
         if (!_confirmAbsent(key, a.model)) return; // unconfirmed or already healed — no switch
         const label = a.displayName || a.name;
         const pinNote = (a.pinnedModel || a.pinnedBoth) ? ' (was pinned — model gone from provider)' : '';
@@ -7969,7 +8586,7 @@
         const defKey = `${backend}|__defaultModel__`;
         if (saved && isAvailable(saved)) {
           _markAvailable(defKey, saved);
-        } else if (saved && _confirmAbsent(defKey, saved)) {
+        } else if (saved && first && _confirmAbsent(defKey, saved)) {
           _configState.data.litellm.defaultModel = first;
           fetch('/api/config/governor/litellm', {
             method: 'PUT',
@@ -9247,14 +9864,44 @@ function burnAreaChart() {
       } catch (e) { /* transient — leave last render in place */ }
     }
 
-    // PANEL B — lifecycle timeline + fleet health.
+    // Short chip labels for the journey stage axis; keys are the closed Kind
+    // set served by /api/lifecycle-timeline.
+    const LC_STAGE_AXIS = ['enumerated', 'classified', 'kicked', 'pr_opened', 'merged', 'blocked'];
+    const LC_STAGE_LABEL = {
+      enumerated: 'enum', classified: 'class', kicked: 'kick',
+      pr_opened: 'pr', merged: 'merged', blocked: 'blocked'
+    };
+
+    // Format the fleet-health coverage note: counts are honest only relative
+    // to how much history the store actually holds (coveredMs), which can be
+    // shorter than the requested window right after first deploy.
+    function lcWindowLabel(fleet) {
+      const windowMs = Number(fleet.windowMs) || 0;
+      const coveredMs = Number(fleet.coveredMs) || 0;
+      const fmt = (ms) => {
+        const min = Math.round(ms / 60000);
+        if (min < 60) return min + 'm';
+        const hr = Math.round(min / 60);
+        if (hr < 48) return hr + 'h';
+        return Math.round(hr / 24) + 'd';
+      };
+      if (!windowMs) return '';
+      if (coveredMs > 0 && coveredMs < windowMs) {
+        return `over the last ${fmt(coveredMs)} of recorded history (window ${fmt(windowMs)})`;
+      }
+      return `over the last ${fmt(windowMs)}`;
+    }
+
+    // PANEL B — lifecycle journeys + fleet health. One row per work item:
+    // reached stage chips in journey order (current stage colored, earlier
+    // ones dimmed), latest agent, last activity.
     function renderLifecycle(dto) {
       const section = document.getElementById('lifecycle-section');
       const card = document.getElementById('lifecycle-card');
       if (!section || !card) return;
       dto = dto || {};
       const fleet = dto.fleet || {};
-      const events = Array.isArray(dto.events) ? dto.events : [];
+      const journeys = Array.isArray(dto.journeys) ? dto.journeys : [];
 
       section.style.display = '';
 
@@ -9266,27 +9913,38 @@ function burnAreaChart() {
         <div class="lc-fleet-stat"><div class="val merged">${merged}</div><div class="lbl">Merged</div></div>
         <div class="lc-fleet-stat"><div class="val blocked">${blocked}</div><div class="lbl">Blocked</div></div>
       </div>`;
+      const windowLabel = lcWindowLabel(fleet);
+      const windowHtml = windowLabel ? `<div class="lc-window">${escapeHtml(windowLabel)}</div>` : '';
 
       let listHtml;
-      if (events.length === 0) {
-        listHtml = `<div class="lc-empty">No lifecycle events yet — the governor only recently started recording them.</div>`;
+      if (journeys.length === 0) {
+        listHtml = `<div class="lc-empty">No lifecycle journeys yet — they appear as the governor enumerates and works issues.</div>`;
       } else {
-        listHtml = `<ul class="lc-events">${events.map((e) => {
-          e = e || {};
-          const kind = e.kind || '';
-          const ref = escapeHtml(e.issueRef || '');
-          const agent = e.agent ? escapeHtml(e.agent) : '';
-          const rel = v4RelTime(e.at);
+        listHtml = `<ul class="lc-journeys">${journeys.map((j) => {
+          j = j || {};
+          const stages = j.stages || {};
+          const current = j.current || '';
+          const ref = escapeHtml(j.ref || '');
+          const chips = LC_STAGE_AXIS.filter((k) => stages[k]).map((k) => {
+            const st = stages[k] || {};
+            const isCurrent = k === current;
+            const cls = isCurrent ? `lc-kind ${v4KindClass(k)}` : 'lc-kind neutral lc-stage past';
+            const count = Number(st.count) > 1 ? ` ×${Number(st.count)}` : '';
+            const title = `${k}${count} — ${v4RelTime(st.lastAt) || ''}`;
+            return `<span class="${cls}" title="${escapeHtml(title)}">${escapeHtml(LC_STAGE_LABEL[k] || k)}</span>`;
+          }).join('<span class="lc-stage-arrow">→</span>');
+          const agent = j.agent ? escapeHtml(j.agent) : '';
+          const rel = v4RelTime(j.lastAt);
           const agentHtml = agent ? `<span class="lc-agent">${agent}</span>` : '';
           const timeHtml = rel ? `<span class="lc-time">${escapeHtml(rel)}</span>` : '';
-          return `<li class="lc-event">
-            <span class="lc-kind ${v4KindClass(kind)}">${escapeHtml(kind || '—')}</span>
-            <span class="lc-ref">${ref || '—'}</span>${agentHtml}${timeHtml}
+          return `<li class="lc-journey">
+            <span class="lc-ref">${ref || '—'}</span>
+            <span class="lc-stages">${chips}</span>${agentHtml}${timeHtml}
           </li>`;
         }).join('')}</ul>`;
       }
 
-      card.innerHTML = fleetHtml + listHtml;
+      card.innerHTML = fleetHtml + windowHtml + listHtml;
       applySectionCollapse('lifecycle-section');
     }
 
@@ -13786,6 +14444,31 @@ function burnAreaChart() {
       const ghCorePct = ghCoreLimit > 0 ? Math.round((ghCoreUsed / ghCoreLimit) * 100) : 0;
       const ghResetRaw = ghRate.core?.reset;
       const ghResetAt = ghResetRaw ? new Date(typeof ghResetRaw === 'number' ? ghResetRaw * 1000 : ghResetRaw).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+      // How old is this reading? (#5733) The card used to show only `reset`,
+      // which moves independently of when the sample was taken — so a value
+      // that had stopped updating looked exactly like a fresh one. A reading
+      // held back by the monotone clamp keeps its original observed_at, so the
+      // age below is what makes that visible.
+      const GH_RATE_STALE_SECONDS = 300;
+      const ghObservedRaw = ghRate.core?.observed_at;
+      let ghObservedHtml = '';
+      if (ghObservedRaw) {
+        const observedMs = new Date(ghObservedRaw).getTime();
+        if (!Number.isNaN(observedMs)) {
+          const ageSec = Math.max(0, Math.floor((Date.now() - observedMs) / 1000));
+          const ageStr = ageSec < 60
+            ? ageSec + 's ago'
+            : ageSec < 3600
+              ? Math.floor(ageSec / 60) + 'm ago'
+              : Math.floor(ageSec / 3600) + 'h ago';
+          const stale = ageSec >= GH_RATE_STALE_SECONDS;
+          const color = stale ? 'var(--yellow)' : 'var(--muted)';
+          const title = stale
+            ? 'This reading has not refreshed recently — treat the headroom above as a floor, not a live value'
+            : 'When this rate-limit reading was taken';
+          ghObservedHtml = `<div style="${rowStyle}"><span>Measured</span><span style="color:${color}" title="${escapeHtml(title)}">${ageStr}</span></div>`;
+        }
+      }
       const ghIdentity = ghRate.identity || {};
       const ghIdentityLabel = ghIdentity.label || 'unknown';
       const ghIdentityType = ghIdentity.type || 'unknown';
@@ -13810,6 +14493,7 @@ function burnAreaChart() {
           <div style="${rowStyle}"><span>Identity</span><span>${ghIdentityBadge} ${esc(ghIdentityLabel)}</span></div>
           <div style="${rowStyle}"><span>Core API</span><span style="font-weight:600">${ghCoreUsed} / ${ghCoreLimit} (${ghCorePct}%)</span></div>
           <div style="${rowStyle}"><span>Resets at</span><span>${ghResetAt}</span></div>
+          ${ghObservedHtml}
           <div style="margin-top:6px;height:6px;background:var(--line);border-radius:3px;overflow:hidden">
             <div style="height:100%;width:${ghCorePct}%;background:${ghCorePct > 80 ? 'var(--red)' : ghCorePct > 50 ? 'var(--yellow)' : 'var(--green)'};border-radius:3px;transition:width 0.3s"></div>
           </div>
@@ -14012,6 +14696,7 @@ function burnAreaChart() {
       const agent = el.dataset.agent || '';
       switch (action) {
         case 'toggleAgent': toggleAgent(agent, el.dataset.paused === 'true'); break;
+        case 'startResumeAgent': startResumeAgent(agent); break;
         case 'restartAgent': restartAgent(agent); break;
         case 'openConfigDialog': { const ct = el.dataset.configType || el.dataset.arg0 || 'agent'; const tab = el.dataset.tab || el.dataset.arg2 || null; if (el.classList.contains('agent-link')) { closeConfigDialog(); setTimeout(() => openConfigDialog(ct, agent, tab), 100); } else { openConfigDialog(ct, agent || null, tab); } } break;
         case 'ocSendKick': ocSendKick(agent); break;
@@ -14019,6 +14704,10 @@ function burnAreaChart() {
         case 'kick': kick(agent); break;
         case 'kickEmpty': { const inp = document.getElementById('kick-prompt-' + agent); if (inp) inp.value = ''; kick(agent); } break;
         case 'openTerminal': e.preventDefault(); openTerminal(agent, el.href); break;
+        case 'openAuthenticatedLink': e.preventDefault(); openAuthenticatedLink(el.href, el.hasAttribute('download')); break;
+        case 'copyTerminalUrl': e.stopPropagation(); copyTerminalUrl(agent); break;
+        case 'submitLoginCode': e.stopPropagation(); submitLoginCode(agent); break;
+        case 'showTerminalKeyboardHint': e.stopPropagation(); showTerminalKeyboardHint(); break;
         case 'togglePin': togglePin(agent, el.dataset.pinType, el.dataset.unpin === 'true'); break;
         case 'resetRestarts': resetRestarts(agent); break;
         case 'deleteAgentFromConfig': deleteAgentFromConfig(agent); break;
@@ -14204,6 +14893,75 @@ function burnAreaChart() {
       }
     }
 
+    // postJSON POSTs to an API endpoint and returns its decoded JSON body.
+    //
+    // The endpoints we control always answer JSON, but an intermediary need
+    // not: an auth proxy can answer a session-expiry redirect, an ingress can
+    // answer a 502/504, and both bodies are HTML. Calling res.json() on those
+    // throws a parser error ("Unexpected token '<'"), and the caller's catch
+    // then reports the parser's complaint instead of the actual failure —
+    // hiding whether the fix is "sign in again" or "the spoke is unreachable".
+    //
+    // So sniff the content type first and, when it is not JSON, throw an Error
+    // whose message names the real HTTP condition. Callers keep their existing
+    // catch and now surface something an operator can act on.
+    async function postJSON(url, opts) {
+      const res = await fetch(url, opts);
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        // 401/403 is the session-expiry case and has a specific remedy; every
+        // other non-JSON answer is reported by its status so a screenshot still
+        // carries the diagnosis.
+        throw new Error(res.status === 401 || res.status === 403
+          ? 'session expired — reload and sign in again'
+          : `server returned ${res.status} ${res.statusText || 'error'}`);
+      }
+      return await res.json();
+    }
+
+    // Kick delivery is asynchronous (#5325). POST /api/kick answers 202 as soon
+    // as the message is queued; whether it actually reached the CLI is read
+    // from GET /api/kick/{agent}/status. Poll that until it settles.
+    //
+    // The wait can legitimately run to the server's input-prompt timeout (120s)
+    // when a CLI is slow to present its prompt, so the ceiling here is above it
+    // — and running out of poll budget is reported as STILL PENDING, never as a
+    // failure. That distinction is the whole point of the issue: an
+    // indeterminate kick that gets rendered as failed is what made operators
+    // click Kick again and deliver the work twice.
+    const KICK_POLL_INTERVAL_MS = 2000;
+    const KICK_POLL_TIMEOUT_MS = 150000;
+
+    async function pollKickOutcome(agent) {
+      const deadline = Date.now() + KICK_POLL_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, KICK_POLL_INTERVAL_MS));
+        try {
+          const res = await fetch(`/api/kick/${agent}/status`);
+          const contentType = res.headers.get('content-type') || '';
+          if (!contentType.includes('application/json')) continue;
+          const data = await res.json();
+          if (data.status === 'delivered') return { settled: true, ok: true };
+          if (data.status === 'failed') return { settled: true, ok: false, error: data.error || 'unknown' };
+        } catch (e) {
+          // A transient poll failure says nothing about the kick. Keep polling.
+        }
+      }
+      return { settled: false };
+    }
+
+    // reportKickOutcome renders a queued kick's true result, or leaves the
+    // operator with an explicitly indeterminate message if it never settles.
+    async function reportKickOutcome(agent, toast, queuedMsg) {
+      const outcome = await pollKickOutcome(agent);
+      if (!outcome.settled) {
+        dismissToast(toast, `${queuedMsg} — still waiting for ${agent}'s CLI; check the terminal`, 'info');
+        return;
+      }
+      if (outcome.ok) { dismissToast(toast, `Kicked ${agent}`, 'success'); return; }
+      dismissToast(toast, 'Kick failed: ' + outcome.error, 'error');
+    }
+
     async function kick(agent) {
       const input = document.getElementById(`kick-prompt-${agent}`);
       const prompt = input ? input.value.trim() : '';
@@ -14215,11 +14973,14 @@ function burnAreaChart() {
       // request still surfaces feedback instead of silently doing nothing.
       const toast = showToast(`Kicking ${agent}...`, 'info', true);
       try {
-        const res = await fetch(`/api/kick/${agent}`, opts);
-        const data = await res.json();
+        const data = await postJSON(`/api/kick/${agent}`, opts);
         if (!data.ok) { dismissToast(toast, 'Kick failed: ' + (data.error || 'unknown'), 'error'); return; }
-        dismissToast(toast, `Kicked ${agent}`, 'success');
         if (input) input.value = '';
+        if (data.status === 'in-flight') {
+          dismissToast(toast, `A kick is already being delivered to ${agent}`, 'info');
+          return;
+        }
+        await reportKickOutcome(agent, toast, `Queued for ${agent}`);
       } catch (e) {
         dismissToast(toast, 'Kick failed: ' + e.message, 'error');
       }
@@ -14306,6 +15067,24 @@ function burnAreaChart() {
       // Update in-memory agent state so cadence table re-renders correctly
       const agentObj = (window._lastAgents || []).find(a => a.name === agent);
       if (agentObj) { agentObj.paused = nowPaused; }
+      // The blockers line and the toggle tooltip (#5594) both render from the
+      // agent object, so patch them from the SAME authoritative state. Left
+      // alone they would keep saying "paused" after a successful resume until
+      // the next poll — the stale-control bug this function already exists to
+      // prevent for the button label.
+      if (agentObj) {
+        document.querySelectorAll(`.agent-card[data-agent="${CSS.escape(agent)}"] .agent-blockers`)
+          .forEach(el => { el.outerHTML = agentBlockerLineHtml(agentObj); });
+        document.querySelectorAll(`.agent-card[data-agent="${CSS.escape(agent)}"] .btn-toggle`)
+          .forEach(el => {
+            // A just-paused agent gets the full combined-action rebuild —
+            // the combined start-and-resume button when its session is also
+            // down (#5594 follow-up); an unpaused one only needs its tooltip
+            // refreshed.
+            if (nowPaused) el.outerHTML = pausedAgentActionHtml(agentObj);
+            else el.title = agentToggleTitle(agentObj, false, false);
+          });
+      }
       // The focused agent-detail panel renders its own toggle button — the
       // .agent-card loop above never reaches it, so re-render it from the
       // just-updated state or the button stays stale until navigation.
@@ -14325,6 +15104,40 @@ function burnAreaChart() {
       } else {
         dismissToast(toast, `${agent} ${action}d`, 'success');
       }
+    }
+
+    // Combined start & resume for a paused agent whose session is also down
+    // (#5594 follow-up to resume-leads). Client-side chain of the two
+    // existing endpoints — resume FIRST so the pause is cleared before the
+    // supervisor spawns the session (a session started while still paused
+    // would just sit unkickable), then restart, which for a down session is
+    // simply "start". No confirm dialog: unlike restartAgent there is no
+    // live session to kill.
+    async function startResumeAgent(agent) {
+      const toast = showToast(`Starting & resuming ${agent}...`, 'info', true);
+      try {
+        const res = await fetch(`/api/resume/${agent}`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.ok) { dismissToast(toast, `Resume failed: ${data.error || 'unknown'}`, 'error'); return; }
+        const res2 = await fetch(`/api/restart/${agent}`, { method: 'POST' });
+        const data2 = await res2.json();
+        if (!data2.ok) { dismissToast(toast, `Resumed, but session start failed: ${data2.error || 'unknown'}`, 'error'); return; }
+      } catch (e) {
+        dismissToast(toast, `Start & resume failed: ${e}`, 'error');
+        return;
+      }
+      // Same optimistic patch discipline as toggleAgent: the blockers line
+      // and the action button render from the agent object, so update it and
+      // repaint before the next poll confirms.
+      const agentObj = (window._lastAgents || []).find(x => x.name === agent);
+      if (agentObj) {
+        agentObj.paused = false;
+        document.querySelectorAll(`.agent-card[data-agent="${CSS.escape(agent)}"] .agent-blockers`)
+          .forEach(el => { el.outerHTML = agentBlockerLineHtml(agentObj); });
+      }
+      if (typeof ocRenderAgentDetail === 'function') ocRenderAgentDetail();
+      refreshStatus();
+      dismissToast(toast, `${agent} resumed — supervisor is starting the session`, 'success');
     }
 
     async function restartAgent(agent) {
@@ -14833,11 +15646,15 @@ function burnAreaChart() {
     }
 
     function acmmCriterionRow(c, repoName) {
-      const icon = c.passed ? '✅' : '❌';
+      // ❔ = GitHub did not answer for every pattern (rate limit, timeout,
+      // error). Not a gap: no Open Issue button, excluded from Open All.
+      const icon = c.unknown ? '❔' : (c.passed ? '✅' : '❌');
       const tip = ACMM_CRITERION_TIPS[c.id] || '';
       const patternItems = (c.patterns || []).map(p => '<span style="display:inline-block;font-size:0.68rem;background:var(--bg);padding:1px 6px;border-radius:3px;border:1px solid var(--border);margin:1px 2px;font-family:var(--font-mono)">' + escapeHtml(p) + '</span>').join('');
       let issueBtn = '';
-      if (!c.passed) {
+      if (c.unknown) {
+        issueBtn = '<span class="muted-xs" style="margin-left:auto;white-space:nowrap" title="The evaluation could not check this criterion — GitHub returned an error or the per-repo time budget ran out. Re-evaluate before treating it as a gap.">not evaluated</span>';
+      } else if (!c.passed) {
         const repo = repoName || _acmmSelectedRepo || '';
         const issueKey = repo + ':' + c.id;
         const existing = _acmmOpenedIssues[issueKey];
@@ -14952,7 +15769,7 @@ function burnAreaChart() {
     function acmmOpenAllIssuesForLevel(level) {
       if (!_acmmEvalData) return;
       const active = acmmGetActiveData();
-      const criteria = (active.criteria_results || active.CriteriaResults || []).filter(c => c.level === level && !c.passed);
+      const criteria = (active.criteria_results || active.CriteriaResults || []).filter(c => c.level === level && !c.passed && !c.unknown);
       if (criteria.length === 0) return;
       const repos = (_acmmEvalData.repo_results || []);
       const hasMultiRepo = repos.length > 1;
@@ -14989,11 +15806,32 @@ function burnAreaChart() {
 
     async function acmmBatchCreateIssues(level) {
       const active = acmmGetActiveData();
-      const criteria = (active.criteria_results || []).filter(c => c.level === level && !c.passed);
+      const criteria = (active.criteria_results || []).filter(c => c.level === level && !c.passed && !c.unknown);
       const repos = (_acmmEvalData.repo_results || []);
       const targetRepo = _acmmSelectedRepo || (repos.length === 1 ? repos[0].repo : null);
 
       let created = 0, failed = 0, skipped = 0;
+      // #5873: every failure used to collapse into a bare `failed++` while the
+      // server's response body — which carries the actual GitHub error, e.g.
+      // "410 Issues has been disabled in this repository" — was discarded
+      // unread. The summary then appended fixed template text about the acmm +
+      // ai-fix-requested labels, which reads as a diagnosis and sent operators
+      // chasing labels that were never the problem. Collect the real reason
+      // per failing repo:criterion instead, deduped, exactly as the
+      // single-issue path already shows it.
+      const failures = new Map(); // reason -> [repo:criterion, ...]
+      const recordFailure = async (where, r) => {
+        failed++;
+        let reason;
+        if (r instanceof Response) {
+          try { reason = (await r.text()).trim(); } catch { /* body unreadable */ }
+          reason = reason || ('HTTP ' + r.status + ' ' + r.statusText);
+        } else {
+          reason = 'network error: ' + (r && r.message ? r.message : r);
+        }
+        if (!failures.has(reason)) failures.set(reason, []);
+        failures.get(reason).push(where);
+      };
       acmmShowDialog('Creating Issues...', '<p id="acmm-batch-progress" class="text-base">0/' + criteria.length + ' created...</p>');
 
       for (const c of criteria) {
@@ -15008,14 +15846,14 @@ function burnAreaChart() {
             if (r.ok) {
               acmmRememberIssue(issueKey, await r.json());
               created++;
-            } else { failed++; }
-          } catch { failed++; }
+            } else { await recordFailure(issueKey, r); }
+          } catch (e) { await recordFailure(targetRepo + ':' + c.id, e); }
         } else {
           for (const rr of repos) {
             const issueKey = rr.repo + ':' + c.id;
             if (_acmmOpenedIssues[issueKey]) { skipped++; continue; }
             const rc = (rr.criteria_results || []).find(x => x.id === c.id);
-            if (rc && !rc.passed) {
+            if (rc && !rc.passed && !rc.unknown) {
               try {
                 const r = await fetch('/api/acmm/issue', {
                   method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -15024,16 +15862,25 @@ function burnAreaChart() {
                 if (r.ok) {
                   acmmRememberIssue(issueKey, await r.json());
                   created++;
-                } else { failed++; }
-              } catch { failed++; }
+                } else { await recordFailure(issueKey, r); }
+              } catch (e) { await recordFailure(issueKey, e); }
             }
           }
         }
         const prog = document.getElementById('acmm-batch-progress');
         if (prog) prog.textContent = created + '/' + criteria.length + ' created' + (failed > 0 ? ' (' + failed + ' failed)' : '') + (skipped > 0 ? ' (' + skipped + ' skipped)' : '') + '...';
       }
+      // The label note is a description of what a SUCCESSFUL create did, not a
+      // diagnosis — show it only when something was actually created (#5873).
       const labelNote = acmmEffectiveTracker() === 'linear' ? ' in Linear.' : ' with <code>acmm</code> + <code>ai-fix-requested</code> labels.';
-      acmmShowDialog('Issues Created', '<p class="text-base">' + created + ' issue(s) created' + (failed > 0 ? ', ' + failed + ' failed' : '') + (skipped > 0 ? ', ' + skipped + ' already existed' : '') + labelNote + '</p>');
+      let html = '<p class="text-base">' + created + ' issue(s) created' + (skipped > 0 ? ', ' + skipped + ' already existed' : '') + (created > 0 ? labelNote : '.') + '</p>';
+      if (failed > 0) {
+        html += '<p class="text-base" style="margin-top:8px">' + failed + ' failed:</p>';
+        for (const [reason, wheres] of failures) {
+          html += '<p class="error-note" style="margin-top:6px">' + escapeHtml(reason) + '<br><span style="font-size:0.7rem;color:var(--muted)">' + escapeHtml(wheres.join(', ')) + '</span></p>';
+        }
+      }
+      acmmShowDialog(failed > 0 ? 'Issues Created (' + failed + ' failed)' : 'Issues Created', html);
     }
 
     function acmmShowLevelDialog(level, repoName) {
@@ -15049,7 +15896,7 @@ function burnAreaChart() {
       const statusColor = passed ? 'var(--green)' : (pct > 40 ? 'var(--yellow)' : 'var(--red)');
       const statusText = passed ? '✓ Passed' : '✗ Not passed';
       const threshold = lvlData ? Math.round(lvlData.threshold * 100) : 70;
-      const failCount = criteria.filter(c => !c.passed).length;
+      const failCount = criteria.filter(c => !c.passed && !c.unknown).length;
 
       const byCategory = {};
       for (const c of criteria) {
@@ -15096,10 +15943,11 @@ function burnAreaChart() {
       const active = acmmGetActiveData();
       const codeLevel = active.codebase_level !== undefined ? active.codebase_level : active.CodebaseLevel;
       const name = ACMM_LEVEL_NAMES[codeLevel] || 'None';
+      const scopeNote = _acmmSelectedRepo ? ' Showing ' + escapeHtml(_acmmSelectedRepo) + '.' : (hasMultiRepo ? ' A criterion passes if it exists in <em>any</em> repo.' : '');
 
       let html = '<div style="margin-bottom:14px">' +
         '<p style="font-size:0.78rem;color:var(--muted);margin:0 0 10px">Each level requires ≥70% of its criteria to pass. Levels must pass in order.' +
-        (hasMultiRepo ? ' A criterion passes if it exists in <em>any</em> repo.' : '') + '</p></div>';
+        scopeNote + '</p></div>';
 
       // Find first failing level for the "blocked at" callout
       const levels = active.levels || active.Levels || [];
@@ -15114,7 +15962,7 @@ function burnAreaChart() {
           '<span data-action="acmmShowLevelDialog" data-arg0="' + firstFail.level + '" data-arg-types="j" style="color:var(--blue);cursor:pointer;text-decoration:underline">View missing criteria →</span></div>';
       }
 
-      if (hasMultiRepo) {
+      if (hasMultiRepo && !_acmmSelectedRepo) {
         // Multi-repo: level bars only inside each repo's expandable
         html += '<div>';
         for (let ri = 0; ri < d.repo_results.length; ri++) {
@@ -15187,18 +16035,23 @@ function burnAreaChart() {
     function acmmShowOverallDialog() {
       if (!_acmmEvalData) return;
       const d = _acmmEvalData;
-      const overallName = ACMM_LEVEL_NAMES[d.overall_level] || 'None';
-      const lower = d.codebase_level <= d.operational_level ? 'codebase readiness' : 'operational autonomy';
-      acmmShowDialog('Overall ACMM Level — L' + d.overall_level + ' ' + escapeHtml(overallName),
+      const active = acmmGetActiveData();
+      const codebaseLevel = Number.isFinite(active.codebase_level) ? active.codebase_level : d.codebase_level;
+      const overallLevel = Math.min(codebaseLevel, d.operational_level);
+      const scope = _acmmSelectedRepo ? escapeHtml(_acmmSelectedRepo) : 'all repos (union aggregate)';
+      const overallName = ACMM_LEVEL_NAMES[overallLevel] || 'None';
+      const lower = codebaseLevel <= d.operational_level ? 'codebase readiness' : 'operational autonomy';
+      acmmShowDialog('Overall ACMM Level — L' + overallLevel + ' ' + escapeHtml(overallName),
         '<p class="dialog-note">The overall ACMM level is the <strong>minimum</strong> of codebase readiness and operational autonomy. Both dimensions must align — a high operational level means nothing if the repo lacks foundational tooling, and vice versa.</p>' +
+        '<p class="dialog-note">Codebase scope: ' + scope + '. Operational autonomy is hive-wide.</p>' +
         '<div style="display:flex;gap:12px;margin-bottom:12px">' +
         '<div class="card-tile" data-action="gh23">' +
-        '<div class="stat-num">L' + d.codebase_level + '</div><div class="muted-xs">Codebase</div></div>' +
+        '<div class="stat-num">L' + codebaseLevel + '</div><div class="muted-xs">Codebase</div></div>' +
         '<div class="card-tile" data-action="gh24">' +
         '<div class="stat-num">L' + d.operational_level + '</div><div class="muted-xs">Operational</div></div>' +
         '</div>' +
         '<div style="padding:10px;background:var(--bg);border-radius:6px;border:1px solid var(--border);font-size:0.8rem">' +
-        '→ Overall is <strong>L' + d.overall_level + '</strong> because ' + lower + ' is the limiting factor.</div>'
+        '→ Overall is <strong>L' + overallLevel + '</strong> because ' + lower + ' is the limiting factor.</div>'
       );
     }
 
@@ -15211,13 +16064,14 @@ function burnAreaChart() {
       const totalPassed = results.filter(c => c.passed).length;
       const hasMultiRepo = (d.repo_results || []).length > 1;
 
-      let html = '<p class="dialog-note">' + totalPassed + ' of ' + results.length + ' criteria detected' + (hasMultiRepo ? ' (aggregate across ' + d.repo_results.length + ' repos)' : '') + '. Click a level row to see details.</p>';
+      const criteriaScope = _acmmSelectedRepo ? ' for ' + escapeHtml(_acmmSelectedRepo) : (hasMultiRepo ? ' (union aggregate across ' + d.repo_results.length + ' repos)' : '');
+      let html = '<p class="dialog-note">' + totalPassed + ' of ' + results.length + ' criteria detected' + criteriaScope + '. Click a level row to see details.</p>';
 
       for (const lvl of levels) {
         const criteria = results.filter(c => c.level === lvl.level);
         const pct = Math.round(lvl.score * 100);
         const color = lvl.passed ? 'var(--green)' : (pct > 40 ? 'var(--yellow)' : 'var(--red)');
-        const failCount = criteria.filter(c => !c.passed).length;
+        const failCount = criteria.filter(c => !c.passed && !c.unknown).length;
         html += '<div style="margin-bottom:8px">' +
           '<div data-action="ghAcmmCloseAndShowLevel" data-arg0="' + lvl.level + '" data-arg-types="j" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;padding:6px 8px;background:var(--bg);border-radius:6px;border:1px solid var(--border);transition:border-color .15s" data-mouseover-action="gh22" data-mouseout-action="gh21">' +
           '<span style="font-size:0.82rem;font-weight:600">L' + lvl.level + ' ' + escapeHtml(lvl.name) + '</span>' +
@@ -15266,24 +16120,171 @@ function burnAreaChart() {
       acmmRenderCard();
     }
 
+    // #5822. Everything below answers one question the panel could not answer:
+    // WHICH repo is lagging, and by how much.
+    //
+    // The aggregate the card headlines is a UNION — evaluateAllRepos marks a
+    // criterion passed if ANY repo has it (api_acmm_eval.go). That is a
+    // defensible number for "what has this hive demonstrated anywhere" and the
+    // wrong one for "is my fleet ready": a repo meeting none of the 43 criteria
+    // does not move the headline at all, so it is invisible. The per-repo data
+    // to say otherwise was already in the payload; nothing here fetches
+    // anything new.
+
+    // acmmFirstFailingLevel returns the lowest level a repo has not passed —
+    // the one it is BLOCKED at. Levels must pass in order, so the first failure
+    // is the whole story; reporting the count of failures instead would rank a
+    // repo stuck at L2 below one that merely has gaps at L5.
+    function acmmFirstFailingLevel(rr) {
+      for (const lvl of (rr.levels || [])) {
+        if (!lvl.passed) return lvl;
+      }
+      return null;
+    }
+
+    // acmmRepoGapRows ranks repos worst-first.
+    //
+    // The primary key is the GAP (unmet criteria), not the percentage: with a
+    // fixed criteria set the two agree, and the raw count is what an operator
+    // acts on ("14 things to fix" is a work estimate; "67%" is not). Ties break
+    // on the lower level first, then on name — a stable order matters because
+    // this table is read repeatedly and a shuffling list reads as churn that is
+    // not there.
+    function acmmRepoGapRows(repos) {
+      const rows = (repos || []).map(rr => {
+        const total = rr.criteria_total || 0;
+        const passed = rr.criteria_passed || 0;
+        return {
+          repo: rr.repo,
+          level: rr.codebase_level || 0,
+          passed: passed,
+          total: total,
+          gap: Math.max(0, total - passed),
+          pct: total > 0 ? Math.round(passed / total * 100) : 0,
+          blocked: acmmFirstFailingLevel(rr)
+        };
+      });
+      rows.sort((a, b) => (b.gap - a.gap) || (a.level - b.level) || a.repo.localeCompare(b.repo));
+      return rows;
+    }
+
+    // acmmRenderRepoTable draws the ranking. It renders only for a multi-repo
+    // hive: with one repo the table would restate the tiles directly above it.
+    function acmmRenderRepoTable(repos) {
+      const el = document.getElementById('acmm-repo-table');
+      if (!el) return;
+      if (!repos || repos.length < 2) {
+        el.style.display = 'none';
+        el.innerHTML = '';
+        return;
+      }
+      const rows = acmmRepoGapRows(repos);
+      // Only call something "weakest" when the repos actually differ. On a
+      // fleet where every repo is level, singling one out would invent a
+      // problem — the same reason the union number needed qualifying.
+      const spread = rows.length > 1 && rows[0].gap > rows[rows.length - 1].gap;
+
+      let html = '<div style="font-size:0.7rem;color:var(--muted);margin-bottom:4px">Per-repo readiness — weakest first</div>' +
+        '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">';
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        const selected = _acmmSelectedRepo === r.repo;
+        const color = r.pct >= 70 ? 'var(--green)' : (r.pct > 40 ? 'var(--yellow)' : 'var(--red)');
+        const blockedText = r.blocked
+          ? 'blocked at L' + r.blocked.level + ' ' + escapeHtml(r.blocked.name)
+          : 'all levels passed';
+        // Selection is carried by the left accent and the weight, NOT by the
+        // background: the hover handlers (gh25/gh26) own the background, and a
+        // selected row would lose its highlight the moment the pointer left it.
+        html += '<div data-action="acmmSelectRepo" data-arg0="' + escapeHtml(r.repo) + '" data-arg-types="s" ' +
+          'style="cursor:pointer;display:flex;align-items:center;gap:8px;padding:5px 8px;font-size:0.75rem;' +
+          'border-left:3px solid ' + (selected ? 'var(--accent)' : 'transparent') + ';' +
+          (i > 0 ? 'border-top:1px solid var(--border);' : '') + '" ' +
+          'data-mouseover-action="gh25" data-mouseout-action="gh26">' +
+          '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:' + (selected ? '600' : '400') + '">' +
+          escapeHtml(r.repo) +
+          (spread && i === 0 ? '<span title="Largest gap of any watched repo" style="margin-left:6px;padding:1px 6px;border-radius:999px;font-size:0.62rem;font-weight:600;background:color-mix(in srgb, var(--red) 16%, transparent);color:var(--red)">weakest</span>' : '') +
+          '</span>' +
+          '<span style="width:34px;text-align:right;font-weight:600">L' + r.level + '</span>' +
+          '<span style="width:74px;text-align:right;color:' + color + ';font-weight:600">' + r.passed + '/' + r.total + '</span>' +
+          '<span style="flex:0 0 auto;min-width:150px;text-align:right;color:var(--muted)">' + blockedText + '</span>' +
+          '</div>';
+      }
+      html += '</div>';
+      el.innerHTML = html;
+      el.style.display = 'block';
+    }
+
     function acmmRenderCard() {
       const d = _acmmEvalData;
       if (!d) return;
+
+      // #5822: the active view is resolved HERE, before the tiles are written.
+      // It used to be computed further down and consumed only by the level
+      // bars, so clicking a repo chip moved the bars while the four tiles above
+      // them kept reporting hive-wide numbers — two halves of one card
+      // disagreeing, with nothing to say which of them followed the click.
+      const active = acmmGetActiveData() || d;
+      const repos = d.repo_results || [];
+      const multiRepo = repos.length > 1;
+      const scoped = !!_acmmSelectedRepo;
 
       const fmtLevel = (lvl) => {
         const name = ACMM_LEVEL_NAMES[lvl] || ('L'+lvl);
         return '<span class="stat-num">L' + lvl + '</span><br><span style="font-size:0.7rem;color:var(--muted)">' + escapeHtml(name) + '</span>';
       };
+      // A RepoEvaluation and the aggregate carry the same field names, but a
+      // repo missing a field must fall back to the aggregate rather than render
+      // "undefined" or silently read as zero.
+      const pick = (v, fallback) => (typeof v === 'number' ? v : fallback);
+      const codebaseLevel = pick(active.codebase_level, d.codebase_level);
 
-      setIfChanged(document.getElementById('acmm-codebase-level'), fmtLevel(d.codebase_level));
+      // Overall is min(codebase, operational). The server computes it against
+      // the UNION codebase level, so with a repo selected it must be recomputed
+      // — otherwise the Overall tile silently keeps the fleet-wide reading
+      // while the tile beside it shows the repo's. Unscoped, the server's value
+      // stands, so the panel never disagrees with the payload it was given.
+      const overallLevel = scoped ? Math.min(codebaseLevel, d.operational_level) : d.overall_level;
+
+      setIfChanged(document.getElementById('acmm-codebase-level'), fmtLevel(codebaseLevel));
       setIfChanged(document.getElementById('acmm-ops-level'), fmtLevel(d.operational_level));
-      setIfChanged(document.getElementById('acmm-overall-level'), fmtLevel(d.overall_level));
+      setIfChanged(document.getElementById('acmm-overall-level'), fmtLevel(overallLevel));
       setIfChanged(document.getElementById('acmm-criteria-ratio'),
-        '<span class="stat-num">' + d.criteria_passed + '/' + d.criteria_total + '</span>');
+        '<span class="stat-num">' + pick(active.criteria_passed, d.criteria_passed) + '/' + pick(active.criteria_total, d.criteria_total) + '</span>');
+
+      // Scope tags. Operational Autonomy is genuinely hive-wide — it measures
+      // the hive's own operating behaviour, not a repository — so it does NOT
+      // follow the selector. That makes the card's scope mixed, which is fine
+      // as long as it is stated: an unlabelled tile that ignores the click is
+      // indistinguishable from one that failed to follow it.
+      const scopeTag = (txt, title) => '<span title="' + escapeHtml(title) + '" style="display:inline-block;margin-left:4px;padding:0 5px;border-radius:999px;font-size:0.6rem;font-weight:600;background:color-mix(in srgb, var(--muted) 18%, transparent);color:var(--muted)">' + escapeHtml(txt) + '</span>';
+      const repoTag = scoped
+        ? scopeTag(_acmmSelectedRepo, 'Showing only ' + _acmmSelectedRepo)
+        : (multiRepo ? scopeTag('all repos', 'Union across all ' + repos.length + ' watched repos: a criterion counts as passed if ANY repo has it') : '');
+      const setLbl = (id, text, tag) => {
+        const el = document.getElementById(id);
+        if (el) setIfChanged(el, escapeHtml(text) + (tag || ''));
+      };
+      setLbl('acmm-lbl-codebase', 'Codebase Readiness', repoTag);
+      setLbl('acmm-lbl-criteria', 'Criteria Passed', repoTag);
+      setLbl('acmm-lbl-overall', 'Overall ACMM', repoTag);
+      setLbl('acmm-lbl-ops', 'Operational Autonomy',
+        scoped ? scopeTag('hive-wide', 'Operational autonomy measures the hive, not a repository — it does not change with the repo selection') : '');
+
+      // Say what the aggregate IS, in the panel and not only in a dialog.
+      const noteEl = document.getElementById('acmm-scope-note');
+      if (noteEl) {
+        if (multiRepo && !scoped) {
+          setIfChanged(noteEl, 'Aggregate across ' + repos.length + ' repos: a criterion counts as passed if <em>any</em> repo has it, so a repo meeting none of them does not lower these numbers. Pick a repo above, or read the table below.');
+          noteEl.style.display = 'block';
+        } else {
+          noteEl.style.display = 'none';
+        }
+      }
 
       // Repo selector
       const selectorEl = document.getElementById('acmm-repo-selector');
-      if (selectorEl && d.repo_results && d.repo_results.length > 1) {
+      if (selectorEl && multiRepo) {
         selectorEl.style.display = 'flex';
         const allBtn = document.getElementById('acmm-repo-btn-all');
         if (allBtn) allBtn.style.fontWeight = _acmmSelectedRepo ? '400' : '600';
@@ -15298,15 +16299,19 @@ function burnAreaChart() {
             btn.onclick = () => acmmSelectRepo(rr.repo);
             selectorEl.appendChild(btn);
           }
-          btn.textContent = rr.repo + ' (L' + rr.codebase_level + ')';
+          // The chip carries the ratio as well as the level (#5822): "lacking,
+          // and by how much" was previously N clicks away for N repos.
+          btn.textContent = rr.repo + ' (L' + rr.codebase_level + ' · ' + rr.criteria_passed + '/' + rr.criteria_total + ')';
           btn.style.fontWeight = _acmmSelectedRepo === rr.repo ? '600' : '400';
+          selectorEl.appendChild(btn);
         }
       } else if (selectorEl) {
         selectorEl.style.display = 'none';
       }
 
-      // Per-level bars from active data
-      const active = acmmGetActiveData();
+      acmmRenderRepoTable(repos);
+
+      // Per-level bars from the same active view the tiles above now use.
       const levels = active.levels || active.Levels || d.levels || [];
       const barsEl = document.getElementById('acmm-level-bars');
       if (barsEl) {
@@ -15325,7 +16330,13 @@ function burnAreaChart() {
 
       const tsEl = document.getElementById('acmm-eval-timestamp');
       if (tsEl) {
-        let tsText = d.last_evaluated_at ? 'Evaluated: ' + new Date(d.last_evaluated_at).toLocaleString() : '';
+        // #5877: relative age, so it is legible that the numbers above may be
+        // an hour-old cache. Absolute timestamp stays in the tooltip.
+        let tsText = '';
+        if (d.last_evaluated_at) {
+          tsText = 'Evaluated ' + acmmRelativeAge(d.last_evaluated_at);
+          tsEl.title = new Date(d.last_evaluated_at).toLocaleString();
+        }
         if (d.repo_results && d.repo_results.length > 1) tsText += ' | ' + d.repo_results.length + ' repos';
         tsEl.textContent = tsText;
       }
@@ -15341,9 +16352,35 @@ function burnAreaChart() {
       }
     }
 
-    async function fetchACMMEvaluation() {
+    function acmmRelativeAge(iso) {
+      const ms = Date.now() - new Date(iso).getTime();
+      if (!Number.isFinite(ms) || ms < 0) return 'just now';
+      const mins = Math.floor(ms / 60000);
+      if (mins < 1) return 'just now';
+      if (mins < 60) return mins + 'm ago';
+      const hrs = Math.floor(mins / 60);
+      if (hrs < 24) return hrs + 'h ' + (mins % 60) + 'm ago';
+      return Math.floor(hrs / 24) + 'd ago';
+    }
+
+    // #5877: operator-initiated re-evaluation. The server enforces its own
+    // debounce (a refresh within a minute of the last evaluation returns the
+    // cached result), so this button cannot spend the API budget.
+    async function acmmForceRefresh() {
+      const btn = document.getElementById('acmm-refresh-btn');
+      if (btn && btn.disabled) return;
+      const prev = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = '⏳ Re-evaluating...'; }
       try {
-        const r = await fetch('/api/acmm/evaluation');
+        await fetchACMMEvaluation(true);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = prev; }
+      }
+    }
+
+    async function fetchACMMEvaluation(force) {
+      try {
+        const r = await fetch(force ? '/api/acmm/evaluation?refresh=1' : '/api/acmm/evaluation');
         if (!r.ok) return;
         _acmmEvalData = await r.json();
         acmmRenderCard();
@@ -15361,7 +16398,7 @@ function burnAreaChart() {
         const el = document.getElementById('git-version');
         const ocEl = document.getElementById('oc-git-version');
         const commitTooltip = v.latestMessage ? escapeHtml(v.latestMessage) : escapeHtml(v.hash);
-        let html = `<a href="https://github.com/kubestellar/hive/commit/${escapeHtml(v.hash)}" target="_blank" style="color:inherit;text-decoration:none" title="${commitTooltip}">${escapeHtml(v.short)}</a>`;
+        let html = `<a href="https://github.com/hivecommons/hive/commit/${escapeHtml(v.hash)}" target="_blank" style="color:inherit;text-decoration:none" title="${commitTooltip}">${escapeHtml(v.short)}</a>`;
         // Branch pill next to the SHA — shows which branch this spoke tracks
         // (v2/v3 release, or a personal dev branch like mk). Skip only the
         // unknown placeholder so the pill is always present for real builds.
@@ -15923,9 +16960,17 @@ function burnAreaChart() {
         const skipped = (data.skipped || []).length;
         const governorChanges = formatGovernorChanges(data.governor_changes);
         closeACMMDialog();
-        window._acmmOverride = { level: level, packAgents: data.packAgents || [] };
+        // Render the level the SERVER confirmed, never the one we asked for
+        // (#5492). We only reach here on a 2xx, so the write is committed; the
+        // body is authoritative. Falling back to `level` keeps an older spoke
+        // that omits the field working.
+        const confirmedLevel = (data && Number.isFinite(Number(data.level))) ? Number(data.level) : level;
+        // Drop any status snapshot built before this apply, so the async
+        // rebuild's predecessor cannot repaint the previous level (#4348).
+        noteStatusMutation(data.minStatusSeq);
+        window._acmmOverride = { level: confirmedLevel, packAgents: data.packAgents || [] };
         if (window._lastStatus) {
-          window._lastStatus.acmmLevel = level;
+          window._lastStatus.acmmLevel = confirmedLevel;
           window._lastStatus.acmmLevelConfigured = true;
           window._lastStatus.acmmPackAgents = data.packAgents || [];
           render(window._lastStatus);
@@ -15960,14 +17005,17 @@ function burnAreaChart() {
         }
         const governorChanges = formatGovernorChanges(data.governor_changes);
         closeACMMDialog();
-        window._acmmOverride = { level: level, packAgents: data.packAgents || [] };
+        // Server-confirmed level only — see applyACMMPack above (#5492).
+        const confirmedLevel = (data && Number.isFinite(Number(data.level))) ? Number(data.level) : level;
+        noteStatusMutation(data.minStatusSeq);
+        window._acmmOverride = { level: confirmedLevel, packAgents: data.packAgents || [] };
         if (window._lastStatus) {
-          window._lastStatus.acmmLevel = level;
+          window._lastStatus.acmmLevel = confirmedLevel;
           window._lastStatus.acmmLevelConfigured = true;
           window._lastStatus.acmmPackAgents = data.packAgents || [];
           render(window._lastStatus);
         }
-        showToast(`ACMM level set to L${level} (${name})` + (governorChanges ? ' — governor settings changed' : ''), governorChanges ? 'info' : 'success');
+        showToast(`ACMM level set to L${confirmedLevel} (${name})` + (governorChanges ? ' — governor settings changed' : ''), governorChanges ? 'info' : 'success');
         if (governorChanges) await hiveAlert(governorChanges, 'Governor settings changed');
         _acmmPacks = null;
       } catch (err) {
@@ -16159,8 +17207,8 @@ function burnAreaChart() {
     }
 
     function renderAgentImport() {
-      var exampleURL = 'https://github.com/kubestellar/hive/blob/HEAD/src/examples/agents/customized-agent.yaml';
-      var rawURL = 'https://raw.githubusercontent.com/kubestellar/hive/HEAD/src/examples/agents/customized-agent.yaml';
+      var exampleURL = 'https://github.com/hivecommons/hive/blob/HEAD/src/examples/agents/customized-agent.yaml';
+      var rawURL = 'https://raw.githubusercontent.com/hivecommons/hive/HEAD/src/examples/agents/customized-agent.yaml';
       // Field-by-field reference on the docs site (documents the same v2 schema
       // as the example, and explains the ref+path "v2/src" URL). See #1929/#1930.
       var docsURL = 'https://docs.kubestellar.io/hive/agent-definition-yaml';
@@ -16200,6 +17248,11 @@ function burnAreaChart() {
       // path/ref from whichever URL it receives, so keep the raw form here and
       // let the server round-trip it back in _importBody.
       var keepLinked = !!(document.getElementById('import-keep-linked') || {}).checked;
+      // Org migration: rewrite blob->raw for BOTH the new (hivecommons) org and
+      // the legacy (kubestellar) one, so pre-transfer links pasted from old
+      // docs/bookmarks still import; raw.githubusercontent follows the repo
+      // transfer for the old spelling.
+      url = url.replace('github.com/hivecommons/hive/blob/', 'raw.githubusercontent.com/hivecommons/hive/');
       url = url.replace('github.com/kubestellar/hive/blob/', 'raw.githubusercontent.com/kubestellar/hive/');
       try {
         var resp = await fetch('/api/agents/import', {method:'POST', headers:_inceptionAuthHeaders(), body:JSON.stringify({source:'url',url:url,preview:true,keepLinked:keepLinked})});
@@ -16807,6 +17860,7 @@ function burnAreaChart() {
     // the models discovered for the add/edit form's endpoint+key.
     let _gateways = [];
     let _gatewayFormModels = [];
+    const _gatewayProbeResults = {};
     // Set by maybeOpenMethodConfig when a method switch jumps the user here to
     // configure a missing gateway; consumed once by loadGateways to auto-open a
     // preset add-form. null when the tab was opened normally.
@@ -17244,6 +18298,8 @@ function burnAreaChart() {
         const keyLine = gw.hasKey
           ? `key set${gw.keyHint ? ' (' + esc(gw.keyHint) + ')' : ''} · Using key: ${esc(gw.keyName || '(unnamed)')}`
           : 'no key';
+        const persistedProbe = _gatewayProbeResults[gw.name] || (gw.health ? { ok: false, error: gatewayHealthText(gw.health) } : null);
+        const testDisplay = persistedProbe ? 'block' : 'none';
         return `
         <div style="border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:10px;background:var(--surface)">
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -17258,7 +18314,7 @@ function burnAreaChart() {
             <div>Endpoint: ${esc(gw.endpoint || '—')}</div>
             <div>Default model: ${esc(gw.default_model || '—')} · ${keyLine}</div>
           </div>
-          <div id="gateway-test-result-${esc(gw.name)}" style="display:none;font-size:0.74rem;margin-top:6px;white-space:pre-wrap"></div>
+          <div id="gateway-test-result-${esc(gw.name)}" style="display:${testDisplay};font-size:0.74rem;margin-top:6px;white-space:pre-wrap">${persistedProbe ? gatewayProbeHTML(persistedProbe) : ''}</div>
         </div>`;
       }).join('');
     }
@@ -17272,24 +18328,36 @@ function burnAreaChart() {
         });
         const data = await res.json().catch(() => ({}));
         const probe = data.probe || (res.ok ? null : { ok: false, error: data.error || ('HTTP ' + res.status) });
+        _gatewayProbeResults[name] = probe;
         showGatewayProbe(el, probe);
       } catch (e) {
-        showGatewayProbe(el, { ok: false, error: e.message });
+        _gatewayProbeResults[name] = { ok: false, error: e.message };
+        showGatewayProbe(el, _gatewayProbeResults[name]);
       }
+    }
+
+    function gatewayHealthText(health) {
+      if (!health) return 'unknown error';
+      if (health.error_class === 'auth' && health.http_status) return `gateway rejected the configured key (HTTP ${health.http_status})`;
+      if (health.error_class === 'dns' || health.error_class === 'connect') return `gateway unreachable (${health.error_class})`;
+      if (health.error_class === '5xx') return 'gateway returned 5xx';
+      if (health.error_class === 'budget') return 'gateway budget/rate limited (HTTP 429)';
+      return health.detail || 'gateway failing';
+    }
+
+    function gatewayProbeHTML(probe) {
+      if (probe && probe.ok) {
+        const n = probe.model_count || 0;
+        return `<span style="color:var(--green)">OK — ${n} model${n === 1 ? '' : 's'} available</span>`;
+      }
+      return `<span style="color:var(--red)">Connection failed: ${esc((probe && probe.error) || 'unknown error')}</span>`;
     }
 
     // showGatewayProbe formats a {ok, model_count} / {ok:false, error} probe.
     function showGatewayProbe(el, probe) {
       if (!el) return;
       el.style.display = 'block';
-      if (probe && probe.ok) {
-        const n = probe.model_count || 0;
-        el.style.color = 'var(--green)';
-        el.textContent = `OK — ${n} model${n === 1 ? '' : 's'} available`;
-      } else {
-        el.style.color = 'var(--red)';
-        el.textContent = 'Connection failed: ' + ((probe && probe.error) || 'unknown error');
-      }
+      el.innerHTML = gatewayProbeHTML(probe);
     }
 
     // refreshMethodModelsAfterGatewaySave re-runs live model discovery for the
@@ -17318,6 +18386,7 @@ function burnAreaChart() {
         if (cached && cached.fallback) {
           // Discovery still is not working (bad key/region/project): say so
           // rather than letting unverified aliases masquerade as discovered.
+          _gatewayProbeResults[method] = { ok: false, error: 'model discovery did not return a live list — check the key and try Test.' };
           showToast(`${method} gateway saved, but model discovery did not return a live list — check the key and try Test.`, 'error');
           continue;
         }
@@ -17625,7 +18694,10 @@ function burnAreaChart() {
           return;
         }
         // Surface the server's live save-time probe inline.
-        if (data.probe && resultEl) showGatewayProbe(resultEl, data.probe);
+        if (data.probe) {
+          _gatewayProbeResults[payload.name] = data.probe;
+          if (resultEl) showGatewayProbe(resultEl, data.probe);
+        }
         showToast('Gateway "' + payload.name + '" saved', 'success');
         closeGatewayForm();
         loadGateways();
@@ -19776,7 +20848,7 @@ function burnAreaChart() {
           <div class="config-list-add" style="align-items:stretch">
             <div style="display:flex;flex:1;min-width:0;align-items:stretch;border:1px solid var(--border);border-radius:6px;overflow:hidden">
               <span style="display:inline-flex;align-items:center;padding:0 8px;background:color-mix(in srgb, ${prefixColor} 12%, var(--surface));color:${prefixColor};font-size:0.78rem;font-weight:600;white-space:nowrap;border-right:1px solid var(--border)" title="This hive's forge — every repo must live on ${esc(ghHost)}">${esc(ghHost)}/</span>
-              <input type="text" id="cfg-repo-input" style="flex:1;min-width:0;border:none;border-radius:0" placeholder="org/repo" data-keydown-action="addListItem" data-arg0="repos" data-arg1="list" data-arg2="cfg-repo-input" data-prevent="1" data-keys="Enter" title="GitHub repository in org/repo format (e.g. kubestellar/console). It must live on this hive's forge, ${esc(ghHost)} — the governor rejects repos on other GitHub hosts. It will be monitored for issues, PRs, and CI status.">
+              <input type="text" id="cfg-repo-input" style="flex:1;min-width:0;border:none;border-radius:0" placeholder="org/repo or GitHub URL" data-keydown-action="addListItem" data-arg0="repos" data-arg1="list" data-arg2="cfg-repo-input" data-prevent="1" data-keys="Enter" title="GitHub repository in org/repo format (e.g. kubestellar/console) or a full GitHub URL. It must live on this hive's forge, ${esc(ghHost)} — saving a repo from a different org migrates this hive to that org. It will be monitored for issues, PRs, and CI status.">
             </div>
             <button data-action="addListItem" data-arg0="repos" data-arg1="list" data-arg2="cfg-repo-input" title="Add this repository to the monitored list">+ Add</button>
           </div>
@@ -21323,7 +22395,7 @@ function burnAreaChart() {
     }
 
     function normalizeRepoInput(raw) {
-      return raw.replace(/^https?:\/\/github\.com\//, '').replace(/\/+$/, '');
+      return raw.trim().replace(/\/+$/, '');
     }
 
     // hiveForgeHostLabel returns this hive's bare GitHub host ("github.com" or a
@@ -21707,6 +22779,10 @@ function burnAreaChart() {
           !(await ensureGatewayMethodConfigured(dirty.general.cliPinValue))) return;
       const base = _configState.type === 'governor' ? '/api/config/governor' : `/api/config/agent/${_configState.agent}`;
       let success = true;
+      // Set once a cadences section has been accepted by the server, so the
+      // success path knows to repaint the governor cadence matrix even when
+      // no `general` field changed (#5492).
+      let savedCadences = false;
       for (const [section, values] of Object.entries(dirty)) {
         try {
           if (_configState.type === 'governor' && section === 'general' && values.hiveId !== undefined) {
@@ -21781,6 +22857,19 @@ function burnAreaChart() {
               body: JSON.stringify(values)
             });
             if (!res.ok) throw new Error(await saveErrorMessage(res));
+            if (section === 'cadences') {
+              // A cadence write kicks an ASYNC status rebuild server-side, so
+              // the refetch below can be served the cached pre-write snapshot
+              // and repaint the OLD cadence — the operator waits for a later
+              // broadcast to see their own change (#5492). Raise the
+              // stale-snapshot floor from the write ack so any snapshot built
+              // before this mutation is discarded instead of rendered.
+              // Reached only after the !res.ok throw above, so a failed write
+              // never advances the floor.
+              const cadenceAck = await res.json().catch(() => ({}));
+              noteStatusMutation(cadenceAck.minStatusSeq);
+              savedCadences = true;
+            }
             if (_configState.type === 'governor' && section === 'litellm') {
               // Saving the LiteLLM tab auto-runs the live connection test
               // server-side; surface its result exactly like the Test
@@ -21837,8 +22926,48 @@ function burnAreaChart() {
           renderGovernor(lastData.governor || {}, lastData.cadenceMatrix || [], lastData);
           renderTokens(lastData.tokens || {});
         }
-        fetch('/api/status').then(r => r.json()).then(render).catch(() => {});
+        if (savedCadences) {
+          // A cadence-only save has no `general` block, so the optimistic
+          // block above is skipped entirely and nothing repaints the governor
+          // cadence matrix. The matrix is server-derived (cadenceMatrix), so
+          // there is no confirmed value to patch in locally — instead pull the
+          // post-mutation snapshot, which the raised floor guarantees is not a
+          // pre-write one (#5492).
+          refreshStatusUntilFresh();
+        } else {
+          fetch('/api/status').then(r => r.json()).then(render).catch(() => {});
+        }
       }
+    }
+
+    // Poll /api/status until a snapshot at or above the stale-snapshot floor
+    // arrives, then render it. The server rebuild kicked by a config write is
+    // asynchronous, so the first refetch usually still returns the cached
+    // pre-write snapshot; render() drops it via the floor guard and this
+    // retries briefly rather than leaving the panel stale until the next
+    // broadcast (#5492).
+    //
+    // This never invents a value: every render is a real server snapshot. If
+    // the rebuild never produces a fresh one, we simply stop retrying and the
+    // regular SSE stream repaints whenever it next delivers — the operator is
+    // never shown an unconfirmed value.
+    var STATUS_FRESH_RETRY_MS = 400;
+    var STATUS_FRESH_MAX_ATTEMPTS = 12;
+    function refreshStatusUntilFresh(attempt) {
+      const n = attempt || 0;
+      fetch('/api/status')
+        .then(r => r.json())
+        .then(data => {
+          // render() itself enforces the floor, but we need to know whether it
+          // took, so test the same condition here before delegating.
+          const seq = (data && data.statusSeq != null) ? Number(data.statusSeq) : null;
+          const stale = seq != null && seq < _statusSeqFloor;
+          if (!stale) { render(data); return; }
+          if (n + 1 < STATUS_FRESH_MAX_ATTEMPTS) {
+            setTimeout(() => refreshStatusUntilFresh(n + 1), STATUS_FRESH_RETRY_MS);
+          }
+        })
+        .catch(() => {});
     }
 
     // --- Chat rich formatting ---
@@ -23060,7 +24189,7 @@ function burnAreaChart() {
           if (ghAppIsOperatorSide(data.githubAppState)) return null;
           return data.githubAppRequired !== true;
         },
-        body: 'The <strong>Forge App</strong> is the app Hive installs on your forge (your source control system, e.g., GitHub, GitHub Enterprise, GitLab, or Gitea) — on GitHub.com and GitHub Enterprise it is a GitHub App. It unlocks issues, advisory reports, and PRs on your primary repo; without it the hive can only observe. ⏰ <strong>Do this in your first session:</strong> hosted hives that never finish this step are reclaimed (reaped) on a timer — the hive disappears from the hub and its URL stops working. If that happens, request a new hive from the hub and complete this step right away. On GitHub Enterprise the install page lives on your enterprise host, not github.com. Full instructions: <a href="https://github.com/kubestellar/hive/blob/v4/src/docs/github-app-setup.md" target="_blank" rel="noopener noreferrer">Forge App (GitHub App) setup</a>.',
+        body: 'The <strong>Forge App</strong> is the app Hive installs on your forge (your source control system, e.g., GitHub, GitHub Enterprise, GitLab, or Gitea) — on GitHub.com and GitHub Enterprise it is a GitHub App. It unlocks issues, advisory reports, and PRs on your primary repo; without it the hive can only observe. ⏰ <strong>Do this in your first session:</strong> hosted hives that never finish this step are reclaimed (reaped) on a timer — the hive disappears from the hub and its URL stops working. If that happens, request a new hive from the hub and complete this step right away. On GitHub Enterprise the install page lives on your enterprise host, not github.com. Full instructions: <a href="https://github.com/hivecommons/hive/blob/v4/src/docs/github-app-setup.md" target="_blank" rel="noopener noreferrer">Forge App (GitHub App) setup</a>.',
         autoNote: 'Checks itself once the app is detected on your repository.',
         actions: [
           { label: 'Install GitHub App', action: 'welcomeInstallGitHubApp' },

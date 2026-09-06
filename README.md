@@ -30,7 +30,7 @@ on the same port.
 - `git`, `openssl`, and a GitHub token (PAT or App) for the org you want the hive to work on
 
 ```bash
-git clone https://github.com/kubestellar/hive.git
+git clone https://github.com/hivecommons/hive.git
 cd hive
 
 cp src/hive.yaml.example src/hive.yaml
@@ -94,7 +94,7 @@ preflights, configuration, the four Quadlet units, the boot wiring, and a final
 check that the **gateway** answers on the published port before it returns.
 
 ```bash
-git clone https://github.com/kubestellar/hive.git
+git clone https://github.com/hivecommons/hive.git
 cd hive
 
 export HIVE_DEPLOY_RUNTIME=podman
@@ -132,7 +132,7 @@ The block below is **rootless**. For rootful, set `CONF=/etc/hive`, drop the
 # checked nothing — they default to Docker and skip.
 export HIVE_DEPLOY_RUNTIME=podman
 
-git clone https://github.com/kubestellar/hive.git
+git clone https://github.com/hivecommons/hive.git
 cd hive
 
 # Engine, root mode, cgroups; then subordinate IDs, graphroot, networking.
@@ -170,7 +170,7 @@ HIVE_SRC_DIR="$CONF" bin/hive-podman-preflight-host.sh
 
 # Pull before starting. The generated ExecStart pulls a missing image itself and
 # that pull is spent inside TimeoutStartSec; the Hive image is ~3.8GB.
-podman pull ghcr.io/kubestellar/hive:stable
+podman pull ghcr.io/hivecommons/hive:stable
 
 # All four Quadlet units — the gateway will not generate without the network it
 # names — plus the plain units that wire the stack to boot (#4478).
@@ -236,7 +236,7 @@ To build from source instead of pulling the pre-built image, build and tag it
 under the name the unit already names, then start as above:
 
 ```bash
-podman build -t ghcr.io/kubestellar/hive:stable -f src/Dockerfile .
+podman build -t ghcr.io/hivecommons/hive:stable -f src/Dockerfile .
 ```
 
 Full install detail — unit search paths, the traps behind each step above, boot
@@ -257,7 +257,11 @@ Teardown: `bin/hive-podman-teardown.sh`.
 
 ### Hosted Option
 
-The [Hive Hub](https://hive.kubestellar.io) provides hosted hives with OAuth-protected dashboards, a public registry, and cross-hive leaderboards. No cluster required.
+The [Hive Hub](https://hive.hivecommons.dev) provides hosted hives with OAuth-protected dashboards, a public registry, and cross-hive leaderboards. No cluster required.
+The canonical hub address is now `https://hive.hivecommons.dev`; the legacy
+`https://hive.kubestellar.io` hostname redirects during the cutover.
+Start with the [hosted hub onboarding guide](src/docs/hosted-hub.md) to sign in,
+request a hosted hive, and finish first-run setup.
 
 If you need to run your own private hub instead, see the
 [self-hosted hub deployment guide](src/docs/hub-deployment.md).
@@ -457,7 +461,7 @@ governor:
 
 hub:
   enabled: true
-  url: https://hive.kubestellar.io
+  url: https://hive.hivecommons.dev
   contribute:
     enabled: true
 ```
@@ -519,7 +523,24 @@ flowchart LR
 
 **See [src/docs/architecture.md](src/docs/architecture.md) for the full reference architecture** — process model, the governor loop, the deterministic pipeline, layered guardrails, ACMM, beads, hub & spoke, and an end-to-end walkthrough, with Mermaid diagrams throughout. Operator safety references include [trajectory review](src/docs/trajectory-review.md), [dashboard health checks](src/docs/health-checks.md), [sandbox guardrails](src/docs/sandbox-isolation.md), [manual provisioning](src/docs/manual-provisioning.md), [cross-cluster migration](src/docs/cross-cluster-migration.md), and [config layering](src/docs/config-layering.md). The dashboard API reference is published as [dashboard/openapi.json](dashboard/openapi.json).
 
-See also the [documentation index](src/docs/README.md), [public roadmap](src/docs/roadmap.md), and [landscape comparison](src/docs/landscape.md) for community-facing documentation and positioning.
+See also the [roadmap](ROADMAP.md) (release-line trajectory, with the [detailed near-term plan](src/docs/roadmap.md)), the [upgrade guide](UPGRADE.md), the [documentation index](src/docs/README.md), and the [landscape comparison](src/docs/landscape.md) for community-facing documentation and positioning.
+
+## Terminal dashboard
+
+`hivectl tui` is a full-screen, keyboard-driven terminal view of the fleet —
+agents, governor, token spend, and activity in a live 2×2 grid, with
+pause/resume, model apply, kick, and ACMM level actions. It is **not a second
+Hive runtime**: it is another client of the same dashboard API the web
+dashboard at `:3001` uses, over the same auth token and the same SSE stream.
+
+```bash
+export HIVE_DASHBOARD_TOKEN="..."
+hivectl tui
+```
+
+See [`hivectl tui` in the command reference](src/docs/hivectl.md#tui--live-terminal-dashboard)
+for keybindings, pane cadence, and v1 boundaries, and
+[the design record](src/docs/design/tui.md) for the reasoning behind it.
 
 ## Contribute to a Hive
 
@@ -529,7 +550,7 @@ running on your own machine:
 
 ```bash
 brew install just gh
-git clone https://github.com/kubestellar/hive && cd hive
+git clone https://github.com/hivecommons/hive && cd hive
 just contribute-setup claude
 just contribute-hive
 ```
@@ -538,11 +559,11 @@ Supported CLIs: Claude Code, GitHub Copilot, Pi, Goose, Bob. Contributors start 
 
 A relay can subscribe to multiple hives with comma-separated `HIVE_HUB` and matching `HIVE_REGISTRATION_TOKEN` values, and operators can delegate selected spoke roles through **Acting as** / `HIVE_AGENT_ROLE`. See [src/docs/contributor-relay.md](src/docs/contributor-relay.md) and [src/docs/contributor-trust-and-roles.md](src/docs/contributor-trust-and-roles.md).
 
-See the [Hive Hub contribute page](https://hive.kubestellar.io) for details.
+See the [Hive Hub contribute page](https://hive.hivecommons.dev) for details.
 
 ## Contributing
 
-See the [Hive Hub](https://hive.kubestellar.io) to browse registered hives, view leaderboards, and find hives accepting contributions.
+See the [Hive Hub](https://hive.hivecommons.dev) to browse registered hives, view leaderboards, and find hives accepting contributions.
 
 To contribute to Hive itself, see [CONTRIBUTING.md](CONTRIBUTING.md) and open issues or PRs on this repository.
 

@@ -29,7 +29,7 @@ ARG GIT_BRANCH=unknown
 # registration), wired the same way as GIT_HASH/GIT_BRANCH: an -X ldflag that
 # takes over from the Go linker default (cmd/hive/main.go, "0.0.0-dev") only
 # when a caller passes it. NO current workflow passes it — docker.yml never
-# does, and release.yml (.github/workflows/release.yml) deliberately does not
+# does, and .github/workflows/tagged-release.yml deliberately does not
 # rebuild at all; it retags the image docker.yml already published for that
 # commit rather than invoking this Dockerfile a second time. This ARG exists
 # so that gap can be closed later (teaching a build to embed a real semver)
@@ -52,7 +52,8 @@ RUN --mount=type=cache,id=hive-go-build,target=/tmp/gobuild \
     if [ -n "$VERSION" ]; then VERSION_LDFLAG="-X main.version=${VERSION}"; fi && \
     GOCACHE=/tmp/gobuild CGO_ENABLED=0 go build -ldflags "-X main.gitHash=${GIT_HASH} -X main.gitShort=${GIT_SHORT} -X main.gitBranch=${GIT_BRANCH} ${VERSION_LDFLAG}" -o /hive ./cmd/hive && \
     GOCACHE=/tmp/gobuild CGO_ENABLED=0 go build -o /bd ./cmd/bd && \
-    GOCACHE=/tmp/gobuild CGO_ENABLED=0 go build -o /hive-backup ./cmd/hive-backup
+    GOCACHE=/tmp/gobuild CGO_ENABLED=0 go build -o /hive-backup ./cmd/hive-backup && \
+    GOCACHE=/tmp/gobuild CGO_ENABLED=0 go build -o /hivectl ./cmd/hivectl
 
 
 # --- tmux from source (cached until TMUX_VERSION changes) ---
@@ -60,7 +61,7 @@ RUN --mount=type=cache,id=hive-go-build,target=/tmp/gobuild \
 # supply-chain risk. Refresh deliberately (same technique as golang above,
 # repo library/node, tag 26-slim) and update both the tag and the @sha256
 # digest together in BOTH FROM node:26-slim lines in this file.
-FROM node:26-slim@sha256:4ebb5ace66f15a24c14c492e01a8beeed4fddf970a856109f5126e703e5fe503 AS tmux-builder
+FROM node:26-slim@sha256:c0753125a3789977aefe869cbebccf70e3cfd7ea84ca48547458f02e4f1d7146 AS tmux-builder
 ARG TARGETARCH
 ARG TMUX_VERSION=3.5a
 ARG TMUX_SHA256_AMD64=16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951
@@ -88,7 +89,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (and the rewrite RUN below) from the branch-scoped GHA cache — so a fresh
 # binary was rebuilt and then discarded, and the OLD binary shipped. See the
 # stale-binary note in .github/workflows/docker.yml.
-FROM node:26-slim@sha256:4ebb5ace66f15a24c14c492e01a8beeed4fddf970a856109f5126e703e5fe503 AS runtime
+FROM node:26-slim@sha256:c0753125a3789977aefe869cbebccf70e3cfd7ea84ca48547458f02e4f1d7146 AS runtime
 
 # --- Layer 1: system packages (rarely changes) ---
 # util-linux provides `setpriv`, used by the entrypoint to drop to `dev` with an
@@ -400,6 +401,20 @@ COPY --from=builder /hive /usr/local/bin/hive
 COPY --from=builder /bd /usr/local/bin/bd
 COPY --from=builder /hive-backup /usr/local/bin/hive-backup
 
+# #5646 — hivectl travels in the image as CARGO, not as part of the runtime.
+# It is the host-side client of the dashboard API, and the whole premise of
+# that client (see #4907) is that it is not a second implementation of Hive
+# logic — so it deliberately does NOT go into /usr/local/bin: nothing inside
+# the container should run it against itself over loopback. It sits at a
+# well-known non-PATH location so bin/hive-podman-setup.sh can `podman cp` it
+# onto the host, which is the only supported way to obtain hivectl on
+# image-based hosts (Silverblue/Bluefin, RHEL image mode) where a Go toolchain
+# cannot be installed. Extracting from the image the deployment already runs
+# means the client can never be a different version than the server.
+# src/deploy/test_hivectl_extraction_contract.sh pins this path to the one the
+# installer extracts, so the two cannot drift apart silently.
+COPY --from=builder /hivectl /usr/local/share/hive/hivectl
+
 # #3760 — defeat the BuildKit/overlayfs metacopy redirect on the cross-stage
 # COPY above. When BuildKit builds these images it can emit a layer where a
 # file brought in by `COPY --from` is stored as an overlay *metacopy redirect*
@@ -419,10 +434,11 @@ COPY --from=builder /hive-backup /usr/local/bin/hive-backup
 # attestation/OCI-index flags; the workflow-side `provenance:false / sbom:false`
 # change (which stops the OCI-index form that enables the metacopy layout in the
 # first place) and this rewrite are independent, belt-and-suspenders defenses.
-RUN for b in hive bd hive-backup; do \
-      cp --remove-destination "/usr/local/bin/$b" "/usr/local/bin/$b.fresh" && \
-      mv -f "/usr/local/bin/$b.fresh" "/usr/local/bin/$b" && \
-      chmod 0755 "/usr/local/bin/$b"; \
+RUN for b in /usr/local/bin/hive /usr/local/bin/bd /usr/local/bin/hive-backup \
+             /usr/local/share/hive/hivectl; do \
+      cp --remove-destination "$b" "$b.fresh" && \
+      mv -f "$b.fresh" "$b" && \
+      chmod 0755 "$b"; \
     done
 
 COPY src/proxy/ /opt/hive/proxy/
@@ -520,7 +536,8 @@ RUN pip3 install --no-cache-dir --break-system-packages specify-cli 2>/dev/null 
     echo "WARN: spec-kit (specify-cli) install failed — inception will generate facts without it"
 # pluk (TypeScript): structured event streaming for AI agent tmux sessions
 ARG PLUK_VERSION=0.8.0
-RUN npm install -g --ignore-scripts --no-fund --no-audit "@kubestellar/pluk@${PLUK_VERSION}" && npm cache clean --force
+RUN (npm install -g --ignore-scripts --no-fund --no-audit "@hivecommons/pluk@${PLUK_VERSION}" || \
+    npm install -g --ignore-scripts --no-fund --no-audit "@kubestellar/pluk@${PLUK_VERSION}") && npm cache clean --force
 RUN mkdir -p /var/run/pluk/logs /var/run/pluk/commands && \
     chown dev:node /var/run/pluk/logs /var/run/pluk/commands && \
     chmod 2770 /var/run/pluk/logs /var/run/pluk/commands

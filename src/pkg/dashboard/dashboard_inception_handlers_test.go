@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
 )
 
 func newMinimalServer(t *testing.T) *Server {
@@ -233,7 +233,9 @@ func TestHandleGHUserAuthPollNoState(t *testing.T) {
 
 func TestHandleGHUserAuthLogout(t *testing.T) {
 	srv := newMinimalServer(t)
+	sid := srv.createUserSession("owner", config.RoleOwner)
 	req := httptest.NewRequest("POST", "/api/gh-user-auth/logout", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sid})
 	w := httptest.NewRecorder()
 	srv.handleGHUserAuthLogout(w, req)
 	if w.Code != http.StatusOK {

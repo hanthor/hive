@@ -103,7 +103,8 @@
                             "format": "date-time"
                           },
                           "user": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Actor identity. May be an opaque OIDC identity key rather than a human-readable name \u2014 see user_name."
                           },
                           "action": {
                             "type": "string"
@@ -113,8 +114,13 @@
                           },
                           "agent": {
                             "type": "string"
+                          },
+                          "user_name": {
+                            "type": "string",
+                            "description": "Hub-delivered display name, stamped at SERVE time only when `user` is an opaque OIDC identity key. The audit ring and the on-disk log keep the raw key, so history survives name changes. Absent when there is no display name to add."
                           }
-                        }
+                        },
+                        "description": "dashboard.AuditEntry (src/pkg/dashboard/audit.go)."
                       }
                     }
                   }
@@ -134,83 +140,367 @@
           "Status"
         ],
         "summary": "Overall hive status",
-        "description": "Returns the full hive status including governor state, agent details, repos, queue depth, and all metrics used by the dashboard.",
+        "description": "Returns the full hive status snapshot the dashboard renders from: governor state, agent runtime details, configured-agent inventory, repos, token rollups, health, budget and ACMM level. The response is dashboard.StatusPayload (src/pkg/dashboard/server.go). Before the first status build completes the handler returns {\"status\": \"initializing\"} instead. Only the fields TUI/API clients consume are enumerated below; StatusPayload carries more.",
         "responses": {
           "200": {
-            "description": "Current hive status",
+            "description": "Current hive status, or {\"status\": \"initializing\"} before the first status build.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
+                  "description": "dashboard.StatusPayload.",
                   "properties": {
+                    "timestamp": {
+                      "type": "string"
+                    },
+                    "statusSeq": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Monotonic publish sequence. Clients drop any payload whose seq is older than the last rendered one."
+                    },
+                    "statusInstance": {
+                      "type": "string",
+                      "description": "Identifies the server process that produced statusSeq; seqs restart at 1 on spoke restart, so a changed instance means reset the guard rather than drop."
+                    },
+                    "hiveId": {
+                      "type": "string"
+                    },
                     "governor": {
                       "type": "object",
+                      "description": "dashboard.FrontendGovernor (src/pkg/dashboard/server.go), built by buildGovernor (status_builder.go).",
                       "properties": {
+                        "active": {
+                          "type": "boolean",
+                          "description": "Hardcoded true whenever buildGovernor ran; false means the payload carried no governor section, not a stopped governor."
+                        },
                         "mode": {
                           "type": "string",
                           "enum": [
-                            "surge",
-                            "busy",
+                            "idle",
                             "quiet",
-                            "idle"
+                            "busy",
+                            "surge"
                           ],
-                          "description": "Current governor mode"
+                          "description": "Laddered governor mode, lowercased by buildGovernor."
                         },
-                        "queue": {
+                        "issues": {
                           "type": "integer",
-                          "description": "Actionable issue count"
+                          "description": "Actionable issue count the governor laddered on (governor.State.QueueIssues)."
                         },
-                        "budgetPct": {
-                          "type": "number",
-                          "description": "Token budget usage percentage"
+                        "prs": {
+                          "type": "integer",
+                          "description": "Actionable PR count the governor laddered on (governor.State.QueuePRs)."
+                        },
+                        "thresholds": {
+                          "type": "object",
+                          "description": "dashboard.FrontendThresholds: the EFFECTIVE ladder boundaries that produced mode, after per-repo scaling. Idle is absent by design \u2014 its threshold is always 0.",
+                          "properties": {
+                            "quiet": {
+                              "type": "integer"
+                            },
+                            "busy": {
+                              "type": "integer"
+                            },
+                            "surge": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "quiet",
+                            "busy",
+                            "surge"
+                          ]
+                        },
+                        "nextKick": {
+                          "type": "string",
+                          "description": "When the governor next evaluates, as a PRE-FORMATTED server-local display string (\"1/2 3:04 PM MST\"), NOT RFC 3339. Omitted when no evaluation interval is configured. The interval itself is only published by GET /api/config/governor as general_advanced.eval_interval_s."
                         }
-                      }
+                      },
+                      "required": [
+                        "active",
+                        "mode",
+                        "issues",
+                        "prs",
+                        "thresholds"
+                      ]
                     },
                     "agents": {
                       "type": "array",
                       "items": {
                         "type": "object",
+                        "description": "dashboard.FrontendAgent (src/pkg/dashboard/server.go). Only the commonly consumed fields are listed; the struct carries more.",
                         "properties": {
                           "name": {
                             "type": "string"
                           },
-                          "status": {
+                          "id": {
                             "type": "string"
                           },
-                          "model": {
+                          "displayName": {
                             "type": "string"
                           },
-                          "cli": {
+                          "role": {
+                            "type": "string"
+                          },
+                          "emoji": {
+                            "type": "string"
+                          },
+                          "session": {
+                            "type": "string",
+                            "description": "tmux session name."
+                          },
+                          "state": {
+                            "type": "string",
+                            "description": "Runtime state (e.g. \"running\", \"stopped\"). There is no `status` field on this object."
+                          },
+                          "busy": {
                             "type": "string"
                           },
                           "paused": {
                             "type": "boolean"
                           },
-                          "restarts": {
-                            "type": "integer"
+                          "pausedReason": {
+                            "type": "string"
+                          },
+                          "enabled": {
+                            "type": "boolean",
+                            "description": "Mirrors the CONFIG flag, not runtime state \u2014 the only thing distinguishing \"switched off on purpose\" from \"stopped because something broke\". Never omitted: false is meaningful."
+                          },
+                          "offByCadence": {
+                            "type": "boolean"
+                          },
+                          "needsLogin": {
+                            "type": "boolean"
+                          },
+                          "cli": {
+                            "type": "string"
+                          },
+                          "model": {
+                            "type": "string"
+                          },
+                          "cadence": {
+                            "type": "string"
+                          },
+                          "doing": {
+                            "type": "string"
                           },
                           "pinned": {
                             "type": "boolean"
+                          },
+                          "pinnedCli": {
+                            "type": "boolean"
+                          },
+                          "pinnedModel": {
+                            "type": "boolean"
+                          },
+                          "restarts": {
+                            "type": "integer"
+                          },
+                          "lastKick": {
+                            "type": "string",
+                            "description": "Pre-formatted server-local display string, not RFC 3339."
+                          },
+                          "nextKick": {
+                            "type": "string",
+                            "description": "Pre-formatted server-local display string, not RFC 3339."
+                          },
+                          "mode": {
+                            "type": "string"
+                          },
+                          "sandboxed": {
+                            "type": "boolean"
+                          },
+                          "onDemand": {
+                            "type": "boolean"
+                          },
+                          "proxyViolations": {
+                            "type": "integer"
+                          },
+                          "lastError": {
+                            "type": "string"
                           }
                         }
                       }
+                    },
+                    "configuredAgents": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      },
+                      "description": "dashboard.FrontendConfiguredAgent \u2014 secret-free config inventory covering agents with no runtime process (notably enabled: false)."
                     },
                     "repos": {
                       "type": "array",
                       "items": {
                         "type": "object",
+                        "description": "dashboard.FrontendRepo (src/pkg/dashboard/server.go).",
                         "properties": {
                           "name": {
-                            "type": "string"
+                            "type": "string",
+                            "description": "Short repo name."
+                          },
+                          "full": {
+                            "type": "string",
+                            "description": "owner/name."
                           },
                           "issues": {
                             "type": "integer"
                           },
                           "prs": {
                             "type": "integer"
+                          },
+                          "actionableIssues": {
+                            "type": "array",
+                            "items": {
+                              "type": "object"
+                            },
+                            "description": "Untyped in the Go source ([]any) \u2014 populated from forge issue records whose shape is not fixed by a Go struct."
+                          },
+                          "openPrs": {
+                            "type": "array",
+                            "items": {
+                              "type": "object"
+                            },
+                            "description": "Untyped in the Go source ([]any) \u2014 populated from forge PR records whose shape is not fixed by a Go struct."
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "full",
+                          "issues",
+                          "prs"
+                        ]
+                      }
+                    },
+                    "acmmLevel": {
+                      "type": "integer",
+                      "description": "Hive ACMM maturity level, 1-6. TOP-LEVEL, not nested under governor. 1 is also the fallback when nothing is configured \u2014 see acmmLevelConfigured to tell those apart."
+                    },
+                    "acmmLevelConfigured": {
+                      "type": "boolean",
+                      "description": "False means nobody chose a level and acmmLevel is the fallback."
+                    },
+                    "acmmPackAgents": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "tokens": {
+                      "type": "object",
+                      "description": "dashboard.FrontendTokens \u2014 the status-embedded token rollup (lookbackHours, sessions, totals, byAgent, byModel, byAgentModel). This is a DIFFERENT shape from GET /api/tokens, which returns tokens.AggregateSummary with snake_case keys."
+                    },
+                    "budget": {
+                      "type": "object",
+                      "description": "dashboard.FrontendBudget. Budget is top-level; there is no budgetPct under governor."
+                    },
+                    "beads": {
+                      "type": "object",
+                      "description": "dashboard.FrontendBeads: {workers, supervisor}."
+                    },
+                    "planning": {
+                      "type": "object",
+                      "description": "dashboard.FrontendPlanning."
+                    },
+                    "hold": {
+                      "type": "object",
+                      "description": "dashboard.FrontendHold."
+                    },
+                    "cadenceMatrix": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      },
+                      "description": "dashboard.FrontendCadence entries."
+                    },
+                    "health": {
+                      "type": "object",
+                      "description": "Untyped in the Go source (map[string]any): repo-workflow health map."
+                    },
+                    "deepHealth": {
+                      "type": "object",
+                      "description": "Untyped in the Go source (map[string]any): the spoke's own deep health checks, the same ones reported hub-ward in the heartbeat."
+                    },
+                    "ghRateLimits": {
+                      "type": "object",
+                      "description": "Untyped in the Go source (map[string]any)."
+                    },
+                    "agentMetrics": {
+                      "type": "object",
+                      "description": "Untyped in the Go source (map[string]any)."
+                    },
+                    "issueToMerge": {
+                      "type": "object",
+                      "description": "Untyped in the Go source (map[string]any)."
+                    },
+                    "systemAlerts": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "severity": {
+                            "type": "string"
+                          },
+                          "message": {
+                            "type": "string"
                           }
                         }
                       }
+                    },
+                    "inferenceBackends": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "inference": {
+                            "type": "boolean"
+                          },
+                          "models": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "models_fallback": {
+                            "type": "boolean",
+                            "description": "True when models is NOT an authoritative census (static aliases, partial sweep, or env list standing in). Consumers must not diff against a fallback list."
+                          }
+                        }
+                      }
+                    },
+                    "platform": {
+                      "type": "object",
+                      "description": "dashboard.FrontendPlatform: {forge, mint, skills}."
+                    },
+                    "security": {
+                      "type": "object",
+                      "description": "dashboard.FrontendSecurity."
+                    },
+                    "githubAppRequired": {
+                      "type": "boolean"
+                    },
+                    "githubAppInstallURL": {
+                      "type": "string"
+                    },
+                    "githubAppInstallMissing": {
+                      "type": "boolean",
+                      "description": "CONFIG TRUTH independent of any auth probe: a real App is named but installation_id is 0."
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "initializing"
+                      ],
+                      "description": "Present ONLY in the pre-first-build response, which is the bare object {\"status\": \"initializing\"} with no other field set."
                     }
                   }
                 }
@@ -363,7 +653,7 @@
           "History"
         ],
         "summary": "Sparkline history",
-        "description": "Returns ~120 downsampled status snapshots from the in-memory 12-hour rolling window (5s intervals). Used for sparkline charts.",
+        "description": "Returns the governor's evaluation history (governor.EvalSnapshot entries) for sparkline charts. When /data/sparkline-history.json exists its seeded entries are prepended to the live in-memory history.",
         "responses": {
           "200": {
             "description": "Array of status snapshots",
@@ -373,21 +663,110 @@
                   "type": "array",
                   "items": {
                     "type": "object",
+                    "description": "governor.EvalSnapshot (src/pkg/governor/governor.go).",
                     "properties": {
                       "t": {
                         "type": "integer",
-                        "description": "Unix timestamp (ms)"
+                        "format": "int64",
+                        "description": "Unix timestamp (ms)."
                       },
                       "govMode": {
-                        "type": "string"
+                        "type": "string",
+                        "enum": [
+                          "idle",
+                          "quiet",
+                          "busy",
+                          "surge"
+                        ],
+                        "description": "Governor mode at this evaluation."
                       },
-                      "queue": {
+                      "govIssues": {
+                        "type": "integer",
+                        "description": "Actionable issue count. There is no single `queue` field."
+                      },
+                      "govPrs": {
+                        "type": "integer",
+                        "description": "Actionable PR count."
+                      },
+                      "govTotal": {
+                        "type": "integer",
+                        "description": "Combined queue depth the governor laddered on."
+                      },
+                      "govHold": {
+                        "type": "integer",
+                        "description": "Items held back from the queue."
+                      },
+                      "govActive": {
+                        "type": "integer",
+                        "description": "Items actively being worked."
+                      },
+                      "sla_violations": {
                         "type": "integer"
                       },
-                      "budgetPct": {
-                        "type": "number"
+                      "agents_kicked": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Agents the governor kicked at this evaluation."
+                      },
+                      "actionableCount": {
+                        "type": "integer"
+                      },
+                      "openPrCount": {
+                        "type": "integer"
+                      },
+                      "mergeableCount": {
+                        "type": "integer"
+                      },
+                      "beadsWorkers": {
+                        "type": "integer"
+                      },
+                      "beadsSupervisor": {
+                        "type": "integer"
+                      },
+                      "repos": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "object",
+                          "description": "governor.RepoSnapshot.",
+                          "properties": {
+                            "issues": {
+                              "type": "integer"
+                            },
+                            "prs": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "issues",
+                            "prs"
+                          ]
+                        },
+                        "description": "Per-repo queue split, keyed by owner/name."
+                      },
+                      "agentStats": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "object"
+                        },
+                        "description": "Untyped in the Go source (map[string]map[string]any): per-agent stat bag whose inner keys are not fixed by a Go struct."
                       }
-                    }
+                    },
+                    "required": [
+                      "t",
+                      "govMode",
+                      "govIssues",
+                      "govPrs",
+                      "govTotal",
+                      "govHold",
+                      "govActive",
+                      "actionableCount",
+                      "openPrCount",
+                      "mergeableCount",
+                      "beadsWorkers",
+                      "beadsSupervisor"
+                    ]
                   }
                 }
               }
@@ -402,7 +781,7 @@
           "History"
         ],
         "summary": "Persistent trend data",
-        "description": "Returns downsampled persistent history for the given range. Used for trend sparklines and governor mode distribution.",
+        "description": "Returns the governor's evaluation history (governor.EvalSnapshot entries) filtered to a time window. `range=day|week` or `hours=N` selects the window; hours is clamped to 720 (30 days) and defaults to 24.",
         "parameters": [
           {
             "name": "range",
@@ -411,12 +790,21 @@
               "type": "string",
               "enum": [
                 "day",
-                "week",
-                "month"
-              ],
-              "default": "week"
+                "week"
+              ]
             },
-            "description": "Time range to query"
+            "description": "Window preset. \"day\" is 24h, \"week\" is 168h. Any other value (including an absent one) falls through to `hours`, defaulting to 24h. Takes precedence over `hours`."
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 720,
+              "default": 24
+            },
+            "description": "Window length in hours, used only when `range` is not \"day\" or \"week\". Values above 720 (30 days) are clamped; values at or below 0 become 24."
           }
         ],
         "responses": {
@@ -428,21 +816,110 @@
                   "type": "array",
                   "items": {
                     "type": "object",
+                    "description": "governor.EvalSnapshot (src/pkg/governor/governor.go).",
                     "properties": {
                       "t": {
                         "type": "integer",
-                        "description": "Unix timestamp (ms)"
+                        "format": "int64",
+                        "description": "Unix timestamp (ms)."
                       },
                       "govMode": {
-                        "type": "string"
+                        "type": "string",
+                        "enum": [
+                          "idle",
+                          "quiet",
+                          "busy",
+                          "surge"
+                        ],
+                        "description": "Governor mode at this evaluation."
                       },
-                      "queue": {
+                      "govIssues": {
+                        "type": "integer",
+                        "description": "Actionable issue count. There is no single `queue` field."
+                      },
+                      "govPrs": {
+                        "type": "integer",
+                        "description": "Actionable PR count."
+                      },
+                      "govTotal": {
+                        "type": "integer",
+                        "description": "Combined queue depth the governor laddered on."
+                      },
+                      "govHold": {
+                        "type": "integer",
+                        "description": "Items held back from the queue."
+                      },
+                      "govActive": {
+                        "type": "integer",
+                        "description": "Items actively being worked."
+                      },
+                      "sla_violations": {
                         "type": "integer"
                       },
-                      "budgetPct": {
-                        "type": "number"
+                      "agents_kicked": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Agents the governor kicked at this evaluation."
+                      },
+                      "actionableCount": {
+                        "type": "integer"
+                      },
+                      "openPrCount": {
+                        "type": "integer"
+                      },
+                      "mergeableCount": {
+                        "type": "integer"
+                      },
+                      "beadsWorkers": {
+                        "type": "integer"
+                      },
+                      "beadsSupervisor": {
+                        "type": "integer"
+                      },
+                      "repos": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "object",
+                          "description": "governor.RepoSnapshot.",
+                          "properties": {
+                            "issues": {
+                              "type": "integer"
+                            },
+                            "prs": {
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "issues",
+                            "prs"
+                          ]
+                        },
+                        "description": "Per-repo queue split, keyed by owner/name."
+                      },
+                      "agentStats": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "object"
+                        },
+                        "description": "Untyped in the Go source (map[string]map[string]any): per-agent stat bag whose inner keys are not fixed by a Go struct."
                       }
-                    }
+                    },
+                    "required": [
+                      "t",
+                      "govMode",
+                      "govIssues",
+                      "govPrs",
+                      "govTotal",
+                      "govHold",
+                      "govActive",
+                      "actionableCount",
+                      "openPrCount",
+                      "mergeableCount",
+                      "beadsWorkers",
+                      "beadsSupervisor"
+                    ]
                   }
                 }
               }
@@ -567,15 +1044,261 @@
           "Tokens"
         ],
         "summary": "Token usage by agent and model",
-        "description": "Returns token consumption data broken down by agent and model.",
+        "description": "Returns tokens.AggregateSummary (src/pkg/tokens/collector.go) as served by dashboard.Server.handleTokens (src/pkg/dashboard/api.go). Keys are snake_case and differ from the camelCase `tokens` block embedded in GET /api/status. NO COST FIELD is returned \u2014 this endpoint reports token counts only; cost must be estimated by the caller or read from a cost endpoint. The handler has two degenerate responses: {\"status\": \"no_collector\"} when no token collector is wired, and {\"total_tokens\": 0, \"sessions\": []} when the collector has no summary yet.",
         "responses": {
           "200": {
-            "description": "Token usage data",
+            "description": "Aggregate token usage, or one of the two degenerate shapes (no_collector / empty summary).",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "Token usage keyed by agent name, with model-level breakdowns"
+                  "description": "tokens.AggregateSummary, or one of the two degenerate handler responses described above.",
+                  "properties": {
+                    "total_tokens": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "total_input": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "total_output": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "total_cache_read": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "total_cache_create": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "total_messages": {
+                      "type": "integer"
+                    },
+                    "by_agent": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "description": "Agent name to total token count."
+                    },
+                    "by_model": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "description": "Model id to total token count."
+                    },
+                    "by_agent_detail": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "description": "tokens.AgentModelBucket.",
+                        "properties": {
+                          "input": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "output": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "cache_read": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "cache_create": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "messages": {
+                            "type": "integer"
+                          },
+                          "sessions": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "input",
+                          "output",
+                          "cache_read",
+                          "cache_create",
+                          "messages",
+                          "sessions"
+                        ]
+                      },
+                      "description": "Agent name to its full breakdown."
+                    },
+                    "by_model_detail": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "description": "tokens.AgentModelBucket.",
+                        "properties": {
+                          "input": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "output": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "cache_read": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "cache_create": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "messages": {
+                            "type": "integer"
+                          },
+                          "sessions": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "input",
+                          "output",
+                          "cache_read",
+                          "cache_create",
+                          "messages",
+                          "sessions"
+                        ]
+                      },
+                      "description": "Model id to its full breakdown."
+                    },
+                    "sessions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "description": "tokens.SessionSummary.",
+                        "properties": {
+                          "session_id": {
+                            "type": "string"
+                          },
+                          "agent": {
+                            "type": "string"
+                          },
+                          "model": {
+                            "type": "string"
+                          },
+                          "input_tokens": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "output_tokens": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "cache_read": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "cache_create": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "total_tokens": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "messages": {
+                            "type": "integer"
+                          },
+                          "first_active": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "Unix milliseconds of the earliest event seen; omitted when undeterminable."
+                          },
+                          "last_active": {
+                            "type": "integer",
+                            "format": "int64",
+                            "description": "Unix milliseconds of the latest event seen; omitted when undeterminable."
+                          },
+                          "backend": {
+                            "type": "string",
+                            "description": "Tool that produced the session (\"claude\", \"copilot\", \"bob\", \"inference\"). Empty/absent means an older flat-format session of unknown provenance, which must be treated as NOT time-resolved."
+                          },
+                          "usage": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "description": "tokens.UsageEvent \u2014 one timestamped slice of a session's usage timeline.",
+                              "properties": {
+                                "ts_ms": {
+                                  "type": "integer",
+                                  "format": "int64",
+                                  "description": "Unix milliseconds. 0 means the source line carried no parseable timestamp; consumers must treat 0 as unknown time rather than sorting it first."
+                                },
+                                "model": {
+                                  "type": "string"
+                                },
+                                "coalesced": {
+                                  "type": "integer",
+                                  "description": "How many raw per-message events this entry represents. Omitted/absent for an untouched event; >1 for a coalesced bucket."
+                                },
+                                "input": {
+                                  "type": "integer",
+                                  "format": "int64"
+                                },
+                                "output": {
+                                  "type": "integer",
+                                  "format": "int64"
+                                },
+                                "cache_read": {
+                                  "type": "integer",
+                                  "format": "int64"
+                                },
+                                "cache_create": {
+                                  "type": "integer",
+                                  "format": "int64"
+                                }
+                              },
+                              "required": [
+                                "ts_ms",
+                                "input",
+                                "output",
+                                "cache_read",
+                                "cache_create"
+                              ]
+                            },
+                            "description": "Per-message usage timeline, populated only by scanners that can observe the grain (currently claude). ADDITIVE: when present its sums equal the summed session fields exactly \u2014 use either, never add both. Absent on sessions restored from the persisted snapshot, which strips timelines."
+                          },
+                          "usage_coalesced": {
+                            "type": "integer",
+                            "description": "How many raw events were folded to keep usage bounded. Absent/0 means full per-message fidelity."
+                          }
+                        },
+                        "required": [
+                          "session_id",
+                          "agent",
+                          "model",
+                          "input_tokens",
+                          "output_tokens",
+                          "cache_read",
+                          "cache_create",
+                          "total_tokens",
+                          "messages"
+                        ]
+                      }
+                    },
+                    "session_count": {
+                      "type": "integer"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "no_collector"
+                      ],
+                      "description": "Present ONLY in the degenerate no-collector response, which is the bare object {\"status\": \"no_collector\"} with no other field set."
+                    }
+                  }
                 }
               }
             }
@@ -2115,6 +2838,126 @@
         }
       }
     },
+    "/api/agents/{name}/login-code": {
+      "post": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "Submit an authorization code to the agent's terminal",
+        "description": "Owner only. Types an operator-supplied OAuth/device authorization code into the agent's tmux pane and submits it with a single Enter. The write-side twin of `GET /api/agents/{name}/terminal-urls`: that endpoint exists because the embedded ttyd terminal cannot deliver a copy (#5188), and this one because it cannot reliably accept a paste either, which leaves an operator unable to finish a sign-in hand-off from the dashboard at all. It grants no capability the writable ttyd terminal does not already give the same operator; it is strictly narrower, and takes the strictest gate rather than inheriting the read endpoint's any-authenticated-role rule. The code is validated as printable and whitespace-free before it is typed, so it cannot carry a newline and become a second command in the agent's shell, and it is never logged or echoed back.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Agent name"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "code"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "description": "The authorization code from the sign-in page. Must be printable and contain no whitespace or control characters; a value carrying a newline is refused rather than sanitised, because typing it would submit at that point and run everything after it as a fresh line."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Code typed into the agent's pane",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "agent": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Code was empty, too long, or carried whitespace or control characters; nothing was typed"
+          },
+          "403": {
+            "description": "Owner access required"
+          },
+          "503": {
+            "description": "Agent manager unavailable"
+          }
+        }
+      }
+    },
+    "/api/agents/{name}/terminal-urls": {
+      "get": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "URLs visible in the agent's terminal",
+        "description": "Read-only; any authenticated role. Returns the distinct http(s) URLs present in the agent's retained tmux scrollback, most recent first, captured with `capture-pane -J` so terminal-wrapped URLs are rejoined and copy whole. Backs the dashboard's click-to-copy control (#5188), which exists because the embedded ttyd terminal cannot complete a clipboard write. `authUrls` narrows the list to sign-in links, which is all the dashboard control offers (#5327). The capture is redacted before extraction and any URL still carrying a redaction marker is dropped, so device-flow login URLs (whose line carries the one-time code) do not appear. An agent with no session, or with no URL on screen, returns an empty list rather than an error.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Agent name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Distinct URLs from the agent's pane, newest first (possibly empty)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "urls": {
+                      "type": "array",
+                      "description": "All distinct URLs on the pane, newest first.",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "authUrls": {
+                      "type": "array",
+                      "description": "The subset of `urls` that looks like a sign-in link. This is the only list the dashboard offers to copy (#5327): a control labelled \"Copy login URL\" must hand back a login URL or nothing, never whatever else the agent happened to print.",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Agent manager unavailable"
+          }
+        }
+      }
+    },
     "/api/agents/{name}/kicks": {
       "get": {
         "tags": [
@@ -2229,7 +3072,7 @@
           "Agents"
         ],
         "summary": "Kick (message) an agent",
-        "description": "Sends a message/prompt to the agent's running session. If no prompt/message is given, an auto-generated message is built from the agent's last actionable item.",
+        "description": "Queues a message/prompt for delivery to the agent's running session and returns immediately. If no prompt/message is given, an auto-generated message is built from the agent's last actionable item.\n\nASYNCHRONOUS (hivecommons/hive#5325). Delivery waits for the CLI's input prompt, which can take up to 120s and therefore used to outlive a typical 60s ingress idle timeout, making a proxy answer 504 for a kick that actually succeeded. Fast, deterministic preconditions (unknown agent, paused, stopped, missing tmux session) are still evaluated inline and still return 400. Everything slower runs in the background; poll GET /api/kick/{agent}/status for the delivery outcome.\n\nDelivery is exactly-once per agent: a second POST while a delivery is in flight is deduplicated and answers status \"in-flight\" without typing the prompt again.",
         "parameters": [
           {
             "name": "agent",
@@ -2262,19 +3105,30 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Kick sent",
+          "202": {
+            "description": "Kick queued for delivery. Not a delivery confirmation.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
                     "status": {
                       "type": "string",
-                      "example": "kicked"
+                      "enum": [
+                        "queued",
+                        "in-flight"
+                      ],
+                      "description": "queued: this call started a delivery. in-flight: a delivery for this agent was already running and this call was deduplicated."
                     },
                     "agent": {
                       "type": "string"
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Present on the in-flight path, explaining the deduplication."
                     }
                   }
                 }
@@ -2282,7 +3136,7 @@
             }
           },
           "400": {
-            "description": "Prompt too long, or SendKick failed (e.g. unknown agent)"
+            "description": "Prompt too long, or the kick failed its preconditions (unknown agent, paused, stopped, no tmux session)"
           }
         }
       }
@@ -10309,6 +11163,86 @@
         }
       }
     },
+    "/api/contribute/run-stats": {
+      "get": {
+        "tags": [
+          "Contribute"
+        ],
+        "summary": "Per-backend run-scenario aggregates",
+        "description": "Aggregates the durable contributor task-run log into per-backend scenario counts (verdict_complete, idle_complete, headless_complete, env_failure, task_failure, unspecified_failure), the chrome-idle share (the completion-sentinel non-compliance rate), and duration percentiles, over a trailing window. Public, GET only, no side effects \u2014 aggregate counts only, no usernames, reasons, or tokens.",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 365,
+              "default": 7
+            },
+            "description": "Trailing window in days; 0 aggregates everything in the live log."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-backend run-scenario aggregates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "window_days": {
+                      "type": "integer"
+                    },
+                    "total": {
+                      "type": "integer"
+                    },
+                    "backends": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "backend": {
+                            "type": "string"
+                          },
+                          "total": {
+                            "type": "integer"
+                          },
+                          "completed": {
+                            "type": "integer"
+                          },
+                          "failed": {
+                            "type": "integer"
+                          },
+                          "scenarios": {
+                            "type": "object",
+                            "description": "Map of scenario name -> count",
+                            "additionalProperties": {
+                              "type": "integer"
+                            }
+                          },
+                          "chrome_idle_share": {
+                            "type": "number",
+                            "description": "idle_complete / completed \u2014 the completion-sentinel non-compliance rate to ratchet toward zero"
+                          },
+                          "duration_p50_s": {
+                            "type": "number"
+                          },
+                          "duration_p95_s": {
+                            "type": "number"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/contribute/opportunistic": {
       "get": {
         "tags": [
@@ -15694,16 +16628,26 @@
                     },
                     "models": {
                       "type": "array",
+                      "description": "Model ids the backend offers, as advertised by the inference gateway (\"openai/gpt-5\", \"claude_opus_4.8\"). A FLOOR rather than a census whenever `fallback` or `partial` is set.",
                       "items": {
-                        "type": "object"
+                        "type": "string"
                       }
                     },
                     "fallback": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "description": "True when endpoint discovery found nothing and the server substituted its static alias list. These ids are common guesses, unverified against the configured endpoint or key."
                     },
                     "partial": {
                       "type": "boolean",
-                      "description": "True when some but not all endpoints answered."
+                      "description": "True when some but not all endpoints answered. Every id present really was discovered, but a model's ABSENCE proves nothing."
+                    },
+                    "entitled": {
+                      "type": "boolean",
+                      "description": "Present and true when the server narrowed `models` to the set the configured key may actually use. Omitted otherwise, and never set alongside `fallback`."
+                    },
+                    "entitledSource": {
+                      "type": "string",
+                      "description": "How the entitled set was learned (key-info probe, or a \"team not allowed\" 403). Present only when `entitled` is true."
                     }
                   }
                 }
@@ -15960,6 +16904,67 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/repos/rescan": {
+      "post": {
+        "tags": [
+          "Status"
+        ],
+        "summary": "Rescan the monitored repositories for issue/PR changes",
+        "description": "Re-enumerates every monitored repository's open issues and pull requests against the forge and republishes the status snapshot, so the dashboard's REPOSITORIES cards reflect the current tickets without waiting out the governor's eval interval. Read-only with respect to the hive: it runs the enumeration half of the eval cycle only - no governor mode change, no agent kicks, no advisory posting. Server-debounced (30s): a call inside the window returns the previous scan's counts with status \"debounced\" and retry_after_s, and a call while a scan is running returns status \"in-progress\".",
+        "responses": {
+          "200": {
+            "description": "Scan result, or the previous scan's counts when debounced/in-progress",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "rescanned",
+                        "debounced",
+                        "in-progress"
+                      ]
+                    },
+                    "issues": {
+                      "type": "integer",
+                      "description": "Actionable open issues across all monitored repositories."
+                    },
+                    "prs": {
+                      "type": "integer",
+                      "description": "Open pull requests across all monitored repositories."
+                    },
+                    "hold": {
+                      "type": "integer",
+                      "description": "Items suppressed by a hold label."
+                    },
+                    "repos": {
+                      "type": "integer",
+                      "description": "Number of repositories scanned."
+                    },
+                    "scanned_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "retry_after_s": {
+                      "type": "integer",
+                      "description": "Seconds until another scan is allowed (debounced responses only)."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Forge enumeration failed"
+          },
+          "503": {
+            "description": "Rescan is not wired on this deployment (no forge credentials)"
           }
         }
       }
@@ -16404,6 +17409,75 @@
         "responses": {
           "204": {
             "description": "No content"
+          }
+        }
+      }
+    },
+    "/api/kick/{agent}/status": {
+      "get": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "Outcome of the most recent kick",
+        "description": "Read-only; any authenticated role. Reports whether the most recent asynchronous kick reached the agent's CLI (hivecommons/hive#5325). This is where kick success or failure is decided \u2014 POST /api/kick only promises the message was queued.\n\nWhile status is \"in-flight\" the outcome is INDETERMINATE: the prompt may still be delivered, and a client must not render it as a failure. \"unknown\" means no asynchronous kick has been dispatched for this agent in the current process lifetime, which is not an error.",
+        "parameters": [
+          {
+            "name": "agent",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Agent name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Kick dispatch state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "agent": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "unknown",
+                        "in-flight",
+                        "delivered",
+                        "failed"
+                      ]
+                    },
+                    "pending": {
+                      "type": "boolean",
+                      "description": "True while the outcome is indeterminate."
+                    },
+                    "error": {
+                      "type": "string",
+                      "description": "Failure reason; present only when status is failed."
+                    },
+                    "queuedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "settledAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "Absent while pending."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Agent manager unavailable"
           }
         }
       }

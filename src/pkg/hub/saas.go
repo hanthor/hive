@@ -22,10 +22,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"testing"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
+	"golang.org/x/net/publicsuffix"
 )
 
 var saasUsersDir = "/data/saas/users"
@@ -596,6 +596,7 @@ func (s *HubServer) registerSaaSRoutes() {
 	// which is the authoritative check for both.
 	s.mux.HandleFunc("PUT /api/saas/hives/{id}/secondary-app", s.requireAuth(s.handleSetHiveSecondaryApp))
 	s.mux.HandleFunc("POST /api/saas/hives/{id}/restart-spoke", s.requireAuth(s.handleRestartSpoke))
+	s.mux.HandleFunc("POST /api/saas/hives/{id}/agents/{agent}/restarts/reset", s.requireAuth(s.handleResetAgentRestarts))
 	s.mux.HandleFunc("GET /api/saas/hive-config/{hiveID}", s.requireAuth(s.handleProxyHiveConfig))
 	s.mux.HandleFunc("GET /api/saas/latest-sha", s.handleLatestSHA)
 	s.mux.HandleFunc("POST /api/saas/hub/upgrade", s.requireAdmin(s.handleHubSelfUpgrade))
@@ -705,23 +706,6 @@ func (s *HubServer) registerSaaSRoutes() {
 	s.mux.HandleFunc("POST /api/saas/admin/slack/broadcast", s.requireAdmin(s.handleSlackBroadcast))
 	s.mux.HandleFunc("POST /api/saas/admin/journey-snooze", s.requireAdmin(s.handleJourneySnooze))
 	s.mux.HandleFunc("GET /api/saas/admin/journey-status", s.requireAdmin(s.handleJourneyStatus))
-
-	// Under `go test` these long-lived pollers leak across test cases: they
-	// immediately hit the GitHub API and read the package-level saas path
-	// variables that the filesystem test helper swaps per-test, which the
-	// race detector rightly flags. Production behavior is unchanged; tests
-	// that need poller logic call the functions directly.
-	if !testing.Testing() {
-		go s.startProvisionWatcher(context.Background())
-		go s.StartLatestSHAPoller(context.Background())
-		// Periodically probe every spoke's unauthenticated /api/status and alert
-		// on any that answer 200 (wide open) — catches auth drift automatically.
-		go s.StartAuthAudit(context.Background())
-		// Advisory-suppression profile (#4167): one structured log line every
-		// cycle saying how many hives are stale and how many are stale but
-		// UNREPORTED. Read-only measurement — no alert, no registry write.
-		go s.StartAdvisoryDiagnostics(context.Background())
-	}
 }
 
 // impersonateExitPath is the one mutating endpoint that stays callable while
@@ -1107,44 +1091,118 @@ func isNonBrowserAPIRequest(r *http.Request) bool {
 	return true
 }
 
+const (
+	defaultHubPublicURL          = "https://hive.kubestellar.io"
+	defaultHubCanonicalHost      = "hive.kubestellar.io"
+	defaultHubSpokeDomain        = "hive.kubestellar.io"
+	defaultLegacyHubCookieDomain = ".hive.kubestellar.io"
+)
+
+// hubPublicURL is the canonical public origin used to build absolute URLs.
+func hubPublicURL() string {
+	if v := strings.TrimSpace(os.Getenv("HIVE_HUB_PUBLIC_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return defaultHubPublicURL
+}
+
+// oauthRedirectURI is the single OAuth/OIDC callback registered on every
+// provider's side. All providers share one callback path; the state parameter
+// carries which provider to complete against.
+func oauthRedirectURI() string {
+	return hubPublicURL() + "/api/auth/callback"
+}
+
 // hubCanonicalHost is the ONE host that serves the hub's own dashboard and API.
 // Every legitimate browser mutation against the hub is issued by a document
 // loaded from this host — tenant spokes are separate origins that talk to the
 // hub through their own proxy, never by scripting a cross-origin POST at it.
-const hubCanonicalHost = "hive.kubestellar.io"
+func hubCanonicalHost() string {
+	u, err := url.Parse(hubPublicURL())
+	if err != nil || u.Hostname() == "" {
+		return defaultHubCanonicalHost
+	}
+	return strings.ToLower(u.Hostname())
+}
 
-// hubDomainSuffix is the shared parent domain the hosted tenants live under
-// (<id>.hive.kubestellar.io). It is a REDIRECT-trust boundary only — see
-// isTrustedRedirectTarget — and deliberately NOT a CSRF or CORS boundary.
-const hubDomainSuffix = ".hive.kubestellar.io"
+// hubSpokeDomain is the shared parent domain the hosted tenants live under
+// (<id>.hive.kubestellar.io by default). It is a REDIRECT-trust boundary only
+// — see isTrustedRedirectTarget — and deliberately NOT a CSRF or CORS boundary.
+func hubSpokeDomain() string {
+	if v := strings.TrimSpace(os.Getenv("HIVE_HUB_SPOKE_DOMAIN")); v != "" {
+		return strings.TrimPrefix(strings.TrimSuffix(strings.ToLower(v), "."), ".")
+	}
+	return defaultHubSpokeDomain
+}
+
+func hubDomainSuffix() string {
+	return "." + hubSpokeDomain()
+}
+
+func legacyHubCookieDomain() string {
+	v := strings.TrimSpace(os.Getenv("HIVE_HUB_LEGACY_COOKIE_DOMAIN"))
+	if v == "" {
+		return ""
+	}
+	return "." + strings.TrimPrefix(strings.TrimSuffix(strings.ToLower(v), "."), ".")
+}
+
+func legacySessionCookieDomains(liveDomain string) []string {
+	var domains []string
+	if liveDomain != "" && liveDomain != defaultLegacyHubCookieDomain {
+		domains = append(domains, defaultLegacyHubCookieDomain)
+	}
+	if legacy := legacyHubCookieDomain(); legacy != "" && legacy != liveDomain && legacy != defaultLegacyHubCookieDomain {
+		domains = append(domains, legacy)
+	}
+	return domains
+}
 
 // sessionCookieParentDomain is the registrable parent domain the hub session
-// cookie is scoped to, so first-party sibling products on other kubestellar.io
-// subdomains (dibs.kubestellar.io) receive it and can SSO against the hub via
-// GET /api/saas/whoami. Derived from hubCanonicalHost (its parent domain)
-// rather than spelled out so the two can never disagree.
+// cookie is scoped to, so first-party sibling products on other subdomains of it
+// (dibs) receive the cookie and can SSO against the hub via GET /api/saas/whoami.
+// Derived from hubCanonicalHost (its parent domain) rather than spelled out so
+// the two can never disagree.
+//
+// That derivation is also the sibling bridge's precondition: the hub and the
+// sibling must share a REGISTRABLE DOMAIN, whichever one it is. Moving the hub
+// across registrable domains — hive.kubestellar.io to hive.hivecommons.dev —
+// therefore signs users out of every sibling left behind on the old one, and no
+// configuration rescues those siblings, because a browser ignores a Set-Cookie
+// whose Domain does not cover the sending host (RFC 6265 5.3). The old sibling
+// host has to REDIRECT to the new one; dual-serving both cannot work (#5925).
+// Pinned by sibling_host_migration_test.go, explained in
+// src/docs/hivecommons-migration.md.
 func sessionCookieParentDomain() string {
-	if _, parent, ok := strings.Cut(hubCanonicalHost, "."); ok {
+	if parent, err := publicsuffix.EffectiveTLDPlusOne(hubCanonicalHost()); err == nil {
 		return parent
 	}
-	return hubCanonicalHost
+	if _, parent, ok := strings.Cut(hubCanonicalHost(), "."); ok {
+		return parent
+	}
+	return hubCanonicalHost()
 }
 
 // sessionCookieDomain returns the Domain attribute the hub session cookie
 // (hive_hub_user) must carry for a request served on host, or "" for a
 // host-only cookie.
 //
-// Production (any host under kubestellar.io, including the hub itself) gets
-// Domain=.kubestellar.io so that BOTH consumers of the cookie receive it:
-//   - every hosted spoke's Node proxy on <id>.hive.kubestellar.io, which
-//     independently verifies it for the tenant dashboard and terminal (the
-//     original reason the cookie carried Domain=.hive.kubestellar.io); and
-//   - sibling first-party products such as dibs.kubestellar.io, which read it
-//     and call back to /api/saas/whoami (#4171).
+// Production (any host under the hub's own registrable domain, including the
+// hub itself) gets Domain=.<that domain> — .kubestellar.io by default, or
+// .hivecommons.dev once HIVE_HUB_PUBLIC_URL moves the hub there — so that BOTH
+// consumers of the cookie receive it:
+//   - every hosted spoke's Node proxy on <id>.hive.<domain>, which independently
+//     verifies it for the tenant dashboard and terminal (the original reason the
+//     cookie carried Domain=.hive.kubestellar.io); and
+//   - sibling first-party products such as dibs, which read it and call back to
+//     /api/saas/whoami (#4171) — but ONLY while the sibling lives under the same
+//     registrable domain (#5925; see sessionCookieParentDomain).
 //
-// Local/dev hosts (localhost, 127.0.0.1, anything not under kubestellar.io)
-// get a host-only cookie: a browser rejects a Set-Cookie whose Domain does not
-// cover the request host, so widening there would break local login outright.
+// Every other host — localhost, 127.0.0.1, and any host outside that domain,
+// which includes a sibling stranded on the PREVIOUS registrable domain — gets a
+// host-only cookie: a browser rejects a Set-Cookie whose Domain does not cover
+// the request host, so widening there would emit a cookie no browser stores and
+// would break local login outright.
 func sessionCookieDomain(host string) string {
 	h := host
 	if hp, _, err := net.SplitHostPort(host); err == nil {
@@ -1195,7 +1253,7 @@ func isSameOriginAsHub(raw string) bool {
 	if !ok {
 		return false
 	}
-	return host == hubCanonicalHost || host == "localhost" || host == "127.0.0.1"
+	return host == hubCanonicalHost() || host == "localhost" || host == "127.0.0.1"
 }
 
 // isTrustedRedirectTarget reports whether raw is a URL the hub may bounce a
@@ -1220,8 +1278,8 @@ func isTrustedRedirectTarget(raw string) bool {
 	if !ok {
 		return false
 	}
-	return host == hubCanonicalHost ||
-		strings.HasSuffix(host, hubDomainSuffix) ||
+	return host == hubCanonicalHost() ||
+		strings.HasSuffix(host, hubDomainSuffix()) ||
 		host == "localhost" ||
 		host == "127.0.0.1"
 }
@@ -2202,6 +2260,33 @@ type PerClusterHealth struct {
 	DataSource string               `json:"data_source,omitempty"` // "heartbeat" when data comes from spoke heartbeat instead of kubectl
 	DataStale  bool                 `json:"data_stale,omitempty"`  // true when heartbeat data is older than heartbeatHealthStaleness
 	DataAge    string               `json:"data_age,omitempty"`    // human-readable age or collection timestamp
+	// StuckPods reports hive-namespace pods stuck Terminating — the residue of
+	// nodes disappearing without draining (#5328 item 3). Nil means the hub
+	// could not determine it (unreachable cluster, pull-only pool, failed
+	// listing); a non-nil report with Total 0 means it looked and the cluster
+	// is clean. Those must not render alike: 27 orphans accumulated for three
+	// weeks precisely because nothing distinguished "none" from "nobody
+	// checked". See orphaned_pod_visibility.go.
+	StuckPods *StuckPodReport `json:"stuck_pods,omitempty"`
+	// LeakedNamespaces reports hive-hosted-* namespaces the cluster holds that
+	// this hub has no hive record for — provisioning namespaces that were
+	// created and never torn down (#5768). Nil means the hub could not
+	// determine it (unreachable cluster, pull-only pool, failed listing, or an
+	// empty hive registry, which cannot be told apart from an unreadable one);
+	// a non-nil report with Total 0 means it looked and the cluster is clean.
+	// Those must not render alike, for the same reason StuckPods above draws
+	// the distinction. See leaked_hosted_namespace.go.
+	LeakedNamespaces *LeakedNamespaceReport `json:"leaked_namespaces,omitempty"`
+	// WildcardTLS reports the health of the wildcard certificate this cluster
+	// serves its spokes from (#5977). Present ONLY for clusters that opted in
+	// with wildcard_tls_secret, because only those have spokes depending on it:
+	// on an opted-in cluster provisioned Ingresses carry no tls: block of their
+	// own, so this one certificate stands behind every hosted dashboard and its
+	// renewal is a single point of failure for all of them. Nil means either
+	// "this cluster does not use the wildcard" or "the hub could not look" —
+	// the same unknown-is-not-healthy contract the two fields above carry. See
+	// wildcard_tls_health.go.
+	WildcardTLS *WildcardTLSReport `json:"wildcard_tls,omitempty"`
 }
 
 type ClusterHealthResponse struct {
@@ -2270,7 +2355,8 @@ func buildClusterHealth(s *HubServer) (*ClusterHealthResponse, error) {
 		hiveIDsByCluster[clusterID][hiveID] = true
 		allHiveIDs[hiveID] = true
 	}
-	for _, sh := range listSaaSHives() {
+	saasHives, saasHivesReadable := listSaaSHivesWithReadStatus()
+	for _, sh := range saasHives {
 		addHive(clusterIDForSaaSHive(sh), sh.ID)
 	}
 	s.mu.RLock()
@@ -2289,6 +2375,20 @@ func buildClusterHealth(s *HubServer) (*ClusterHealthResponse, error) {
 	}
 	totalHiveCount := len(allHiveIDs)
 
+	// One registry snapshot for the whole health build, so two clusters queried
+	// in parallel cannot disagree about which namespaces are accounted for.
+	// Built from the UNION of the on-disk SaaS hive records and the in-memory
+	// registry — the widest set of "the hub knows about this id" available —
+	// because the leak predicate convicts a namespace for being absent from it,
+	// and a narrower set would convict namespaces that are merely recorded
+	// somewhere else. See leaked_hosted_namespace.go.
+	var knownHostedNamespaces map[string]struct{}
+	if saasHivesReadable {
+		knownHostedNamespaces = hostedNamespacesForHiveIDs(allHiveIDs)
+	} else if s.logger != nil {
+		s.logger.Warn("leaked-namespace detection disabled: SaaS hive directory could not be read")
+	}
+
 	// Query all clusters in parallel.
 	type clusterResult struct {
 		health PerClusterHealth
@@ -2303,7 +2403,7 @@ func buildClusterHealth(s *HubServer) (*ClusterHealthResponse, error) {
 		ch := make(chan clusterResult, 1)
 		results[c.ID] = clusterQuery{cluster: c, ch: ch}
 		go func(cluster ClusterConfig) {
-			health, err := buildSingleClusterHealth(&cluster, hiveCounts[cluster.ID], s.logger)
+			health, err := buildSingleClusterHealth(&cluster, hiveCounts[cluster.ID], knownHostedNamespaces, s.logger)
 			ch <- clusterResult{health: health, err: err}
 		}(c)
 	}
@@ -2458,7 +2558,11 @@ func clusterHealthQueryTimeoutFor(cluster *ClusterConfig) time.Duration {
 var errClusterPullOnly = errors.New("cluster is pull-only: not reachable from the hub")
 
 // buildSingleClusterHealth queries a single cluster for node health data.
-func buildSingleClusterHealth(cluster *ClusterConfig, hiveCount int, logger *slog.Logger) (PerClusterHealth, error) {
+// knownHostedNamespaces is the fleet-wide set of hosted namespace names the
+// hub has a hive for, threaded in from buildClusterHealth rather than re-read
+// here so every cluster in one health build judges leaks against the SAME
+// registry snapshot. See hostedNamespacesForHiveIDs.
+func buildSingleClusterHealth(cluster *ClusterConfig, hiveCount int, knownHostedNamespaces map[string]struct{}, logger *slog.Logger) (PerClusterHealth, error) {
 	if cluster.PullOnly {
 		// Node-level health comes from kubectl, which cannot run here. This is
 		// not a new failure mode: the caller already falls back to the health
@@ -2742,6 +2846,75 @@ func buildSingleClusterHealth(cluster *ClusterConfig, hiveCount int, logger *slo
 		result.GPUSummary = &GPUSummary{
 			TotalGPUs:       totalGPUCapacity,
 			AllocatableGPUs: totalGPUAllocatable,
+		}
+	}
+
+	// Orphaned Terminating-pod count (#5328 item 3). READ-ONLY: one extra
+	// `kubectl get pods` on a path that already lists pods. It needs its own
+	// listing because the query above is field-selected to phase=Running and
+	// therefore cannot see an orphan by construction.
+	//
+	// Best-effort: nil on failure, so a cluster the hub could not interrogate
+	// reports UNKNOWN rather than a reassuring zero.
+	if stuck := collectStuckPods(ctx, cluster, timeout, time.Now()); stuck != nil {
+		result.StuckPods = stuck
+		// Log when the fleet is actually accumulating orphans. The reaper
+		// clears them, so a persistently non-zero count here means orphans are
+		// being PRODUCED faster than they age past orphanedPodMinAge — which is
+		// the upstream node-lifecycle fault (#5328 item 1), not a reaper
+		// problem. Silence on zero keeps a healthy fleet quiet.
+		if stuck.Total > 0 && logger != nil {
+			logger.Warn("cluster has hive pods stuck terminating — check for ungraceful node loss",
+				"cluster", cluster.ID,
+				"stuck_pods", stuck.Total,
+				"namespaces_affected", stuck.NamespacesAffected)
+		}
+	}
+
+	// Leaked hosted-namespace count (#5768 ask 3). READ-ONLY: one extra
+	// `kubectl get namespaces`. It cannot reuse any listing above — the pod
+	// queries cannot see a namespace whose pods are gone, and the
+	// registry-derived sweeps cannot see a namespace with no registry entry by
+	// construction, which is exactly the leak class.
+	//
+	// Best-effort: nil on failure or on an empty registry, so a cluster the hub
+	// could not interrogate reports UNKNOWN rather than a reassuring zero.
+	if leaked := collectLeakedHostedNamespaces(ctx, cluster, timeout, knownHostedNamespaces, time.Now(), logger); leaked != nil {
+		result.LeakedNamespaces = leaked
+		// A non-zero count is a standing quota/PVC leak on a shared cluster, and
+		// permanent noise in any surface that reads pod issues — the console
+		// canary that found this read 76 stuck pods across these namespaces.
+		// Nothing deletes them, so this stays warm until a human acts.
+		if leaked.Total > 0 && logger != nil {
+			logger.Warn("cluster holds hive-hosted namespaces with no hive record — leaked provisioning namespaces, nothing will reclaim them",
+				"cluster", cluster.ID,
+				"leaked_namespaces", leaked.Total)
+		}
+	}
+
+	// Wildcard certificate health (#5977). READ-ONLY: one extra `kubectl get
+	// secret`, and ONLY on clusters that opted in with wildcard_tls_secret —
+	// everywhere else spokes still carry per-host certificates and there is
+	// nothing here to be a single point of failure.
+	//
+	// This is also the only place the operator's opt-in assertion is ever
+	// checked against the cluster. The provisioner cannot check it (it must
+	// decide without a round-trip, and guessing wrong takes the cluster down),
+	// so until now "flag set, secret absent" was silent until a user opened a
+	// dashboard and got a self-signed certificate.
+	if wildcard := collectWildcardTLSHealth(ctx, cluster, timeout, time.Now(), logger); wildcard != nil {
+		result.WildcardTLS = wildcard
+		// Every non-ok status is worth a line: unlike the two signals above,
+		// which count things that accumulate, this one is binary and fleet-wide
+		// — when it is wrong, every hosted dashboard on the cluster is already
+		// serving a certificate that does not validate.
+		if !wildcard.Healthy() && logger != nil {
+			logger.Warn("wildcard TLS certificate needs attention — it serves EVERY wildcard-covered spoke on this cluster",
+				"cluster", cluster.ID,
+				"secret", wildcard.Secret,
+				"status", wildcard.Status,
+				"detail", wildcard.Detail,
+				"not_after", wildcard.NotAfter)
 		}
 	}
 
@@ -3074,11 +3247,12 @@ type MyHiveEntry struct {
 	// modal; this is only the hover preview.
 	RecentEvents []TimelineEvent `json:"recentEvents,omitempty"`
 
-	// AdvisoryIssueActivity is the fleet row's advisory/issue output freshness:
-	// the newest successful advisory digest post or actionable-issue count
-	// movement already reported to the hub, bucketed on read. Placeholders and
-	// old/non-advisory spokes with no signal still get the field with bucket
-	// "unknown" so every row renders an explicit n/a instead of disappearing.
+	// AdvisoryIssueActivity is the fleet row's advisory-digest freshness: the
+	// newest successful digest update already reported to the hub, bucketed on
+	// read with the same thresholds and gates as the advisory-stale verdict.
+	// Placeholders and old/non-advisory spokes with no signal still get the
+	// field with bucket "unknown" so every row renders an explicit n/a instead
+	// of disappearing.
 	AdvisoryIssueActivity AdvisoryIssueActivity `json:"advisoryIssueActivity"`
 
 	// BudgetHealth is this hive's current governor budget-window usage, bucketed
@@ -3100,6 +3274,32 @@ type MyHiveEntry struct {
 	// must never show the pill.
 	AdvisoryStale       bool   `json:"advisoryStale,omitempty"`
 	AdvisoryStaleReason string `json:"advisoryStaleReason,omitempty"`
+
+	// AutoUpgradeBlocked is true when this hive has auto-upgrade ON but the hub
+	// will REFUSE to arm it: upgradeCollectible() is false, so the spoke cannot
+	// pull the instruction off its own heartbeat and triggerAutoUpgrades()
+	// declines every cycle. AutoUpgradeBlockedReason is the operator-facing
+	// cause from uncollectibleUpgradeReason() — the SAME string
+	// noteUncollectibleUpgrade() writes to the timeline, and documented there as
+	// free of credentials and kubeconfig paths, so it is safe as a tooltip.
+	//
+	// WHY THIS IS COMPUTED ON READ RATHER THAN RE-DERIVED IN JAVASCRIPT. The
+	// fleet row used to render "Queued for auto-upgrade · 1pm ET" from
+	// autoUpgradeMode alone, which consults nothing about eligibility. A hive
+	// the hub had permanently refused therefore advertised a queued upgrade
+	// while the timeline recorded the refusal — two surfaces, opposite stories,
+	// and no way to tell "waiting for the window" from "will never fire". The
+	// browser must not re-implement the predicate or its staleRemoveAge bound;
+	// sending the evaluated decision is what keeps badge and hub in agreement.
+	//
+	// DELIBERATELY ONLY THE REFUSED GATE. The other gates in
+	// triggerAutoUpgrades() (claim in flight, wave full, provisioning, the
+	// schedule itself) are TRANSIENT — they clear on their own, so a badge
+	// saying "queued" is eventually true. Uncollectible is the one state that
+	// never resolves without operator action, which is why it is the one worth
+	// naming distinctly.
+	AutoUpgradeBlocked       bool   `json:"autoUpgradeBlocked,omitempty"`
+	AutoUpgradeBlockedReason string `json:"autoUpgradeBlockedReason,omitempty"`
 
 	// The inference-backend auth-failure signal (InferenceAuthError) is NOT
 	// re-declared here: MyHiveEntry embeds RegistryEntry, which already carries
@@ -3543,6 +3743,7 @@ func (s *HubServer) handleMyHives(w http.ResponseWriter, r *http.Request) {
 					})
 				}
 			}
+			pending = s.decoratePendingAccessRequests(pending)
 			result[i].PendingRequestCount = len(pending)
 			result[i].PendingRequests = pending
 		}
@@ -3597,16 +3798,27 @@ func (s *HubServer) handleMyHives(w http.ResponseWriter, r *http.Request) {
 		st := s.journey.get(result[i].ID)
 		status := JourneyStatusFor(&result[i].RegistryEntry, st, journeyNow)
 		result[i].Journey = &status
-		result[i].AdvisoryIssueActivity = advisoryIssueActivityFor(result[i].RegistryEntry, journeyNow)
+		result[i].AdvisoryIssueActivity = advisoryFreshnessFor(result[i].RegistryEntry, journeyNow)
 		result[i].BudgetHealth = budgetHealthFor(result[i].RegistryEntry)
 		result[i].GitHubAppHealth = githubAppHealthFor(result[i].RegistryEntry, journeyNow)
 
 		// Advisory-staleness pill, computed on read (same as Journey) so the
 		// gating — advisory-mode participation, app-can-write, past-threshold —
 		// lives ONLY in Go and the browser just renders the flag.
-		if stale, reason := advisoryStale(result[i].RegistryEntry, journeyNow); stale {
+		if stale, reason := advisoryStaleFromFreshness(result[i].RegistryEntry, result[i].AdvisoryIssueActivity); stale {
 			result[i].AdvisoryStale = true
 			result[i].AdvisoryStaleReason = reason
+		}
+
+		// Auto-upgrade REFUSAL, computed on read for the same reason: the
+		// predicate and its staleRemoveAge bound live ONLY in Go, so the fleet
+		// badge cannot drift from what triggerAutoUpgrades() will actually do.
+		// Gated on AutoUpgrade because the state only means anything for a hive
+		// that has asked for auto-upgrades in the first place — a manual hive is
+		// not "blocked", it is simply manual.
+		if blocked, reason := autoUpgradeBlocked(result[i].AutoUpgrade, result[i].LastHeartbeat, journeyNow); blocked {
+			result[i].AutoUpgradeBlocked = true
+			result[i].AutoUpgradeBlockedReason = reason
 		}
 
 		// Running-but-inactive agents, computed on read for the same reason:
@@ -3643,6 +3855,9 @@ func (s *HubServer) handleMyHives(w http.ResponseWriter, r *http.Request) {
 		// count. (isPlaceholderEntry is the same authoritative test computeFleet‐
 		// Stats and the alert layer use.)
 		if len(result[i].Agents) > 0 && !isPlaceholderEntry(result[i]) {
+			if sh := loadSaaSHive(result[i].ID); sh != nil {
+				applyAgentRestartResetBaselines(result[i].Agents, sh.AgentRestartResets, journeyNow)
+			}
 			blockers := hiveBlockers{
 				GitHubAppRequired:       result[i].GitHubAppRequired,
 				GitHubAppPermIssue:      result[i].GitHubAppPermIssue,
@@ -3651,16 +3866,39 @@ func (s *HubServer) handleMyHives(w http.ResponseWriter, r *http.Request) {
 				RepoTargetIssue:         result[i].RepoTargetIssue,
 				InferenceAuthError:      result[i].InferenceAuthError,
 				ProviderLimitReason:     result[i].ProviderLimitReason,
+				ProviderLimitHiveWide:   result[i].ProviderLimitHiveWide,
+				ProviderLimitAgents:     result[i].ProviderLimitAgents,
+				GatewayHealth:           result[i].GatewayHealth,
 			}
 			rollup := rollupAgents(result[i].Agents, blockers, queuedWork, journeyNow)
 			result[i].FleetRollup = &rollup
 			result[i].AgentVerdicts = buildAgentVerdicts(result[i].Agents, blockers, queuedWork, journeyNow)
+			if rollup.RestartStorms > 0 {
+				appendDriftSignal(&result[i].Drift, DriftKindAgentRestartStorm, DriftCritical,
+					fmt.Sprintf("%d agent(s) restarted at least %d times in the last 24h",
+						rollup.RestartStorms, agentRestartProblemThreshold()))
+			}
 			result[i].AgentRosterMismatch = computeAgentRosterMismatch(result[i].ACMMLevel, result[i].Agents)
 
 			// Hive-health verdict: reuse the rollup + app-health + queue depth we
 			// just computed. Only for real (non-placeholder) hives with reported
 			// agents — a placeholder has nothing to produce.
 			verdict := hiveHealthFor(result[i].RegistryEntry, rollup, result[i].GitHubAppHealth, queuedWork, journeyNow)
+			// Digest-lag amber (#5577): the channel/behind-count divergence
+			// info lives on MyHiveEntry (TrackedChannel is hub-owned, the
+			// behind-count was computed just above), so this row of the
+			// signature table is applied here rather than in hiveHealthFor.
+			applyChannelLag(&verdict, result[i].TrackedChannel, result[i].CommitsBehindStableV4, result[i].Upgrading)
+			// The App-broken hint's install URL is cluster-scoped (a GHE
+			// cluster must never be handed a github.com link), so resolve it
+			// from this hive's cluster config — the same single URL builder
+			// the create-hive modal uses.
+			if verdict.cause == causeAppBroken && verdict.Remediation != nil {
+				if c, ok := s.clusters[result[i].ClusterID]; ok {
+					gh := clusterGitHubConfig(&c)
+					verdict.Remediation.Link = gh.AppInstallURL()
+				}
+			}
 			result[i].HealthVerdict = &verdict
 		}
 
@@ -3722,6 +3960,7 @@ func (s *HubServer) handleMyHives(w http.ResponseWriter, r *http.Request) {
 		"latest_sha_messages":      getDisplaySHAMessages(),
 		"latest_sha_image_status":  getImageStatuses(),
 		"latest_sha_build_started": getImageBuildStartTimes(),
+		"latest_sha_build_url":     getImageBuildURLs(),
 		"commit_messages":          getCommitMessages(),
 		"hub_git_hash":             s.hubGitHash,
 		"hub_git_branch":           s.hubGitBranch,
@@ -3843,6 +4082,7 @@ func (s *HubServer) handleAccessStatus(w http.ResponseWriter, r *http.Request) {
 		"latest_sha_messages":      getDisplaySHAMessages(),
 		"latest_sha_image_status":  getImageStatuses(),
 		"latest_sha_build_started": getImageBuildStartTimes(),
+		"latest_sha_build_url":     getImageBuildURLs(),
 		"commit_messages":          getCommitMessages(),
 	})
 }
@@ -3876,7 +4116,7 @@ func (s *HubServer) handleCreateHive(w http.ResponseWriter, r *http.Request) {
 	if host, org, reposFromOrg := normalizeProjectRef(req.Org); org != "" && (host != "" || len(reposFromOrg) > 0) {
 		if host != "" {
 			req.GitHubBaseURL = "https://" + host
-			req.GitHubAPIURL = gheAPIURLForHost(host)
+			req.GitHubAPIURL = forgeAPIURLForHost("", host)
 		}
 		req.Org = org
 		if len(reposFromOrg) > 0 {
@@ -3892,7 +4132,7 @@ func (s *HubServer) handleCreateHive(w http.ResponseWriter, r *http.Request) {
 		host, org, reposFromShifted := normalizeProjectRef(req.Org + "/" + originalFirstRepo)
 		if host != "" && org != "" && strings.Contains(req.Org, ".") {
 			req.GitHubBaseURL = "https://" + host
-			req.GitHubAPIURL = gheAPIURLForHost(host)
+			req.GitHubAPIURL = forgeAPIURLForHost("", host)
 			req.Org = org
 			repos := replaceFirstCSV(req.Repos, strings.Join(reposFromShifted, "/"))
 			req.Repos = repos
@@ -4617,12 +4857,59 @@ func (s *HubServer) handleUpgradeHive(w http.ResponseWriter, r *http.Request) {
 	// the wedge this PR fixes. The hive is latched Upgrading with a target the
 	// moment the request returns, which is what the dashboard renders.
 
+	// Do not ARM an upgrade this hive cannot COLLECT — the same predicate
+	// triggerAutoUpgrades() applies, for the same reason. Delivery is PULL on
+	// BOTH paths: the hub only records a target and arms the heartbeat, and the
+	// spoke patches its own Deployment when it next beats. A hive that never
+	// heartbeats (or is silent past staleRemoveAge) therefore never collects
+	// the instruction, while Upgrading=true latches on the hub and the
+	// stale-upgrade sweep re-arms it every staleUpgradeTimeout — an unbounded
+	// loop the orphan sweep's retry budget cannot break, because such a hive
+	// fails evaluateOrphanedUpgrade()'s liveness test. See pullonly_upgrade.go.
+	//
+	// Without this, the manual button was strictly WORSE than the auto path it
+	// diverged from: auto-upgrade refuses and records the refusal on the
+	// timeline, whereas the click reported {"status":"upgrading"} and a success
+	// toast for an upgrade that could never land. Worse, the asymmetry read as
+	// a workaround — the same spoke auto-upgrade had declined would accept a
+	// manual click, appearing to fix the problem while only hiding it.
+	//
+	// lastHeartbeat comes from the REGISTRY entry, which is the only record
+	// that carries it; SaaSHive (the loadSaaSHive record `h` above) has no such
+	// field. This is the identical source triggerAutoUpgrades() reads.
+	//
+	// Refused with 409, matching the pause-switch refusal above. The reason is
+	// operator-facing by construction and documented to carry no kubeconfig
+	// paths or credentials, so it is safe in the body.
 	s.mu.Lock()
-	var latestSHA string
+	var latestSHA, lastHeartbeat string
+	var found bool
 	for i := range s.registry.Hives {
 		if s.registry.Hives[i].ID == id {
+			found = true
+			lastHeartbeat = s.registry.Hives[i].LastHeartbeat
 			branch := s.upgradeBranchOrDefault(s.registry.Hives[i].GitBranch)
 			latestSHA = getLatestSHAForBranch(branch)
+			break
+		}
+	}
+	// A hive with no registry entry has never checked in at all, so it is
+	// uncollectible for exactly the reason the empty-heartbeat case is.
+	if !found || !upgradeCollectible(lastHeartbeat, time.Now()) {
+		s.mu.Unlock()
+		reason := uncollectibleUpgradeReason(lastHeartbeat)
+		s.logger.Warn("manual upgrade not armed — hive cannot collect the instruction",
+			"hive_id", id, "by", username, "cluster", cluster.ID,
+			"would_have_targeted", latestSHA, "last_heartbeat", orDash(lastHeartbeat),
+			"reason", reason)
+		s.noteUncollectibleUpgrade(id, latestSHA, reason)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": reason})
+		return
+	}
+	for i := range s.registry.Hives {
+		if s.registry.Hives[i].ID == id {
 			s.beginUpgrade(i, latestSHA)
 			break
 		}
@@ -4651,6 +4938,11 @@ func (s *HubServer) handleUpgradeHive(w http.ResponseWriter, r *http.Request) {
 	// collected by the spoke on its next beat. The UI uses this to say "queued"
 	// rather than implying an immediate roll.
 	const mode = "heartbeat"
+	// Armed successfully, so the uncollectible condition has genuinely cleared:
+	// drop the de-duplication memory (as the auto path does on its own successful
+	// arm) so a LATER refusal for this same target is reported afresh rather than
+	// suppressed by a stale entry.
+	s.forgetUncollectibleUpgrade(id)
 	s.logger.Info("audit: hosted hive upgrade requested",
 		"hive_id", id, "by", username, "cluster", cluster.ID, "mode", mode)
 	s.recordTimeline(id, TimelineUpgradeStarted, "upgrade requested from the hub dashboard ("+mode+")", username)
@@ -4740,7 +5032,7 @@ func (s *HubServer) handleSwitchBranch(w http.ResponseWriter, r *http.Request) {
 	ns := "hive-hosted-" + id
 	// A channel IS the tag ("stable"); a branch's moving tag is "<branch>-latest".
 	imageTag := upgradeTargetTag(body.Branch)
-	image := "ghcr.io/kubestellar/hive:" + imageTag
+	image := "ghcr.io/hivecommons/hive:" + imageTag
 	// Refuse a branch name that sanitizes into something that is not a valid
 	// channel tag, rather than stranding the spoke on ImagePullBackOff behind a
 	// still-serving old ReplicaSet.
@@ -4993,6 +5285,119 @@ func (s *HubServer) handleRenameHive(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "project_name": name})
 }
 
+func (s *HubServer) handleResetAgentRestarts(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	agentName := sanitizeHeartbeatField(r.PathValue("agent"))
+	username := s.getAuthUser(r)
+	if agentName == "" || !isValidName(agentName) {
+		http.Error(w, `{"error":"invalid agent name"}`, http.StatusBadRequest)
+		return
+	}
+	h := loadSaaSHive(id)
+	if h == nil {
+		http.Error(w, `{"error":"hive not found"}`, http.StatusNotFound)
+		return
+	}
+	if !userIsHiveOwner(username, h) {
+		http.Error(w, `{"error":"only the owner can reset agent restarts"}`, http.StatusForbidden)
+		return
+	}
+
+	total := 0
+	s.mu.RLock()
+	for _, reg := range s.registry.Hives {
+		if reg.ID != id {
+			continue
+		}
+		for _, a := range reg.Agents {
+			if a.Name == agentName {
+				total = a.Restarts.Total
+				break
+			}
+		}
+		break
+	}
+	s.mu.RUnlock()
+
+	if h.AgentRestartResets == nil {
+		h.AgentRestartResets = make(map[string]AgentRestartReset)
+	}
+	reset := AgentRestartReset{
+		ResetAt:       time.Now().UTC().Format(time.RFC3339),
+		By:            username,
+		TotalBaseline: total,
+		Pending:       true,
+	}
+	h.AgentRestartResets[agentName] = reset
+	if err := saveSaaSHive(h); err != nil {
+		http.Error(w, `{"error":"failed to save"}`, http.StatusInternalServerError)
+		return
+	}
+	s.logger.Info("audit: agent restart counter reset", "hive_id", id, "agent", agentName, "by", username, "total_baseline", total)
+	s.recordTimeline(id, TimelineRestarted, fmt.Sprintf("agent %s restart counter reset", agentName), username)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "agent": agentName, "reset_at": reset.ResetAt, "by": username})
+}
+
+func pendingAgentRestartResetsForHeartbeat(hiveID string) []string {
+	h := loadSaaSHive(hiveID)
+	if h == nil || len(h.AgentRestartResets) == 0 {
+		return nil
+	}
+	var names []string
+	changed := false
+	for name, reset := range h.AgentRestartResets {
+		if !reset.Pending {
+			continue
+		}
+		names = append(names, name)
+		reset.Pending = false
+		reset.TotalBaseline = 0
+		h.AgentRestartResets[name] = reset
+		changed = true
+	}
+	if changed {
+		_ = saveSaaSHive(h)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func applyAgentRestartResetBaselines(agents []AgentSummary, resets map[string]AgentRestartReset, now time.Time) {
+	if len(resets) == 0 {
+		return
+	}
+	cutoff := now.Add(-24 * time.Hour)
+	for i := range agents {
+		reset, ok := resets[agents[i].Name]
+		if !ok {
+			continue
+		}
+		agents[i].Restarts.ResetAt = reset.ResetAt
+		agents[i].Restarts.ResetBy = reset.By
+		resetAt, err := time.Parse(time.RFC3339, reset.ResetAt)
+		if err != nil || resetAt.Before(cutoff) {
+			continue
+		}
+		delta := agents[i].Restarts.Total - reset.TotalBaseline
+		if delta < 0 {
+			delta = 0
+		}
+		agents[i].Restarts.Last24h = delta
+	}
+}
+
+func appendDriftSignal(report *DriftReport, kind string, sev DriftSeverity, reason string) {
+	if report == nil {
+		return
+	}
+	report.Signals = append(report.Signals, DriftSignal{Kind: kind, Severity: sev, Reason: reason})
+	report.Count = len(report.Signals)
+	if driftSeverityRank[sev] > driftSeverityRank[report.WorstSeverity] {
+		report.WorstSeverity = sev
+	}
+}
+
 // pushVisibilityToSpoke best-effort notifies a hosted hive's own governor
 // config of a visibility change made from the hub dashboard. It never
 // affects the outcome of the toggle request — the hub's registry/SaaS
@@ -5177,6 +5582,10 @@ const (
 	imageStatusReady    = "ready"    // image tag verified on GHCR
 	imageStatusBuilding = "building" // docker workflow queued/in progress, or image not yet visible
 	imageStatusFailed   = "failed"   // docker workflow completed unsuccessfully
+	imageStatusStale    = "stale"    // still non-ready past the configured build window
+
+	imageBuildStaleAfterEnv     = "HIVE_IMAGE_BUILD_STALE_AFTER"
+	defaultImageBuildStaleAfter = 90 * time.Minute
 )
 
 // branchHeadInfo tracks the branch HEAD commit, which may be ahead of the
@@ -5191,6 +5600,9 @@ type branchHeadInfo struct {
 	// while the same SHA keeps building; it is zeroed when the image finishes
 	// (ready/failed) or a new SHA takes over. Zero means "not building / unknown".
 	BuildStartedAt time.Time
+	// BuildURL is the GitHub Actions run URL for the docker workflow run that
+	// established a terminal/non-ready state, when GitHub reported one.
+	BuildURL string
 }
 
 // githubAPIBase and ghcrBase are the GitHub/GHCR origins used by the SHA-poll
@@ -5209,8 +5621,8 @@ var (
 // chasing a SHA whose hub image was never pushed, and the rollout falls back to
 // a stale cached image.
 const (
-	ghcrRepoSpoke = "kubestellar/hive"
-	ghcrRepoHub   = "kubestellar/hive-hub"
+	ghcrRepoSpoke = "hivecommons/hive"
+	ghcrRepoHub   = "hivecommons/hive-hub"
 
 	// hubDeploymentName / hubContainerName / hubNamespace identify the hub's own
 	// Kubernetes objects for self-upgrade. NOTE the container is named "hub", not
@@ -5318,7 +5730,7 @@ var (
 const imageBranchCacheTTL = 5 * time.Minute
 
 // discoveredImageBranches returns branch names inferred from published
-// ghcr.io/kubestellar/hive:<branch>-latest tags (cached). A tag with a '-'
+// ghcr.io/hivecommons/hive:<branch>-latest tags (cached). A tag with a '-'
 // that our sanitizer would have produced can't be reversed unambiguously, so
 // we only surface tags that round-trip: the tag minus the "-latest" suffix.
 // Slashless branches (v2, mk) round-trip exactly; slashed branches
@@ -5365,12 +5777,12 @@ func discoveredImageBranches() []string {
 	return branches
 }
 
-// listRepoBranches returns the names of branches on kubestellar/hive via the
+// listRepoBranches returns the names of branches on hivecommons/hive via the
 // GitHub API (paginated). Best-effort: returns nil on any failure so callers
 // treat "unknown" as "don't filter" rather than hiding valid branches.
 func listRepoBranches(client *http.Client) []string {
 	var names []string
-	url := githubAPIBase + "/repos/kubestellar/hive/branches?per_page=100"
+	url := githubAPIBase + "/repos/hivecommons/hive/branches?per_page=100"
 	const maxPages = 10
 	for page := 0; url != "" && page < maxPages; page++ {
 		req, _ := http.NewRequest("GET", url, nil)
@@ -5411,10 +5823,10 @@ func nextGitHubLink(link string) string {
 }
 
 // listLatestImageBranches queries the GHCR tag list for
-// ghcr.io/kubestellar/hive and returns the branch name of every "<x>-latest"
+// ghcr.io/hivecommons/hive and returns the branch name of every "<x>-latest"
 // tag (the "<x>" part).
 func listLatestImageBranches(client *http.Client) []string {
-	tokenResp, err := client.Get(ghcrBase + "/token?scope=repository:kubestellar/hive:pull")
+	tokenResp, err := client.Get(ghcrBase + "/token?scope=repository:hivecommons/hive:pull")
 	if err != nil {
 		return nil
 	}
@@ -5431,7 +5843,7 @@ func listLatestImageBranches(client *http.Client) []string {
 	// "<branch>-latest" tags we want may live on a later page — follow Link
 	// until exhausted (bounded) rather than reading only the first page.
 	branchSet := map[string]struct{}{}
-	next := ghcrBase + "/v2/kubestellar/hive/tags/list?n=1000"
+	next := ghcrBase + "/v2/hivecommons/hive/tags/list?n=1000"
 	const maxPages = 20 // bound: up to ~20k tags
 	for page := 0; next != "" && page < maxPages; page++ {
 		req, _ := http.NewRequest("GET", next, nil)
@@ -5587,26 +5999,33 @@ func getBranchHead(branch string) branchHeadInfo {
 // setBranchHead records the branch HEAD and its image build status, keeping
 // the previous commit message when the new fetch didn't include one.
 func setBranchHead(branch, sha, msg, status string) {
+	setBranchHeadDetails(branch, sha, msg, status, "")
+}
+
+func setBranchHeadDetails(branch, sha, msg, status, buildURL string) {
 	latestSHAMu.Lock()
 	defer latestSHAMu.Unlock()
 	prev := headSHAByBranch[branch]
 	if msg == "" && prev.SHA == sha {
 		msg = prev.Message
 	}
+	if buildURL == "" && prev.SHA == sha && status != imageStatusReady {
+		buildURL = prev.BuildURL
+	}
 	// Stamp the build-start time on the first poll that sees this SHA building,
 	// and carry it forward on every subsequent poll while the same SHA is still
-	// building — so the dashboard's elapsed timer counts from when the build
+	// building/stale — so the dashboard's elapsed timer counts from when the build
 	// actually started, not from each poll. Clear it once the image is
 	// ready/failed or a different SHA takes over.
 	var buildStartedAt time.Time
-	if status == imageStatusBuilding {
+	if status == imageStatusBuilding || status == imageStatusStale {
 		if prev.SHA == sha && !prev.BuildStartedAt.IsZero() {
 			buildStartedAt = prev.BuildStartedAt // same build, keep the original start
 		} else {
 			buildStartedAt = time.Now() // newly observed building SHA
 		}
 	}
-	headSHAByBranch[branch] = branchHeadInfo{SHA: sha, Message: msg, ImageStatus: status, BuildStartedAt: buildStartedAt}
+	headSHAByBranch[branch] = branchHeadInfo{SHA: sha, Message: msg, ImageStatus: status, BuildStartedAt: buildStartedAt, BuildURL: buildURL}
 	if msg != "" {
 		commitMsgBySHA[sha] = msg
 	}
@@ -5658,24 +6077,66 @@ func getImageStatuses() map[string]string {
 	for k := range latestSHAByBranch {
 		cp[k] = imageStatusReady
 	}
+	now := time.Now()
 	for k, v := range headSHAByBranch {
 		if v.SHA != "" && v.ImageStatus != "" {
-			cp[k] = v.ImageStatus
+			cp[k] = buildStatusWithStaleness(v.ImageStatus, v.BuildStartedAt, now)
 		}
 	}
 	return cp
 }
 
+// getImageBuildURLs returns branch→docker workflow run URL for non-ready head
+// states when GitHub reported a run.
+func getImageBuildURLs() map[string]string {
+	latestSHAMu.RLock()
+	defer latestSHAMu.RUnlock()
+	cp := make(map[string]string, len(headSHAByBranch))
+	now := time.Now()
+	for k, v := range headSHAByBranch {
+		status := buildStatusWithStaleness(v.ImageStatus, v.BuildStartedAt, now)
+		if v.SHA != "" && v.BuildURL != "" && status != "" && status != imageStatusReady {
+			cp[k] = v.BuildURL
+		}
+	}
+	return cp
+}
+
+// imageBuildStaleAfter is the maximum time the UI may call a non-ready head
+// "building" before surfacing it as stale/unknown.
+func imageBuildStaleAfter() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(imageBuildStaleAfterEnv))
+	if raw == "" {
+		return defaultImageBuildStaleAfter
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return defaultImageBuildStaleAfter
+	}
+	return d
+}
+
+// buildStatusWithStaleness applies the stale cap at read/poll time without
+// rewriting terminal failed/ready states.
+func buildStatusWithStaleness(status string, started time.Time, now time.Time) string {
+	if status == imageStatusBuilding && !started.IsZero() && now.Sub(started) > imageBuildStaleAfter() {
+		return imageStatusStale
+	}
+	return status
+}
+
 // getImageBuildStartTimes returns branch→unix-millis of when each currently
 // "building" head first started building, for the dashboard's elapsed build
 // timer. Only branches that are actively building have an entry; ready/failed/
-// unknown branches are omitted. Millis match the JS side (Date.now()).
+// stale/unknown branches are omitted. Millis match the JS side (Date.now()).
 func getImageBuildStartTimes() map[string]int64 {
 	latestSHAMu.RLock()
 	defer latestSHAMu.RUnlock()
 	cp := make(map[string]int64, len(headSHAByBranch))
+	now := time.Now()
 	for k, v := range headSHAByBranch {
-		if v.SHA != "" && v.ImageStatus == imageStatusBuilding && !v.BuildStartedAt.IsZero() {
+		if v.SHA != "" && v.ImageStatus == imageStatusBuilding && !v.BuildStartedAt.IsZero() &&
+			buildStatusWithStaleness(v.ImageStatus, v.BuildStartedAt, now) == imageStatusBuilding {
 			cp[k] = v.BuildStartedAt.UnixMilli()
 		}
 	}
@@ -5795,6 +6256,14 @@ func (s *HubServer) StartLatestSHAPoller(ctx context.Context) {
 	// rate-limited to perHiveEnvMaxPatchesPerCycle patches per cycle, because
 	// each patch rolls that hive's pod. See perhive_env_reconcile.go.
 	s.reconcilePerHiveEnvIfDue()
+	// Force-delete hive-namespace pods stuck in Terminating past
+	// orphanedPodMinAge with no finalizers and a non-Running phase — the
+	// residue of nodes disappearing without draining (#5328). Throttled
+	// internally to orphanedPodReapInterval and capped per cycle; nothing else
+	// ever removes these, so without this they accumulate indefinitely (32
+	// measured across 16 namespaces, oldest three weeks). See
+	// orphaned_pod_reaper.go.
+	s.reapOrphanedPodsIfDue()
 	// Drop master generations whose verify window has closed, and warn when one
 	// is closing while spokes still carry it. Throttled internally to
 	// generationRetireInterval. This lane PERSISTS the drop and ALERTS; it is
@@ -5826,67 +6295,78 @@ func (s *HubServer) StartLatestSHAPoller(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		oldSHAs := getLatestSHAs()
-		oldInfos := snapshotBranchSHAs()
-		// Re-resolve each tick so branches from newly registered hives are
-		// picked up without a hub restart.
-		fetchAllBranchSHAs(s.logger, s.trackedBranchList())
-		newSHAs := getLatestSHAs()
-		if !maps.Equal(snapshotBranchSHAs(), oldInfos) {
-			persistLatestSHAs(s.logger)
+		s.pollLatestSHAsTick(ctx, time.Now())
+	}
+}
+
+// pollLatestSHAsTick is the body of StartLatestSHAPoller's ticker loop,
+// extracted so it can be invoked directly by tests without waiting on the
+// live ticker: re-fetches every tracked branch SHA, persists on change, drives
+// the throttled reconciliation lanes, and runs the hub auto-upgrade check.
+// now is injected so tests control the clock the same way
+// maybeSnapshotImagePulls already does.
+func (s *HubServer) pollLatestSHAsTick(ctx context.Context, now time.Time) {
+	oldSHAs := getLatestSHAs()
+	oldInfos := snapshotBranchSHAs()
+	// Re-resolve each tick so branches from newly registered hives are
+	// picked up without a hub restart.
+	fetchAllBranchSHAs(s.logger, s.trackedBranchList())
+	newSHAs := getLatestSHAs()
+	if !maps.Equal(snapshotBranchSHAs(), oldInfos) {
+		persistLatestSHAs(s.logger)
+	}
+	// Always check for pending auto-upgrades (retries failed/missed hives).
+	s.triggerAutoUpgrades()
+	s.sweepOrphanedUpgradesIfDue()
+	s.sweepStuckAssignmentsIfDue()
+	s.reconcileNetAdminIfDue()
+	s.reconcilePerHiveEnvIfDue()
+	s.reapOrphanedPodsIfDue()
+	s.retireExpiredGenerationsIfDue()
+	s.sweepExpiredAccessIfDue()
+	s.replenishPoolsIfDue()
+	s.maybeSnapshotImagePulls(ctx, now)
+	changed := false
+	for branch, sha := range newSHAs {
+		if sha != "" && sha != oldSHAs[branch] {
+			changed = true
+			break
 		}
-		// Always check for pending auto-upgrades (retries failed/missed hives).
-		s.triggerAutoUpgrades()
-		s.sweepOrphanedUpgradesIfDue()
-		s.sweepStuckAssignmentsIfDue()
-		s.reconcileNetAdminIfDue()
-		s.reconcilePerHiveEnvIfDue()
-		s.retireExpiredGenerationsIfDue()
-		s.sweepExpiredAccessIfDue()
-		s.replenishPoolsIfDue()
-		s.maybeSnapshotImagePulls(ctx, time.Now())
-		changed := false
-		for branch, sha := range newSHAs {
-			if sha != "" && sha != oldSHAs[branch] {
-				changed = true
-				break
-			}
+	}
+	_ = changed
+	// Hub auto-upgrade — checked EVERY cycle, not only when the SHA just
+	// changed. Previously this lived inside `if changed {}`, so if the hub
+	// missed the one poll where v2's SHA flipped (busy, mid-restart, or the
+	// SHA moved between polls), it stayed "queued" forever and never retried,
+	// while spokes retry every cycle via triggerAutoUpgrades() above. Mirror
+	// that: whenever auto-upgrade is on and the hub is behind latest v2, trigger
+	// a rollout restart. A debounce prevents re-restarting every 2min while a
+	// restart is already rolling out (the new pod reports the new hash, which
+	// clears the condition, but the poll can fire before the rollout lands).
+	// Use the hub's OWN branch, not a hardcoded "v2": hubUpgradeState() and
+	// handleHubSelfUpgrade() both read s.hubGitBranch, so hardcoding here
+	// made the badge and the poller disagree the moment a hub ran on v3.
+	hubBranchSHA := getLatestHubSHAForBranch(s.hubGitBranch)
+	s.hubUpgradeMu.Lock()
+	debounced := time.Since(s.lastHubUpgradeTrigger) > hubUpgradeDebounce
+	s.hubUpgradeMu.Unlock()
+	// Admin kill switch: while hub upgrades are paused the hub stays on its
+	// current build regardless of new tags — the auto-trigger below never
+	// fires. Checked every cycle (like the trigger itself), so flipping the
+	// switch takes effect on the next poll without a restart.
+	if hubPauseSw, hubPaused := s.hubUpgradesPaused(); hubPaused {
+		if isHubAutoUpgrade() && hubBranchSHA != "" && !sameCommit(hubBranchSHA, s.hubGitHash) {
+			s.logger.Debug("hub auto-upgrade suppressed — hub upgrades are paused",
+				"behind", hubBranchSHA, "paused_by", hubPauseSw.By, "paused_at", hubPauseSw.At)
 		}
-		_ = changed
-		// Hub auto-upgrade — checked EVERY cycle, not only when the SHA just
-		// changed. Previously this lived inside `if changed {}`, so if the hub
-		// missed the one poll where v2's SHA flipped (busy, mid-restart, or the
-		// SHA moved between polls), it stayed "queued" forever and never retried,
-		// while spokes retry every cycle via triggerAutoUpgrades() above. Mirror
-		// that: whenever auto-upgrade is on and the hub is behind latest v2, trigger
-		// a rollout restart. A debounce prevents re-restarting every 2min while a
-		// restart is already rolling out (the new pod reports the new hash, which
-		// clears the condition, but the poll can fire before the rollout lands).
-		// Use the hub's OWN branch, not a hardcoded "v2": hubUpgradeState() and
-		// handleHubSelfUpgrade() both read s.hubGitBranch, so hardcoding here
-		// made the badge and the poller disagree the moment a hub ran on v3.
-		hubBranchSHA := getLatestHubSHAForBranch(s.hubGitBranch)
-		s.hubUpgradeMu.Lock()
-		debounced := time.Since(s.lastHubUpgradeTrigger) > hubUpgradeDebounce
-		s.hubUpgradeMu.Unlock()
-		// Admin kill switch: while hub upgrades are paused the hub stays on its
-		// current build regardless of new tags — the auto-trigger below never
-		// fires. Checked every cycle (like the trigger itself), so flipping the
-		// switch takes effect on the next poll without a restart.
-		if hubPauseSw, hubPaused := s.hubUpgradesPaused(); hubPaused {
-			if isHubAutoUpgrade() && hubBranchSHA != "" && !sameCommit(hubBranchSHA, s.hubGitHash) {
-				s.logger.Debug("hub auto-upgrade suppressed — hub upgrades are paused",
-					"behind", hubBranchSHA, "paused_by", hubPauseSw.By, "paused_at", hubPauseSw.At)
-			}
-		} else if isHubAutoUpgrade() && hubBranchSHA != "" && !sameCommit(hubBranchSHA, s.hubGitHash) && debounced {
-			s.logger.Info("audit: hub auto-upgrade triggered", "from", s.hubGitHash, "to", hubBranchSHA)
-			// rolloutHubToSHA verifies the hub image exists (skips a doomed roll
-			// when the hive-hub build for this SHA failed) and pins the SHA so a
-			// stale cached v2-latest can't come back up. It records the in-flight
-			// state on success so the dashboard shows "Upgrading", not "queued".
-			if err := s.rolloutHubToSHA(hubBranchSHA); err != nil {
-				s.logger.Warn("hub auto-upgrade skipped", "to", hubBranchSHA, "reason", err)
-			}
+	} else if isHubAutoUpgrade() && hubBranchSHA != "" && !sameCommit(hubBranchSHA, s.hubGitHash) && debounced {
+		s.logger.Info("audit: hub auto-upgrade triggered", "from", s.hubGitHash, "to", hubBranchSHA)
+		// rolloutHubToSHA verifies the hub image exists (skips a doomed roll
+		// when the hive-hub build for this SHA failed) and pins the SHA so a
+		// stale cached v2-latest can't come back up. It records the in-flight
+		// state on success so the dashboard shows "Upgrading", not "queued".
+		if err := s.rolloutHubToSHA(hubBranchSHA); err != nil {
+			s.logger.Warn("hub auto-upgrade skipped", "to", hubBranchSHA, "reason", err)
 		}
 	}
 }
@@ -6031,7 +6511,13 @@ func (s *HubServer) triggerAutoUpgrades() {
 			// up to date; clear the latch here instead of advancing the target.
 			// Commit-pinned hives are unaffected — their tag resolves to exactly
 			// one build, so the specific-target check still governs them.
-			registryLatestSHA := getLatestSHAForBranch(branch)
+			//
+			// "Latest for its branch" is resolved THROUGH the tracked tag
+			// (#5994). A :stable spoke's ceiling is the digest :stable carries,
+			// not branch HEAD, so judging it against HEAD kept it latched for
+			// the whole soak window — the 41 spokes measured stuck this way —
+			// while it had already converged on everything its tag offers.
+			registryLatestSHA := s.reachableUpgradeTarget(branch, imageRef, h.TrackedChannel).SHA
 			if imageTagIsMutable(imageRef) && registryLatestSHA != "" &&
 				sameCommit(currentSHA, registryLatestSHA) {
 				s.mu.Lock()
@@ -6259,9 +6745,80 @@ func (s *HubServer) triggerAutoUpgrades() {
 		if currentSHA == "" {
 			continue
 		}
-		latestSHA := getLatestSHAForBranch(branch)
+		// Target what this spoke's TAG can actually deliver (#5994). Branch HEAD
+		// is the right answer only for a spoke tracking that branch's moving
+		// tag; a spoke on :stable can reach exactly the digest :stable carries,
+		// and instructing anything else is an instruction it will spend its
+		// entire retry budget failing to satisfy.
+		reach := s.reachableUpgradeTarget(branch, imageRef, h.TrackedChannel)
+		if !reach.Resolved {
+			// Channel-tracking spoke whose channel would not resolve. Refuse
+			// LOUDLY and instruct nothing. Falling back to branch HEAD here is
+			// exactly the bug, and it would be the worst-evidenced fallback
+			// available: we know the spoke's ceiling is not HEAD, and we do not
+			// know what it is. The next cycle retries.
+			s.logger.Warn("auto-upgrade held — the spoke's release channel did not resolve to a commit",
+				"hive_id", h.ID, "channel", reach.Channel, "branch", branch,
+				"current", currentSHA, "image_ref", imageRef)
+			continue
+		}
+		latestSHA := reach.SHA
 		if latestSHA == "" || sameCommit(currentSHA, latestSHA) {
 			continue
+		}
+		// A channel is a moving POINTER, not a monotonic branch, so a spoke can
+		// legitimately sit AHEAD of the one it tracks — it was rolled while the
+		// channel was further along, or it tracked :candidate until a moment
+		// ago. Targeting the channel SHA there would instruct a DOWNGRADE: a
+		// failure mode this path never had while it only ever chased HEAD.
+		if reach.Channel != "" && commitAtOrAheadOfTarget(currentSHA, latestSHA, s.logger) {
+			s.logger.Debug("auto-upgrade skipped — hive is at or ahead of its release channel",
+				"hive_id", h.ID, "channel", reach.Channel,
+				"current", currentSHA, "channel_sha", latestSHA)
+			continue
+		}
+		// Merge-driven debounce (#5391). Reached ONLY on the automatic
+		// chase-latest path: everything that starts an upgrade for an operator
+		// — a manual "Upgrade now" (upgradeHiveHandler), a bulk upgrade
+		// (saas_bulk.go), and a hard image pin (delivered as UpgradeTarget
+		// through the stale-recovery branch ABOVE the `if !h.AutoUpgrade` gate)
+		// — arms s.heartbeatUpgrade directly and never enters this loop body.
+		// So an operator's upgrade and a pin stay IMMEDIATE by construction,
+		// and only the merge-frequency-driven roll is held.
+		//
+		// Placed after every eligibility gate above so a hive that would not
+		// upgrade anyway never arms a window, and before the wave gate and the
+		// fire-date persistence below so a debounced hive costs no wave slot and
+		// keeps its daily/weekly window open.
+		debounce := shouldDebounceAutoUpgrade(
+			autoUpgradeDebounceState{
+				Target:       h.AutoUpgradePendingTarget,
+				ArmedAt:      h.AutoUpgradePendingSince,
+				FirstArmedAt: h.AutoUpgradePendingFirst,
+				Collapsed:    h.AutoUpgradeCollapsed,
+			},
+			latestSHA, autoUpgradeDebounceInterval(), autoUpgradeMaxHold(), time.Now())
+		if !debounce.Allowed {
+			// Persist the (possibly just-replaced) pending target so a hub
+			// restart inside the window resumes it rather than dropping it.
+			s.persistUpgradeDebounceState(&h, debounce.State)
+			s.logger.Info("auto-upgrade debounced — holding for a quiet branch",
+				"hive_id", h.ID, "branch", branch,
+				"target", debounce.State.Target, "current", currentSHA,
+				"collapsed", debounce.State.Collapsed,
+				"debounce", autoUpgradeDebounceInterval(),
+				"reason", debounce.Reason)
+			continue
+		}
+		if debounce.Collapsed > 0 {
+			// Report the collapse. Silent batching would trade one invisible
+			// problem for another: without this line, N merges producing one
+			// roll is indistinguishable from N-1 upgrades having been lost.
+			s.logger.Info("auto-upgrade debounce collapsed a merge burst into one roll",
+				"hive_id", h.ID, "branch", branch,
+				"merges_collapsed", debounce.Collapsed+1,
+				"final_target", latestSHA, "current", currentSHA,
+				"debounce", autoUpgradeDebounceInterval())
 		}
 		hiveCluster := s.clusterForHive(&h)
 		if hiveCluster == nil {
@@ -6326,6 +6883,13 @@ func (s *HubServer) triggerAutoUpgrades() {
 					"hive_id", h.ID, "date", decision.FireDate, "error", err)
 			}
 		}
+		// Clear the debounce record now the roll is actually going out. Cleared
+		// HERE, after every gate that could still `continue`, so a hive turned
+		// away by the wave gate keeps its pending target and simply boards a
+		// later wave instead of re-arming a fresh window each cycle. Clearing
+		// before the rollout (like the fire date above) means a hub crash in
+		// between costs at most a re-armed window, never a duplicate roll.
+		s.persistUpgradeDebounceState(&h, autoUpgradeDebounceState{})
 		// The hive is deliverable again — drop any suppressed-refusal memory so a
 		// future undeliverable episode is reported afresh rather than swallowed.
 		s.forgetUncollectibleUpgrade(h.ID)
@@ -6368,7 +6932,7 @@ func fetchBranchSHA(logger *slog.Logger, branch string) {
 	// Step 1: get the latest commit SHA on the branch from the GitHub API
 	const shaFetchTimeout = 10 * time.Second
 	client := &http.Client{Timeout: shaFetchTimeout}
-	branchURL := fmt.Sprintf("%s/repos/kubestellar/hive/branches/%s", githubAPIBase, branch)
+	branchURL := fmt.Sprintf("%s/repos/hivecommons/hive/branches/%s", githubAPIBase, branch)
 	req, _ := http.NewRequest("GET", branchURL, nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := client.Do(req)
@@ -6447,7 +7011,8 @@ func fetchBranchSHA(logger *slog.Logger, branch string) {
 
 	// Image not on GHCR yet — ask the docker workflow whether the build for
 	// this head commit is still running or has failed.
-	status := fetchImageBuildStatus(client, branchResult.Commit.SHA, logger)
+	buildState := fetchImageBuildState(client, branchResult.Commit.SHA, logger)
+	status := buildState.Status
 	if status == "" {
 		// Actions API unavailable (rate-limited/network): keep the last-known
 		// status for this head; a brand-new head with no image is presumed
@@ -6460,12 +7025,19 @@ func fetchBranchSHA(logger *slog.Logger, branch string) {
 	if commitMsg == "" && headChanged {
 		commitMsg = fetchCommitMessage(client, branchResult.Commit.SHA, logger)
 	}
-	setBranchHead(branch, candidateSHA, commitMsg, status)
-	logger.Info("SHA poll: container image not yet on GHCR", "branch", branch, "sha", candidateSHA, "image_status", status)
+	if status == imageStatusBuilding {
+		started := prevHead.BuildStartedAt
+		if headChanged || started.IsZero() {
+			started = time.Now()
+		}
+		status = buildStatusWithStaleness(status, started, time.Now())
+	}
+	setBranchHeadDetails(branch, candidateSHA, commitMsg, status, buildState.RunURL)
+	logger.Info("SHA poll: container image not yet on GHCR", "branch", branch, "sha", candidateSHA, "image_status", status, "build_url", buildState.RunURL)
 }
 
 // dockerWorkflowFile is the workflow that builds and pushes the container
-// images (ghcr.io/kubestellar/hive:<branch>-latest and :<short-sha>) on
+// images (ghcr.io/hivecommons/hive:<branch>-latest and :<short-sha>) on
 // every push to a tracked branch.
 const dockerWorkflowFile = "docker.yml"
 
@@ -6473,51 +7045,70 @@ const dockerWorkflowFile = "docker.yml"
 // commit and maps it to an image build status. Returns "" when the API is
 // unavailable so the caller can keep the last-known status instead of
 // flapping ready/building on transient errors.
+type imageBuildState struct {
+	Status string
+	RunURL string
+}
+
 func fetchImageBuildStatus(client *http.Client, fullSHA string, logger *slog.Logger) string {
-	runsURL := fmt.Sprintf("%s/repos/kubestellar/hive/actions/workflows/%s/runs?head_sha=%s&per_page=1", githubAPIBase, dockerWorkflowFile, fullSHA)
+	return fetchImageBuildState(client, fullSHA, logger).Status
+}
+
+func fetchImageBuildState(client *http.Client, fullSHA string, logger *slog.Logger) imageBuildState {
+	runsURL := fmt.Sprintf("%s/repos/hivecommons/hive/actions/workflows/%s/runs?head_sha=%s&per_page=1", githubAPIBase, dockerWorkflowFile, fullSHA)
 	req, _ := http.NewRequest("GET", runsURL, nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.Warn("SHA poll: workflow runs request failed", "sha", fullSHA, "error", err)
-		return ""
+		return imageBuildState{}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		logger.Warn("SHA poll: workflow runs non-200", "sha", fullSHA, "status", resp.StatusCode)
-		return ""
+		return imageBuildState{}
 	}
 	var result struct {
 		WorkflowRuns []struct {
 			Status     string `json:"status"`
 			Conclusion string `json:"conclusion"`
+			HTMLURL    string `json:"html_url"`
 		} `json:"workflow_runs"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		logger.Warn("SHA poll: workflow runs decode failed", "sha", fullSHA, "error", err)
-		return ""
+		return imageBuildState{}
 	}
 	if len(result.WorkflowRuns) == 0 {
-		// The push event may not have spawned the workflow run yet.
-		return imageStatusBuilding
+		// The push event may not have spawned the workflow run yet. If it never does,
+		// the caller's stale timer flips the UI out of the spinner state.
+		return imageBuildState{Status: imageStatusBuilding}
 	}
 	run := result.WorkflowRuns[0]
+	state := imageBuildState{RunURL: run.HTMLURL}
 	if run.Status != "completed" {
-		return imageStatusBuilding // queued, in_progress, waiting, pending
+		state.Status = imageStatusBuilding // queued, in_progress, waiting, pending
+		return state
 	}
-	if run.Conclusion == "success" {
+	switch run.Conclusion {
+	case "success":
 		// Workflow finished but the manifest isn't visible on GHCR yet —
-		// treat as still publishing; the GHCR check flips it to ready.
-		return imageStatusBuilding
+		// treat as still publishing; the GHCR check flips it to ready, while the
+		// stale timer prevents an endless spinner if publication never appears.
+		state.Status = imageStatusBuilding
+	case "failure", "cancelled", "skipped", "timed_out", "action_required", "startup_failure", "neutral":
+		state.Status = imageStatusFailed
+	default:
+		state.Status = imageStatusFailed
 	}
-	return imageStatusFailed // failure, cancelled, timed_out, startup_failure
+	return state
 }
 
 // fetchCommitMessage fetches the first line of a commit message from the GitHub API.
 // Uses a separate endpoint that's less likely to be rate-limited since it's called
 // only once per new SHA (not every poll cycle).
 func fetchCommitMessage(client *http.Client, fullSHA string, logger *slog.Logger) string {
-	commitURL := fmt.Sprintf("%s/repos/kubestellar/hive/commits/%s", githubAPIBase, fullSHA)
+	commitURL := fmt.Sprintf("%s/repos/hivecommons/hive/commits/%s", githubAPIBase, fullSHA)
 	req, _ := http.NewRequest("GET", commitURL, nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := client.Do(req)
@@ -7245,6 +7836,28 @@ func loadAccessRequests(hiveID string) []AccessRequest {
 	return reqs
 }
 
+func (s *HubServer) decoratePendingAccessRequests(reqs []PendingAccessRequest) []PendingAccessRequest {
+	for i := range reqs {
+		username := strings.TrimSpace(reqs[i].Username)
+		if username == "" {
+			continue
+		}
+		label, avatar := s.displayIdentity(username)
+		reqs[i].DisplayLabel = label
+		reqs[i].AvatarURL = avatar
+		if u := loadSaaSUser(username); u != nil {
+			reqs[i].Provider = grantableUserProvider(u)
+			continue
+		}
+		if provider, _ := splitIdentityKey(username); provider != "" {
+			reqs[i].Provider = normalizeIdentityProvider(provider)
+		} else {
+			reqs[i].Provider = legacyProvider
+		}
+	}
+	return reqs
+}
+
 func saveAccessRequests(hiveID string, reqs []AccessRequest) {
 	if strings.Contains(hiveID, "..") || strings.Contains(hiveID, "/") || strings.Contains(hiveID, "\\") {
 		slog.Warn("saveAccessRequests: invalid hiveID", "hiveID", hiveID)
@@ -7356,12 +7969,17 @@ func (s *HubServer) handleGetRequests(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reqs := loadAccessRequests(hiveID)
-	pending := make([]AccessRequest, 0)
+	pending := make([]PendingAccessRequest, 0)
 	for _, req := range reqs {
 		if req.Status == "pending" {
-			pending = append(pending, req)
+			pending = append(pending, PendingAccessRequest{
+				Username:    req.Username,
+				RequestedAt: req.RequestedAt,
+				Note:        req.Note,
+			})
 		}
 	}
+	pending = s.decoratePendingAccessRequests(pending)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"requests": pending})
@@ -7621,9 +8239,11 @@ type ProvisionRequest struct {
 	// for an approval — which hive the requester actually got. That made the
 	// history unauditable: an approved request and a denied one looked equally
 	// anonymous. Empty on records decided before these fields existed.
-	DecidedBy    string `json:"decided_by,omitempty"`
-	DecidedAt    string `json:"decided_at,omitempty"`
-	AssignedHive string `json:"assigned_hive,omitempty"`
+	DecidedBy string `json:"decided_by,omitempty"`
+	// DecidedByName is the display-only label for DecidedBy, resolved on read.
+	DecidedByName string `json:"decided_by_name,omitempty"`
+	DecidedAt     string `json:"decided_at,omitempty"`
+	AssignedHive  string `json:"assigned_hive,omitempty"`
 	// DenyReason is the optional free-text explanation shown back to the
 	// requester when a request is turned down.
 	DenyReason string `json:"deny_reason,omitempty"`
@@ -7778,6 +8398,7 @@ func enrichProvisionRequests(requests []ProvisionRequest) []ProvisionRequest {
 		return requests
 	}
 	users := listAllSaaSUsers()
+	label := (&HubServer{}).identityLabeler()
 	for i := range requests {
 		if requests[i].UserID == "" {
 			requests[i].UserID, requests[i].UserIDSource = provisionRequestUserIdentity(requests[i].Username, provisionRequestUserFromRoster(requests[i].Username, users), requests[i].FullName)
@@ -7785,6 +8406,9 @@ func enrichProvisionRequests(requests []ProvisionRequest) []ProvisionRequest {
 			if requests[i].UserID == requests[i].Username {
 				requests[i].UserIDSource = "native"
 			}
+		}
+		if l := label(requests[i].DecidedBy); l != requests[i].DecidedBy {
+			requests[i].DecidedByName = l
 		}
 		requests[i].AssignedRole = roleForUserOnHive(requests[i].Username, requests[i].AssignedHive, users)
 		requests[i].OtherHives = hivesForUser(requests[i].Username, requests[i].AssignedHive, users)
@@ -8243,7 +8867,7 @@ func (s *HubServer) handleApproveProvision(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		// An explicit "public" choice means public github.com. Record it as a
-		// blank host so gheAPIURLForHost pushes nothing and the spoke keeps its
+		// blank host so forgeAPIURLForHost pushes nothing and the spoke keeps its
 		// own api.github.com default — and so the cluster backfill below, which
 		// only ever fills a blank, does not silently re-GHE it.
 		if strings.EqualFold(host, githubHostPublic) {
@@ -8793,7 +9417,7 @@ func projectConfigForHiveID(hiveID, curOrg string, curRepos []string, curPrimary
 	// Deliberately conservative: an empty curAPIURL means the spoke is too old
 	// to report its API URL, which is UNKNOWN, not a mismatch — pushing on it
 	// would re-send on every beat with no read-back to ever stop it.
-	wantAPIURL := gheAPIURLForHost(h.GitHubHost)
+	wantAPIURL := forgeAPIURLForHost(h.Forge, h.GitHubHost)
 	// The api_url is the field where unknown-vs-mismatch actually bites: a spoke
 	// too old to report it sends "", which is NOT "I am on api.github.com". The
 	// observedKnown argument carries that distinction explicitly instead of
@@ -8864,7 +9488,7 @@ func projectConfigForHiveID(hiveID, curOrg string, curRepos []string, curPrimary
 			if forgeAPIURL != "" {
 				return forgeAPIURL
 			}
-			return gheAPIURLForHost(h.GitHubHost)
+			return forgeAPIURLForHost(h.Forge, h.GitHubHost)
 		}(),
 		// AIAuthor is deliberately left empty here. Provisioning state never
 		// knows the agents' GitHub account — the spoke owns it — and the spoke
@@ -9054,7 +9678,7 @@ func (s *HubServer) handleAssignHive(w http.ResponseWriter, r *http.Request) {
 	// right GitHub API. Never blank an existing value with an empty one.
 	//
 	// "public" is an explicit choice of public github.com on a cluster whose
-	// defaults point at GHE. Record it as a blank host (so gheAPIURLForHost
+	// defaults point at GHE. Record it as a blank host (so forgeAPIURLForHost
 	// pushes nothing and the spoke keeps api.github.com) PLUS the
 	// GitHubBaseURL sentinel, which is what makes effectiveGitHubBaseURL
 	// resolve to "" and therefore makes the cluster backfill below decline to
@@ -9073,7 +9697,7 @@ func (s *HubServer) handleAssignHive(w http.ResponseWriter, r *http.Request) {
 	// the placeholder carries one. Placeholders provisioned BEFORE their
 	// cluster gained github_base_url/github_api_url have GitHubHost == "", and
 	// nothing else ever fills it in: projectConfigForHiveID pushes
-	// gheAPIURLForHost(h.GitHubHost), which is empty for those hives, so the
+	// forgeAPIURLForHost(h.Forge, h.GitHubHost), which is empty for those hives, so the
 	// spoke keeps api.github.com and the public app_id even though the cluster
 	// is a GHE cluster (observed on the heartbeat-only cluster: hosted-available-vllmd-01 has
 	// base_url: "" / api_url: "" against a github.ibm.com cluster). The hive's
@@ -9746,7 +10370,7 @@ Ask %s to grant you access from their
 </p>
 <a href="/dashboard" class="btn btn-primary">Go to My Hives</a>
 <a href="/" class="btn btn-secondary">Browse Public Hives</a>
-<p class="help">If you believe this is an error, <a href="https://github.com/kubestellar/hive/issues" style="color:#58a6ff">file an issue</a>.</p>
+<p class="help">If you believe this is an error, <a href="https://github.com/hivecommons/hive/issues" style="color:#58a6ff">file an issue</a>.</p>
 </div>
 </body></html>`, hiveID, hiveID, ownerLink)
 }
@@ -10230,7 +10854,7 @@ const dashboardHTML = `<!DOCTYPE html>
     <a href="/" class="brand">
       <span class="brand-mark">🐝</span>
       <span>Hive</span>
-      <span onclick="window.open(&#39;https://github.com/kubestellar/hive&#39;,&#39;_blank&#39;)" title="Source Code" style="opacity:0.6;margin-left:2px;cursor:pointer;display:inline-flex"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></span>
+      <span onclick="window.open(&#39;https://github.com/hivecommons/hive&#39;,&#39;_blank&#39;)" title="Source Code" style="opacity:0.6;margin-left:2px;cursor:pointer;display:inline-flex"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></span>
     </a>
     <nav>
       <a href="/">Hives</a>
@@ -10258,7 +10882,7 @@ const dashboardHTML = `<!DOCTYPE html>
         <p style="margin-top:8px;padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:rgba(244,199,95,0.08);font-size:0.85rem">👋 New to Hive? Read the <a href="https://docs.kubestellar.io/docs/hive/getting-started" target="_blank" rel="noopener" style="color:var(--amber);font-weight:700">Getting Started Guide</a> before diving in.</p>
         <p id="latest-image-sha" style="font-size:0.7rem;color:var(--muted);margin-top:4px"></p>
         <!-- Image-pulls bar chart: per-release container-image PULLS of the
-             public spoke image (ghcr.io/kubestellar/hive), bucketed by the
+             public spoke image (ghcr.io/hivecommons/hive), bucketed by the
              ACTIVE release line's release boundaries (the line the "stable"
              channel currently resolves to — v4 today, v5 after the next
              rollover, with no code change). Gauges external adoption beyond
@@ -10268,7 +10892,7 @@ const dashboardHTML = `<!DOCTYPE html>
              which also fills the per-line mini charts in the
              "Latest available images" rows. Hidden until there is data. -->
         <div id="image-pulls-spark" style="display:none;margin-top:8px"
-             title="Container-image pulls per release of the active release line: the pulls that landed while each of the last ~10 releases was the newest, of the public hive image (ghcr.io/kubestellar/hive). Derived from GitHub's cumulative download counter — pulls, not unique downloads."></div>
+             title="Container-image pulls per release of the active release line: the pulls that landed while each of the last ~10 releases was the newest, of the public hive image (ghcr.io/hivecommons/hive). Derived from GitHub's cumulative download counter — pulls, not unique downloads."></div>
       </div>
       <div style="display:flex;gap:8px;align-items:center">
         <button class="btn-primary" id="btn-send-banner-top" style="display:none;background:#d97706" onclick="_bannerTargetHive=null;document.getElementById('banner-modal').style.display='flex';loadBannerHiveList()">Send Banner</button>
@@ -10442,7 +11066,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
   <footer class="footer">
     <div class="footer-links">
-      <a href="https://github.com/kubestellar/hive">Source Code</a>
+      <a href="https://github.com/hivecommons/hive">Source Code</a>
       <a href="https://arxiv.org/abs/2604.09388">ACMM Paper</a>
       <a href="https://kubestellar.io">KubeStellar</a>
     </div>
@@ -11206,6 +11830,8 @@ const dashboardHTML = `<!DOCTYPE html>
        install or reconfigure. */
     var GH_APP_STATE_KEY_MISSING = 'key-missing';
     var GH_APP_STATE_KEY_INVALID = 'key-invalid';
+    var GH_APP_STATE_REPO_NOT_COVERED = 'repo-not-covered';
+    var GH_APP_STATE_REPO_MOVED = 'repo-moved';
     var GH_APP_OPERATOR_STATES = {};
     GH_APP_OPERATOR_STATES[GH_APP_STATE_KEY_MISSING] = true;
     GH_APP_OPERATOR_STATES[GH_APP_STATE_KEY_INVALID] = true;
@@ -11223,6 +11849,8 @@ const dashboardHTML = `<!DOCTYPE html>
       var s = String(state || '').trim();
       if (s === 'wrong-installation') return 'wrong installation (installation_id points at another account)';
       if (s === 'write-forbidden') return 'write forbidden (repo not in the App installation)';
+      if (s === GH_APP_STATE_REPO_NOT_COVERED) return 'repo not covered (repo not ticked in the App installation)';
+      if (s === GH_APP_STATE_REPO_MOVED) return 'repo moved (hive config still points at the old account)';
       if (s === 'no-app-assigned') return 'no App assigned yet';
       return 'permissions insufficient';
     }
@@ -11514,6 +12142,7 @@ const dashboardHTML = `<!DOCTYPE html>
        apart on a typo'd string literal. */
     var HIVE_FILTER_APP_MISSING = 'app-missing';
     var HIVE_FILTER_NO_TOKENS = 'no-tokens';
+    var HIVE_FILTER_RESTART_STORMS = 'restart-storms';
     var HIVE_FILTER_DEGRADED = 'degraded';
     var HIVE_FILTER_OK = 'ok';
 
@@ -11533,6 +12162,7 @@ const dashboardHTML = `<!DOCTYPE html>
       h = h || {};
       var hp = h.health || {};
       var st = hp.status || 'unknown';
+      var tokenReason = tokenHealthReason(h);
       /* githubAppRequired means the spoke wants the App but it is not usable:
          with a perm issue it is installed-but-insufficient, without one it is
          not installed at all. healthBadge() forces "degraded" in both cases —
@@ -11540,16 +12170,36 @@ const dashboardHTML = `<!DOCTYPE html>
          pool's designed state (mirrored here so dot and chip never disagree). */
       var appMissing = !isPlaceholderHive(h) && !!h.githubAppRequired && !h.githubAppPermIssue;
       var repoTargetBad = !isPlaceholderHive(h) && !!h.repoTargetMisconfigured;
-      var degraded = repoTargetBad || (!isPlaceholderHive(h) && !!h.githubAppRequired) || st === 'degraded' || st === 'critical';
+      var restartStorms = !!((h.fleetRollup || {}).restartStorms);
+      var degraded = restartStorms || repoTargetBad || (!isPlaceholderHive(h) && !!h.githubAppRequired) || st === 'degraded' || st === 'critical';
       /* An offline hive has no live reading at all, so it is not "OK" even if
          its last stored health snapshot said ok. */
       var ok = !degraded && st === 'ok' && !!h.online;
       return {
         appMissing: appMissing,
         noTokens: (Number(h.totalTokens24h) || 0) <= NO_TOKENS_THRESHOLD,
+        restartStorms: restartStorms,
+        noTokensReason: tokenReason,
         degraded: degraded,
         ok: ok
       };
+    }
+
+    function tokenHealthReason(h) {
+      var checks = (((h || {}).health || {}).checks || []);
+      for (var i = 0; i < checks.length; i++) {
+        var ck = checks[i] || {};
+        if (ck.name === 'tokens' && ck.detail) return String(ck.detail);
+      }
+      return '';
+    }
+
+    function tokenUsageTitle(h) {
+      var reason = tokenHealthReason(h);
+      if ((Number((h || {}).totalTokens24h) || 0) <= NO_TOKENS_THRESHOLD && reason) {
+        return 'No tokens used: ' + reason;
+      }
+      return 'Cumulative tokens consumed, as of the last heartbeat';
     }
 
     // uptimeCell renders process uptime for the Uptime column.
@@ -11835,6 +12485,31 @@ const dashboardHTML = `<!DOCTYPE html>
         'color:#f85149;background:rgba(248,81,73,0.12);border:1px solid rgba(248,81,73,0.35)">' +
         'inference auth</span>';
     }
+
+    function restartStormSummary(h) {
+      var agents = (h && h.agentVerdicts) || [];
+      var bad = agents.filter(function(a) { return a && a.restartProblem; });
+      if (!bad.length) return '';
+      var first = bad[0];
+      var title = bad.map(function(a) { return a.restartProblem; }).join('\n');
+      var count = ((first.restarts || {}).last_24h) || 0;
+      var label = 'agent restarts: ' + first.name + ' ×' + count + '/24h';
+      if (bad.length > 1) label = bad.length + ' restart storms';
+      var reset = roleAtLeast(h.role, 'owner')
+        ? ' <button type="button" class="reset-agent-restarts" data-hive-id="' + escAttr(h.id) + '" data-agent-name="' + escAttr(first.name) + '" style="margin-left:4px;padding:0 5px;border-radius:9999px;border:1px solid rgba(248,81,73,0.45);background:transparent;color:#f85149;font-size:0.6rem;cursor:pointer">reset</button>'
+        : '';
+      return '<span title="' + esc(title) + '" style="display:inline-block;margin-left:6px;padding:0 6px;' +
+        'border-radius:9999px;font-size:0.62rem;font-weight:600;line-height:1.5;cursor:help;white-space:nowrap;' +
+        'color:#f85149;background:rgba(248,81,73,0.12);border:1px solid rgba(248,81,73,0.35)">' +
+        esc(label) + reset + '</span>';
+    }
+    document.addEventListener('click', function(e) {
+      var btn = e.target && e.target.closest && e.target.closest('.reset-agent-restarts');
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      resetAgentRestarts(btn.getAttribute('data-hive-id') || '', btn.getAttribute('data-agent-name') || '');
+    });
 
     /* ---- ClankeR, the contributor relay (hover panel) ------------------
        The relay is a first-class SUBSTITUTE for assigning a method/model:
@@ -12178,8 +12853,10 @@ const dashboardHTML = `<!DOCTYPE html>
       'upgrading':       'Upgrading',
       'acmm-unset':      'ACMM level unset',
       'no-agents':       'No agents running',
+      'agent-restart-storm': 'Agent restart storms',
       'duplicate-spoke': 'Duplicate spoke instances',
-      'status-flipping': 'Status flipping'
+      'status-flipping': 'Status flipping',
+      'version-absent':  'Heartbeat without a version'
     };
 
     function driftKindLabel(kind) { return DRIFT_KIND_LABELS[kind] || kind || 'Unknown'; }
@@ -12453,6 +13130,7 @@ const dashboardHTML = `<!DOCTYPE html>
     /* branch -> unix-millis when the currently-building image started building,
        from the hub (getImageBuildStartTimes). Drives the elapsed build timer. */
     var _latestBuildStarted = {};
+    var _latestBuildURLs = {};
 
     /* Format elapsed build time from an epoch-ms start as "Mm Ss" (or "Ss" under
        a minute). Clamps negatives (clock skew) to 0. */
@@ -12568,8 +13246,9 @@ const dashboardHTML = `<!DOCTYPE html>
        until the poll landed.
        v5: rows carry the fleet-divergence view (fleetRollup + agentVerdicts:
        expected/actual/able per agent); a v4 cache would omit the new per-agent
-       drill-down until the first poll landed. */
-    var HIVES_CACHE_VERSION = 5;
+       drill-down until the first poll landed.
+       v6: agent verdicts carry restart-storm telemetry and reset markers. */
+    var HIVES_CACHE_VERSION = 6;
     /* 10 minutes: long enough to cover a reload or a tab restore, short enough
        that a cached fleet is never wildly out of date before the poll lands. */
     var HIVES_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -12577,6 +13256,7 @@ const dashboardHTML = `<!DOCTYPE html>
        paint are stored, but a huge fleet could still overflow the ~5 MB quota
        and make every write fail. */
     var HIVES_CACHE_MAX_ROWS = 200;
+    var _expandedPendingRows = new Set();
 
     function readHivesCache() {
       try {
@@ -12648,6 +13328,7 @@ const dashboardHTML = `<!DOCTYPE html>
     var HIVE_FILTER_CHIPS = [
       {key: HIVE_FILTER_APP_MISSING, label: 'GitHub App not installed', color: '#f85149'},
       {key: HIVE_FILTER_NO_TOKENS, label: 'No tokens used', color: '#6b7280'},
+      {key: HIVE_FILTER_RESTART_STORMS, label: 'Restart storms', color: '#f85149'},
       {key: HIVE_FILTER_DEGRADED, label: 'Degraded', color: '#f85149'},
       {key: HIVE_FILTER_OK, label: 'OK', color: '#3fb950'}
     ];
@@ -13330,6 +14011,7 @@ const dashboardHTML = `<!DOCTYPE html>
       var byKey = {};
       byKey[HIVE_FILTER_APP_MISSING] = f.appMissing;
       byKey[HIVE_FILTER_NO_TOKENS] = f.noTokens;
+      byKey[HIVE_FILTER_RESTART_STORMS] = f.restartStorms;
       byKey[HIVE_FILTER_DEGRADED] = f.degraded;
       byKey[HIVE_FILTER_OK] = f.ok;
       for (var i = 0; i < active.length; i++) {
@@ -13619,7 +14301,6 @@ const dashboardHTML = `<!DOCTYPE html>
         ['online', 'Online', '', true],
         ['offline', 'Offline', 'warn', true],
         ['pool_available', 'Pool', '', false],
-        ['assigned_unclaimed', 'Unclaimed', 'warn', false],
         ['provisioning', 'Provisioning', '', false],
         ['upgrading', 'Upgrading', '', false],
         ['upgrade_failed', 'Upgrade failed', 'bad', false],
@@ -14168,12 +14849,14 @@ const dashboardHTML = `<!DOCTYPE html>
       var counts = {};
       counts[HIVE_FILTER_APP_MISSING] = 0;
       counts[HIVE_FILTER_NO_TOKENS] = 0;
+      counts[HIVE_FILTER_RESTART_STORMS] = 0;
       counts[HIVE_FILTER_DEGRADED] = 0;
       counts[HIVE_FILTER_OK] = 0;
       (assignedNoPlaceholders || []).forEach(function(h) {
         var f = hiveStatusFlags(h);
         if (f.appMissing) counts[HIVE_FILTER_APP_MISSING]++;
         if (f.noTokens) counts[HIVE_FILTER_NO_TOKENS]++;
+        if (f.restartStorms) counts[HIVE_FILTER_RESTART_STORMS]++;
         if (f.degraded) counts[HIVE_FILTER_DEGRADED]++;
         if (f.ok) counts[HIVE_FILTER_OK]++;
       });
@@ -15261,6 +15944,7 @@ const dashboardHTML = `<!DOCTYPE html>
         if (data.latest_sha_messages) _latestSHAMessages = data.latest_sha_messages;
         if (data.latest_sha_image_status) _latestImageStatus = data.latest_sha_image_status;
         _latestBuildStarted = data.latest_sha_build_started || {};
+        _latestBuildURLs = data.latest_sha_build_url || {};
         if (data.commit_messages) _commitMessages = data.commit_messages;
         if (data.hub_auto_upgrade !== undefined) _hubAutoUpgrade = data.hub_auto_upgrade;
         if (data.upgrade_pause) _upgradePause = data.upgrade_pause;
@@ -15285,7 +15969,15 @@ const dashboardHTML = `<!DOCTYPE html>
                   : '';
                 brStatusHTML = '<span style="display:inline-block;flex:none;width:10px;height:10px;border:2px solid rgba(255,255,255,0.2);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite" title="Container image for this commit is still building"></span><span style="font-size:0.65rem;color:var(--muted);opacity:0.7;white-space:nowrap">building image…</span>' + _timerHTML;
               } else if (brStatus === 'failed') {
-                brStatusHTML = '<span style="color:var(--red);font-size:0.7rem;cursor:help" title="Image build failed for this commit — upgrades keep using the previous image">✗</span>';
+                var _bURL = _latestBuildURLs[br] || '';
+                var _failText = '<span style="color:var(--red);font-size:0.65rem;white-space:nowrap">build failed</span>';
+                if (_bURL) _failText = '<a href="' + escAttr(_bURL) + '" target="_blank" rel="noopener" style="color:var(--red);font-size:0.65rem;white-space:nowrap;text-decoration:none" title="Open failed Docker workflow run">build failed</a>';
+                brStatusHTML = '<span style="color:var(--red);font-size:0.7rem;cursor:help" title="Image build failed for this commit — upgrades keep using the previous image">✗</span>' + _failText;
+              } else if (brStatus === 'stale') {
+                var _staleURL = _latestBuildURLs[br] || '';
+                var _staleText = '<span style="color:var(--orange,#f59e0b);font-size:0.65rem;white-space:nowrap">build stale/unknown</span>';
+                if (_staleURL) _staleText = '<a href="' + escAttr(_staleURL) + '" target="_blank" rel="noopener" style="color:var(--orange,#f59e0b);font-size:0.65rem;white-space:nowrap;text-decoration:none" title="Open Docker workflow run">build stale/unknown</a>';
+                brStatusHTML = '<span style="color:var(--orange,#f59e0b);font-size:0.7rem;cursor:help" title="Image is still unavailable after the configured build window">!</span>' + _staleText;
               }
               lines += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px"><span style="display:inline-block;padding:1px 6px;border-radius:9999px;font-size:0.6rem;background:rgba(59,130,246,0.15);color:#60a5fa;border:1px solid rgba(59,130,246,0.3)">' + esc(br) + '</span><span style="font-family:monospace;color:var(--muted)">' + esc(_latestSHAs[br]) + '</span>' + (brMsg ? '<span style="font-size:0.7rem;color:var(--muted);opacity:0.7">: ' + esc(brMsg) + '</span>' : '') + brStatusHTML +
                 /* Per-line pulls mini chart: a .line-pulls span each
@@ -15461,7 +16153,7 @@ const dashboardHTML = `<!DOCTYPE html>
        no frontend change — and (b) a mini per-line chart in each
        "Latest available images" row from data.lines. One bar per release,
        newest on the right. Gauges external adoption of the public spoke image
-       (ghcr.io/kubestellar/hive) beyond the hosted fleet. Honest labelling:
+       (ghcr.io/hivecommons/hive) beyond the hosted fleet. Honest labelling:
        derived from GitHub's cumulative download counter (pulls, NOT unique
        downloads; GitHub publishes one package-wide counter, not per-tag). Cold
        start (fewer than two release snapshots → no window can be closed yet)
@@ -16001,6 +16693,19 @@ const dashboardHTML = `<!DOCTYPE html>
         '<div style="margin-top:10px;text-align:left;max-height:220px;overflow:auto">' + failedRows + '</div>', true);
     }
 
+    function pruneExpandedPendingRows(allHives) {
+      if (!_expandedPendingRows || !_expandedPendingRows.size) return;
+      var pendingHiveIds = new Set();
+      (allHives || []).forEach(function(h) {
+        if (h && h.id && h.pendingRequestCount > 0 && roleAtLeast(h.role, 'read-write') && (h.pending_requests || []).length > 0) {
+          pendingHiveIds.add(String(h.id));
+        }
+      });
+      _expandedPendingRows.forEach(function(hiveId) {
+        if (!pendingHiveIds.has(hiveId)) _expandedPendingRows.delete(hiveId);
+      });
+    }
+
     /* True while any row's branch/channel dropdown is open. renderHives
        rebuilds the row DOM, which would destroy the open menu mid-click —
        the fleet heartbeats change some hive field on nearly every poll, so
@@ -16051,6 +16756,7 @@ const dashboardHTML = `<!DOCTYPE html>
          next render call (poll tick, or the catch-up fired when the menu
          closes) sees a stale _lastHivesJSON and repaints normally. */
       if (branchMenuOpen()) return;
+      pruneExpandedPendingRows(allHives);
       /* The signature must include EVERY piece of render-affecting view state,
          otherwise changing it while the hive data is unchanged is silently a
          no-op — toggling a chip, drilling into an alert type, expanding the
@@ -16406,6 +17112,21 @@ const dashboardHTML = `<!DOCTYPE html>
             var queuedTitle = queuedDaily
               ? 'Auto-upgrade will apply ' + branchLatest + ' (' + versionLabel(versionSel) + ') at the next 1pm ET window' + buildingHint
               : 'Auto-upgrade will apply ' + branchLatest + ' (' + versionLabel(versionSel) + ') shortly' + buildingHint;
+            /* REFUSED, not queued. autoUpgradeBlocked is the hub's own evaluated
+               decision (upgradeCollectible false), sent by the fleet API rather
+               than re-derived here — the badge must never claim an upgrade is
+               coming for a hive triggerAutoUpgrades() declines every cycle and
+               will keep declining until an operator intervenes. The mode-derived
+               label above says nothing about eligibility, which is exactly how a
+               hive sat 89 commits behind still advertising "· 1pm ET".
+               "Upgrade now" stays beside it: the manual path is pushed through a
+               different route and remains the operator's escape hatch. */
+            if (h.autoUpgradeBlocked) {
+              queuedLabel = 'Auto-upgrade blocked';
+              queuedTitle = 'The hub will not arm an auto-upgrade for this hive: ' +
+                (h.autoUpgradeBlockedReason || 'it cannot collect the upgrade instruction') +
+                '. It will not resolve on its own.' + buildingHint;
+            }
             /* escAttr, not esc, for the title: esc() leaves quotes intact and a
                branch name or commit subject carrying one would break out of the
                attribute. jsArg supplies its own quotes for the handler args. */
@@ -16589,20 +17310,29 @@ const dashboardHTML = `<!DOCTYPE html>
         var pendingExpandRow = '';
         if (h.pendingRequestCount > 0 && (roleAtLeast(h.role, 'read-write')) && (h.pending_requests || []).length > 0) {
           var prItems = (h.pending_requests || []).map(function(pr) {
-            var avatar = linkedAvatar(pr.username, LIST_AVATAR_PX, pr.username, 'margin-right:6px');
+            var rawUser = String(pr.username || '');
+            var userLabel = String(pr.display_label || rawUser);
+            var provider = pr.provider || identityProviderFromKey(rawUser);
+            var avatar = (provider === 'github' && rawUser.indexOf(':') === -1)
+              ? linkedAvatar(rawUser, LIST_AVATAR_PX, userLabel, 'margin-right:6px')
+              : userAvatar({display_name: userLabel, avatar_url: pr.avatar_url, github_username: rawUser}, LIST_AVATAR_PX, 'margin-right:6px');
+            var authKey = userLabel && rawUser && userLabel !== rawUser
+              ? '<span style="display:block;font-size:0.68rem;color:var(--muted);word-break:break-word" title="Auth key">' + esc(rawUser) + '</span>'
+              : '';
             var note = (pr.note || '').trim();
             var noteHtml = note
               ? '<div style="margin-top:4px;font-size:0.75rem;color:var(--text);white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,0.15);border-left:2px solid var(--accent);padding:4px 8px;border-radius:2px">' + esc(note) + '</div>'
               : '<div style="margin-top:4px;font-size:0.72rem;color:var(--muted);font-style:italic">(no note)</div>';
             return '<div style="padding:6px 0;border-bottom:1px solid var(--border)">' +
               '<div style="display:flex;align-items:center;justify-content:space-between">' +
-              '<div>' + avatar + '<span style="font-size:0.85rem">' + esc(pr.username) + '</span></div>' +
+              '<div>' + avatar + '<span style="font-size:0.85rem">' + esc(userLabel || rawUser) + '</span>' + authKey + '</div>' +
               '<div style="display:flex;gap:4px">' +
               '<button onclick="inlineApproveAccess(\'' + esc(h.id) + '\',\'' + esc(pr.username) + '\',this)" style="padding:2px 8px;background:var(--green);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.65rem">Approve</button>' +
               '<button onclick="inlineDenyAccess(\'' + esc(h.id) + '\',\'' + esc(pr.username) + '\',this)" style="padding:2px 8px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.65rem">Deny</button>' +
               '</div></div>' + noteHtml + '</div>';
           }).join('');
-          pendingExpandRow = '<tr id="pending-row-' + esc(h.id) + '"' + ((i % 2 === 1) ? ' class="hive-row-alt"' : '') + ' style="display:none"><td colspan="' + TOTAL_COLUMNS + '"><div style="padding:8px 16px;background:rgba(59,130,246,0.05);border-radius:6px;margin:4px 0">' + prItems + '</div></td></tr>';
+          var pendingRowStyle = _expandedPendingRows.has(String(h.id || '')) ? '' : 'display:none';
+          pendingExpandRow = '<tr id="pending-row-' + esc(h.id) + '"' + ((i % 2 === 1) ? ' class="hive-row-alt"' : '') + ' style="' + pendingRowStyle + '"><td colspan="' + TOTAL_COLUMNS + '"><div style="padding:8px 16px;background:rgba(59,130,246,0.05);border-radius:6px;margin:4px 0">' + prItems + '</div></td></tr>';
         }
         /* Stable per-hive anchor so the "Attention needed" panel can scroll a
            specific row into view and highlight it. Built from the hive id, which
@@ -16610,7 +17340,7 @@ const dashboardHTML = `<!DOCTYPE html>
         return '<tr id="' + escAttr(hiveRowDomId(h.id)) + '"' + ((i % 2 === 1) ? ' class="hive-row-alt"' : '') + '>' +
           bulkCheckboxCell(h, section || 'all') +
           '<td class="hive-menu-cell" style="position:relative;width:30px;text-align:center;overflow:visible">' + ('<span style="cursor:pointer;font-size:1.1rem;color:var(--muted);user-select:none">⋮</span>' + pendingBadge + '<div class="hive-menu-dropdown" style="display:none;position:absolute;left:0;bottom:auto;background:#1c2128;border:1px solid #30363d;border-radius:8px;min-width:160px;padding:4px 0;z-index:1000;box-shadow:0 8px 24px rgba(0,0,0,0.5)">' + menuItems.join('') + '</div>') + '</td>' +
-          '<td style="text-align:left;line-height:1.4">' + (function() { var isHostedRow = h.hiveType === 'hosted' || (h.id && (h.id.startsWith('hosted-') || h.id.startsWith('saas-'))); var dh = isHostedRow && h.id ? ('/api/saas/hives/' + encodeURIComponent(h.id) + '/open') : (rb ? esc(rb) : ''); /* Label derived from the PROJECT (org + primary repo), not by splitting h.name — see hiveLabel. */ var label = hiveLabel(h); var orgName = label.line1; var repoName = label.line2; /* rp is the repo path shown in the GitHub-icon tooltip; use the same doubling-safe path the label shows (repoDisplayLine / hiveLabel), never org + '/' + primaryRepo which doubles the owner on a github.io/GHE hive whose primaryRepo is already 'owner/repo'. */ var rp = repoName || ''; /* The icon href must resolve to a real GitHub path. When primaryRepo already carries 'owner/repo', that pair IS the owner/repo the URL needs (not org, which may be a mis-parsed host); otherwise fall back to org + primaryRepo. */ var hasRepoPath = h.primaryRepo && h.primaryRepo.indexOf('/') !== -1; var rpOwner = hasRepoPath ? h.primaryRepo.split('/')[0] : h.org; var rpName = hasRepoPath ? h.primaryRepo.split('/').slice(1).join('/') : h.primaryRepo; var rpHref = ghRepoURL(hiveForgeHost(h), rpOwner, rpName); var ghIcon = (rp && rpHref) ? '<a href="' + rpHref + '" target="_blank" style="opacity:0.5;vertical-align:middle" title="' + esc(rp) + '"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a>' : (rp ? '<span style="opacity:0.5;vertical-align:middle" title="' + esc(rp) + '"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></span>' : ''); /* vanityDisplay is the friendly host shown in the status bar on hover. rb is resolvedBase(h), which the hub has already overlaid with the claimed vanity_url; it is only a DISPLAY url here, never the click target — see ssoDisplayLink. Empty for a row with no vanity host, which falls back to today's /open href. Only meaningful on hosted rows: a non-hosted row's dh IS rb already. */ var vanityDisplay = isHostedRow && rb ? rb : ''; var link = function(text, bold) { if (dh) { return ssoDisplayLink(dh, vanityDisplay, text, bold ? 'hive-name-link' : 'hive-sub-link'); } var s = bold ? 'font-weight:700;color:inherit' : 'color:#6b7280;font-weight:400'; return '<span style="' + s + '">' + esc(text) + '</span>'; }; /* repoLink wraps the second line (the org/repo) in a link to the ACTUAL FORGE REPO (github.com / GHE host), NOT the spoke dashboard: the top line already opens the dashboard, so the repo path should take an operator to the code. rpHref is the same doubling-safe forge URL the GitHub icon uses (ghRepoURL(hiveForgeHost(h), rpOwner, rpName)); when it is empty (BYO/mis-parsed host) fall back to plain non-link text, never to the dashboard. */ var repoLink = function(text) { if (rpHref) { return '<a href="' + rpHref + '" target="_blank" rel="noopener" class="hive-sub-link" title="Open repository on ' + escAttr((hiveForgeHost(h) || 'github.com')) + '">' + esc(text) + '</a>'; } return '<span style="color:#6b7280;font-weight:400">' + esc(text) + '</span>'; }; var line1 = dot + ' ' + link(orgName, true) + heartbeatHeart(h) + nameEditAffordance(h); var fcPill = h.online ? failingCheckSummary(h) : ''; /* Advisory-staleness pill sits right beside the failing-check pill: both are "something is quietly wrong with this working hive" signals, and advisoryStaleSummary already self-suppresses (empty string) unless the hub flagged the digest stale, so unaffected rows are pixel-identical. */ var advPill = h.online ? advisoryStaleSummary(h) : ''; /* Advisory finding-count pill rides beside the staleness pill and carries the "(top N)" marker when the spoke capped its digest. */ var advCountPill = h.online ? advisoryFindingsSummary(h) : ''; /* Dead-link pill is deliberately NOT gated on h.online: the entire point is a hive that IS online and heartbeating while its public URL is broken, so gating it the way the other pills are gated would hide exactly the case it exists to surface. */ var dlPill = deadLinkSummary(h); var privatePill = privateURLSummary(h); /* Inference-auth pill: like the dead-link pill it is NOT gated on h.online, because the hive being online while every inference call 401s is exactly the case it surfaces. */ var iaPill = inferenceAuthSummary(h); /* Inline access faces sit on the name cell's second line, immediately after this row's own role badge: the badge already answers "what am I on this hive", so the co-members read as the natural continuation of the same thought, in the one cell that is left-aligned and has room to grow. It also keeps them out of the 16 dense metric columns, none of which is about people. Empty string when the viewer is the only member, so those rows are pixel-identical to today. */ var accessFaces = hiveAccessAvatars(h); /* Keyed off repoName, not orgName: line 1 now always carries SOME identity, so the presence of a second line is decided purely by whether there is a repo to put on it. Without a repo the row still shows the GitHub icon, role badge, faces and failing-check pill on the compact variant. */ var line2 = repoName ? '<div style="padding-left:18px;font-size:0.8rem">' + repoLink(repoName) + ' ' + ghIcon + ' ' + roleBadge(h.role) + accessFaces + fcPill + advPill + advCountPill + dlPill + privatePill + iaPill + '</div>' : '<div style="padding-left:18px">' + ghIcon + ' ' + roleBadge(h.role) + accessFaces + fcPill + advPill + advCountPill + dlPill + privatePill + iaPill + '</div>'; var line3 = pendingPill ? '<div style="margin-top:4px;padding-left:18px">' + pendingPill + '</div>' : ''; return line1 + line2 + line3; })() + '</td>' +
+          '<td style="text-align:left;line-height:1.4">' + (function() { var isHostedRow = h.hiveType === 'hosted' || (h.id && (h.id.startsWith('hosted-') || h.id.startsWith('saas-'))); var dh = isHostedRow && h.id ? ('/api/saas/hives/' + encodeURIComponent(h.id) + '/open') : (rb ? esc(rb) : ''); /* Label derived from the PROJECT (org + primary repo), not by splitting h.name — see hiveLabel. */ var label = hiveLabel(h); var orgName = label.line1; var repoName = label.line2; /* rp is the repo path shown in the GitHub-icon tooltip; use the same doubling-safe path the label shows (repoDisplayLine / hiveLabel), never org + '/' + primaryRepo which doubles the owner on a github.io/GHE hive whose primaryRepo is already 'owner/repo'. */ var rp = repoName || ''; /* The icon href must resolve to a real GitHub path. When primaryRepo already carries 'owner/repo', that pair IS the owner/repo the URL needs (not org, which may be a mis-parsed host); otherwise fall back to org + primaryRepo. */ var hasRepoPath = h.primaryRepo && h.primaryRepo.indexOf('/') !== -1; var rpOwner = hasRepoPath ? h.primaryRepo.split('/')[0] : h.org; var rpName = hasRepoPath ? h.primaryRepo.split('/').slice(1).join('/') : h.primaryRepo; var rpHref = ghRepoURL(hiveForgeHost(h), rpOwner, rpName); var ghIcon = (rp && rpHref) ? '<a href="' + rpHref + '" target="_blank" style="opacity:0.5;vertical-align:middle" title="' + esc(rp) + '"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a>' : (rp ? '<span style="opacity:0.5;vertical-align:middle" title="' + esc(rp) + '"><svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:middle"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></span>' : ''); /* vanityDisplay is the friendly host shown in the status bar on hover. rb is resolvedBase(h), which the hub has already overlaid with the claimed vanity_url; it is only a DISPLAY url here, never the click target — see ssoDisplayLink. Empty for a row with no vanity host, which falls back to today's /open href. Only meaningful on hosted rows: a non-hosted row's dh IS rb already. */ var vanityDisplay = isHostedRow && rb ? rb : ''; var link = function(text, bold) { if (dh) { return ssoDisplayLink(dh, vanityDisplay, text, bold ? 'hive-name-link' : 'hive-sub-link'); } var s = bold ? 'font-weight:700;color:inherit' : 'color:#6b7280;font-weight:400'; return '<span style="' + s + '">' + esc(text) + '</span>'; }; /* repoLink wraps the second line (the org/repo) in a link to the ACTUAL FORGE REPO (github.com / GHE host), NOT the spoke dashboard: the top line already opens the dashboard, so the repo path should take an operator to the code. rpHref is the same doubling-safe forge URL the GitHub icon uses (ghRepoURL(hiveForgeHost(h), rpOwner, rpName)); when it is empty (BYO/mis-parsed host) fall back to plain non-link text, never to the dashboard. */ var repoLink = function(text) { if (rpHref) { return '<a href="' + rpHref + '" target="_blank" rel="noopener" class="hive-sub-link" title="Open repository on ' + escAttr((hiveForgeHost(h) || 'github.com')) + '">' + esc(text) + '</a>'; } return '<span style="color:#6b7280;font-weight:400">' + esc(text) + '</span>'; }; var line1 = dot + ' ' + link(orgName, true) + heartbeatHeart(h) + nameEditAffordance(h); var fcPill = h.online ? failingCheckSummary(h) : ''; /* Advisory-staleness pill sits right beside the failing-check pill: both are "something is quietly wrong with this working hive" signals, and advisoryStaleSummary already self-suppresses (empty string) unless the hub flagged the digest stale, so unaffected rows are pixel-identical. */ var advPill = h.online ? advisoryStaleSummary(h) : ''; /* Advisory finding-count pill rides beside the staleness pill and carries the "(top N)" marker when the spoke capped its digest. */ var advCountPill = h.online ? advisoryFindingsSummary(h) : ''; /* Dead-link pill is deliberately NOT gated on h.online: the entire point is a hive that IS online and heartbeating while its public URL is broken, so gating it the way the other pills are gated would hide exactly the case it exists to surface. */ var dlPill = deadLinkSummary(h); var privatePill = privateURLSummary(h); /* Inference-auth pill: like the dead-link pill it is NOT gated on h.online, because the hive being online while every inference call 401s is exactly the case it surfaces. */ var iaPill = inferenceAuthSummary(h); var rsPill = restartStormSummary(h); /* Inline access faces sit on the name cell's second line, immediately after this row's own role badge: the badge already answers "what am I on this hive", so the co-members read as the natural continuation of the same thought, in the one cell that is left-aligned and has room to grow. It also keeps them out of the 16 dense metric columns, none of which is about people. Empty string when the viewer is the only member, so those rows are pixel-identical to today. */ var accessFaces = hiveAccessAvatars(h); /* Keyed off repoName, not orgName: line 1 now always carries SOME identity, so the presence of a second line is decided purely by whether there is a repo to put on it. Without a repo the row still shows the GitHub icon, role badge, faces and failing-check pill on the compact variant. */ var line2 = repoName ? '<div style="padding-left:18px;font-size:0.8rem">' + repoLink(repoName) + ' ' + ghIcon + ' ' + roleBadge(h.role) + accessFaces + fcPill + advPill + advCountPill + dlPill + privatePill + iaPill + rsPill + '</div>' : '<div style="padding-left:18px">' + ghIcon + ' ' + roleBadge(h.role) + accessFaces + fcPill + advPill + advCountPill + dlPill + privatePill + iaPill + rsPill + '</div>'; var line3 = pendingPill ? '<div style="margin-top:4px;padding-left:18px">' + pendingPill + '</div>' : ''; return line1 + line2 + line3; })() + '</td>' +
           '<td>' + locationCell + '</td>' +
           '<td style="white-space:nowrap">' + uptimeCell(h) + '</td>' +
           /* No white-space:nowrap on the cell itself: the stacked lines each
@@ -16649,7 +17379,7 @@ const dashboardHTML = `<!DOCTYPE html>
             '</div>' +
           '</td>' +
           '<td title="' + esc((h.agents || []).map(function(a){ var label = a.name + ' (' + a.state + ')'; if (a.mode === 'on_demand') label += ' — on demand'; if (a.paused) label += ' — ' + agentPauseProvenance(a); return label; }).join('\n')) + '" style="cursor:' + ((h.agentCount || 0) > 0 ? 'help' : 'default') + '">' + (h.agentCount || 0) + '</td>' +
-          '<td title="Cumulative tokens consumed, as of the last heartbeat" style="white-space:nowrap;cursor:help">' + fmtTokens(h.totalTokens24h || 0) + '</td>' +
+          '<td title="' + escAttr(tokenUsageTitle(h)) + '" style="white-space:nowrap;cursor:help">' + fmtTokens(h.totalTokens24h || 0) + '</td>' +
           '<td>' + modeCell + '</td>' +
           /* ACTIVITY: Issues, PRs and Contributors — three mini-stats that were
              three columns — stacked densely into ONE cell. Every number and both
@@ -17407,6 +18137,20 @@ const dashboardHTML = `<!DOCTYPE html>
       }
     }
 
+    async function resetAgentRestarts(hiveId, agentName) {
+      var ok = await hiveConfirm('Reset restart counter for agent "' + agentName + '"?\n\nThe fleet page will count restarts from this point so you can tell whether the problem recurs.');
+      if (!ok) return;
+      try {
+        var resp = await fetch('/api/saas/hives/' + encodeURIComponent(hiveId) + '/agents/' + encodeURIComponent(agentName) + '/restarts/reset', {method: 'POST'});
+        var data = await resp.json().catch(function() { return {}; });
+        if (!resp.ok) { await hiveNotify('Reset failed', String(data.error || resp.status)); return; }
+        await hiveNotify('Restart counter reset', 'Agent: ' + agentName + '\nCounting restarts from now.');
+        if (typeof loadHives === 'function') loadHives();
+      } catch (e) {
+        await hiveNotify('Reset failed', String(e));
+      }
+    }
+
     /* Reset assignment: returns an assigned-but-unclaimed placeholder to the
        available pool so it can be re-armed. Shown only on a wedged row
        (assigned && !claim_delivered), matching the endpoint's guard — a
@@ -17558,8 +18302,16 @@ const dashboardHTML = `<!DOCTYPE html>
     }
 
     function togglePendingRow(hiveId) {
+      var key = String(hiveId || '');
       var row = document.getElementById('pending-row-' + hiveId);
-      if (row) row.style.display = row.style.display === 'none' ? '' : 'none';
+      if (!row) {
+        _expandedPendingRows.delete(key);
+        return;
+      }
+      var opening = row.style.display === 'none';
+      row.style.display = opening ? '' : 'none';
+      if (opening) _expandedPendingRows.add(key);
+      else _expandedPendingRows.delete(key);
     }
 
     async function inlineApproveAccess(hiveId, username, btn) {
@@ -17942,7 +18694,7 @@ const dashboardHTML = `<!DOCTYPE html>
           '<td style="white-space:nowrap">' + acmmBadge(pr.acmm_level) + '</td>' +
           '<td style="white-space:nowrap;color:var(--muted);font-size:0.7rem">' + esc((pr.requested_at || '').substring(0, 10)) + '</td>' +
           '<td style="white-space:nowrap"><span style="color:' + color + ';font-weight:600;font-size:0.72rem">' + esc(pr.status) + '</span></td>' +
-          '<td style="white-space:nowrap">' + esc(pr.decided_by || '—') + '</td>' +
+          '<td style="white-space:nowrap">' + esc(pr.decided_by_name || pr.decided_by || '—') + '</td>' +
           '<td style="white-space:nowrap;color:var(--muted);font-size:0.7rem">' + esc((pr.decided_at || '').substring(0, 10) || '—') + '</td>' +
           '<td>' + outcome + '</td>' +
           '<td>' + otherHivesCell(pr.other_hives) + '</td>' +
@@ -18020,6 +18772,11 @@ const dashboardHTML = `<!DOCTYPE html>
 
     var _provisionRequestsByUser = {};
 
+    function provisionRequesterDisplay(username) {
+      var pr = _provisionRequestsByUser[username] || {username: username};
+      return provisionRequesterPrimary(pr) || String(username || '');
+    }
+
     /* openAssignForUser is the entry point from a click on a user in the admin
        users table. It routes to whichever existing flow fits, rather than adding
        a third assign path:
@@ -18054,7 +18811,7 @@ const dashboardHTML = `<!DOCTYPE html>
       var reposText = pr.primary_repo || pr.repos || '';
       var summary =
         '<div style="padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.8rem;margin-bottom:4px">' +
-        '<div><span style="color:var(--muted)">User:</span> <strong>' + esc(username) + '</strong></div>' +
+        '<div><span style="color:var(--muted)">User:</span> <strong>' + esc(provisionRequesterDisplay(username)) + '</strong></div>' +
         '<div><span style="color:var(--muted)">Org:</span> ' + esc(pr.org || '') + '</div>' +
         '<div><span style="color:var(--muted)">Repos:</span> ' + esc(pr.repos || '') + '</div>' +
         '<div><span style="color:var(--muted)">Primary:</span> ' + esc(pr.primary_repo || '') + '</div>' +
@@ -18140,20 +18897,20 @@ const dashboardHTML = `<!DOCTYPE html>
         var data = await resp.json();
         if (!resp.ok) { hiveToast(data.error || 'Assign failed', 'error'); if (submit) { submit.disabled = false; submit.textContent = 'Approve'; } return; }
         closeApproveModal();
-        hiveToast('Approved ' + username + ' → ' + (hiveId || 'auto') + ' (' + (data.hive_id || 'a hive') + ')', 'success');
+        hiveToast('Approved ' + provisionRequesterDisplay(username) + ' → ' + (hiveId || 'auto') + ' (' + (data.hive_id || 'a hive') + ')', 'success');
         loadHives();
       } catch(e) { hiveToast('Error: ' + e.message, 'error'); if (submit) { submit.disabled = false; submit.textContent = 'Approve'; } }
     }
 
     async function denyProvision(username, btn) {
-      if (!await hiveConfirm('Deny provision request from ' + username + '?')) return;
+      if (!await hiveConfirm('Deny provision request from ' + provisionRequesterDisplay(username) + '?')) return;
       btn.disabled = true;
       btn.textContent = 'Denying...';
       try {
         var resp = await fetch('/api/saas/deny-provision/' + encodeURIComponent(username), {method: 'DELETE'});
         var data = await resp.json();
         if (!resp.ok) { hiveToast(data.error || 'Deny failed', 'error'); btn.disabled = false; btn.textContent = 'Deny'; return; }
-        hiveToast('Provision request denied for ' + username, 'success');
+        hiveToast('Provision request denied for ' + provisionRequesterDisplay(username), 'success');
         loadHives();
       } catch(e) { hiveToast('Error: ' + e.message, 'error'); btn.disabled = false; btn.textContent = 'Deny'; }
     }
@@ -18477,6 +19234,62 @@ const dashboardHTML = `<!DOCTYPE html>
               var capRemaining = cs.hive_capacity_remaining;
               capacityLine = ' · <span title="Estimated headroom: per-hive CPU/memory request footprint bin-packed into free (allocatable minus requested) capacity on Ready, schedulable nodes only">room for ~' + capRemaining + ' more hive' + (capRemaining === 1 ? '' : 's') + '</span>';
             }
+            // Stuck (orphaned Terminating) hive pods — the residue of nodes
+            // disappearing without draining (#5328). ABSENT means the hub could
+            // not determine it and nothing is claimed; a present zero is
+            // deliberately silent so a healthy fleet stays quiet. Only a real
+            // non-zero count renders, because the whole cost of this incident
+            // was that 27 orphans across 15 namespaces accumulated for three
+            // weeks with nothing reporting them.
+            var stuckLine = '';
+            if (c.stuck_pods && c.stuck_pods.total > 0) {
+              var sp = c.stuck_pods;
+              var nsList = (sp.namespaces || []).map(function(x) { return x.namespace + ' (' + x.count + ')'; }).join(', ');
+              if (sp.truncated) { nsList += ', …'; }
+              var stuckTitle = 'Hive pods stuck Terminating past the reaper threshold: deletionTimestamp set, no finalizers, not Running. ' +
+                'Signature of a node removed without draining. Affected namespaces: ' + nsList;
+              stuckLine = ' · <span style="color:var(--red)" title="' + esc(stuckTitle) + '">' +
+                sp.total + ' stuck pod' + (sp.total === 1 ? '' : 's') +
+                ' in ' + sp.namespaces_affected + ' ns</span>';
+            }
+            // Wildcard certificate health (#5977). ABSENT means either this
+            // cluster does not serve spokes from a wildcard or the hub could not
+            // look, and nothing is claimed either way. A present "ok" is
+            // deliberately silent, like the stuck-pod line above: a healthy fleet
+            // stays quiet. Only a finding renders — and every finding here is
+            // fleet-wide, because on an opted-in cluster this one certificate is
+            // what every hosted dashboard is served with.
+            var wildcardLine = '';
+            if (c.wildcard_tls && c.wildcard_tls.status && c.wildcard_tls.status !== 'ok') {
+              var wt = c.wildcard_tls;
+              var wtLabel;
+              if (wt.status === 'expiring') {
+                // days_remaining is always set alongside an 'expiring' status,
+                // but the label must not depend on that: falling through to the
+                // catch-all would report an expiring certificate as unreadable.
+                wtLabel = wt.days_remaining != null
+                  ? 'wildcard cert expires in ' + wt.days_remaining + 'd'
+                  : 'wildcard cert expiring soon';
+              } else if (wt.status === 'expired') {
+                wtLabel = 'wildcard cert EXPIRED';
+              } else if (wt.status === 'missing') {
+                wtLabel = 'wildcard cert MISSING';
+              } else if (wt.status === 'domain_mismatch') {
+                wtLabel = 'wildcard cert does not cover this domain';
+              } else if (wt.status === 'not_served') {
+                wtLabel = 'wildcard cert is not the ingress default';
+              } else {
+                wtLabel = 'wildcard cert unreadable';
+              }
+              var wtTitle = (wt.detail || '') +
+                ' Secret: ' + (wt.secret || '?') + '.' +
+                (wt.not_after ? ' Expires ' + wt.not_after + '.' : '') +
+                (wt.issuer ? ' Issuer: ' + wt.issuer + '.' : '') +
+                ((wt.dns_names || []).length ? ' SANs: ' + (wt.dns_names || []).join(', ') + '.' : '') +
+                ' Every wildcard-covered spoke on this cluster is served by this one certificate.';
+              wildcardLine = ' · <span style="color:var(--red)" title="' + esc(wtTitle) + '">' +
+                esc(wtLabel) + '</span>';
+            }
             var errorLine = c.error ? '<div style="margin:8px 0;padding:6px 10px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:0.75rem;color:var(--red)">' + esc(c.error) + '</div>' : '';
             var headerHtml = '<div style="display:flex;align-items:center;gap:8px;margin:16px 0 8px">' +
               clusterBadge(c.id, c.name) +
@@ -18486,7 +19299,7 @@ const dashboardHTML = `<!DOCTYPE html>
               '<span style="color:' + cCpuColor + '">' + (cs.total_cpu_percent || 0) + '% cpu</span> · ' +
               '<span style="color:' + cMemColor + '">' + (cs.total_mem_percent || 0) + '% mem</span> · ' +
               cDiskSegment +
-              (c.hive_count || 0) + ' hives' + capacityLine + gpuLine +
+              (c.hive_count || 0) + ' hives' + capacityLine + gpuLine + stuckLine + wildcardLine +
               '</span></div>';
             var nodesHtml = (c.nodes || []).length > 0
               ? '<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">' + (c.nodes || []).map(renderNodeCard).join('') + '</div>'
@@ -18580,7 +19393,7 @@ const dashboardHTML = `<!DOCTYPE html>
       else if (!r.deployed) flags.push('<span style="padding:2px 8px;border-radius:9999px;font-size:0.65rem;font-weight:600;background:rgba(107,114,128,0.15);color:#9ca3af;border:1px solid rgba(107,114,128,0.3)" title="No hive reports running a commit containing this PR yet (merged is not deployed)">not deployed</span>');
       if ((r.shared_with || []).length) flags.push('<span style="padding:2px 8px;border-radius:9999px;font-size:0.65rem;font-weight:600;background:rgba(128,191,255,0.15);color:#80bfff;border:1px solid rgba(128,191,255,0.3)" title="Co-deployed with PR ' + esc((r.shared_with || []).map(function(n) { return '#' + n; }).join(', ')) + ' — reach and deltas are shared by construction (D4)">shared</span>');
       return '<tr>' +
-        '<td style="white-space:nowrap"><a href="https://github.com/kubestellar/hive/pull/' + r.pr + '" target="_blank">#' + r.pr + '</a>' +
+        '<td style="white-space:nowrap"><a href="https://github.com/hivecommons/hive/pull/' + r.pr + '" target="_blank">#' + r.pr + '</a>' +
         (r.title ? ' <span style="color:var(--muted);font-size:0.75rem" title="' + esc(r.title) + '">' + esc(r.title.length > 48 ? r.title.slice(0, 48) + '…' : r.title) + '</span>' : '') + '</td>' +
         '<td>' + compCell + '</td>' +
         '<td>' + reachCell + '</td>' +
@@ -21309,14 +22122,22 @@ const dashboardHTML = `<!DOCTYPE html>
         if (!el) return;
         if (!reqs.length) { el.innerHTML = '<span style="color:var(--muted);font-size:0.8rem">No pending requests</span>'; return; }
         el.innerHTML = reqs.map(function(r) {
-          var avatar = linkedAvatar(r.username, LIST_AVATAR_PX, r.username, 'margin-right:6px');
+          var rawUser = String(r.username || '');
+          var userLabel = String(r.display_label || rawUser);
+          var provider = r.provider || identityProviderFromKey(rawUser);
+          var avatar = (provider === 'github' && rawUser.indexOf(':') === -1)
+            ? linkedAvatar(rawUser, LIST_AVATAR_PX, userLabel, 'margin-right:6px')
+            : userAvatar({display_name: userLabel, avatar_url: r.avatar_url, github_username: rawUser}, LIST_AVATAR_PX, 'margin-right:6px');
+          var authKey = userLabel && rawUser && userLabel !== rawUser
+            ? '<span style="display:block;font-size:0.68rem;color:var(--muted);word-break:break-word" title="Auth key">' + esc(rawUser) + '</span>'
+            : '';
           var note = (r.note || '').trim();
           var noteHtml = note
             ? '<div style="margin-top:4px;font-size:0.75rem;color:var(--text);white-space:pre-wrap;word-break:break-word;background:var(--bg);border-left:2px solid var(--accent);padding:4px 8px;border-radius:2px">' + esc(note) + '</div>'
             : '<div style="margin-top:4px;font-size:0.72rem;color:var(--muted);font-style:italic">(no note)</div>';
           return '<div style="padding:6px 0;border-bottom:1px solid var(--border)">' +
             '<div style="display:flex;align-items:center;justify-content:space-between">' +
-            '<div>' + avatar + '<span style="font-size:0.85rem">' + esc(r.username) + '</span> <span style="font-size:0.7rem;color:var(--muted)">' + esc(r.requested_at.substring(0,10)) + '</span></div>' +
+            '<div>' + avatar + '<span style="font-size:0.85rem">' + esc(userLabel || rawUser) + '</span> <span style="font-size:0.7rem;color:var(--muted)">' + esc(r.requested_at.substring(0,10)) + '</span>' + authKey + '</div>' +
             '<div style="display:flex;gap:4px">' +
             '<select id="req-role-' + esc(r.username) + '" title="Role to grant on approval" style="padding:2px 6px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:0.7rem"><option value="read" title="' + escAttr(roleDescription('read')) + '">Read</option><option value="read-write" title="' + escAttr(roleDescription('read-write')) + '">Read-Write</option><option value="merger" title="' + escAttr(roleDescription('merger')) + '">Merger</option></select>' +
             '<button onclick="approveRequest(\'' + esc(r.username) + '\')" style="padding:2px 8px;background:var(--green);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:0.65rem">Approve</button>' +

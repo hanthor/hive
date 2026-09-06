@@ -42,11 +42,12 @@ The biggest mistake new users make: seeing agent output and either (a) panicking
 
 None of the level guidance below works until your hive is connected to your git host. Do this in your **first session**:
 
-1. **Install the Forge App.** The Forge App is the app Hive installs on your forge (your source control system, e.g., GitHub, GitHub Enterprise, GitLab, or Gitea) — on **GitHub.com and GitHub Enterprise (GHE) it's a GitHub App**; on GitLab or Gitea it's the equivalent host app. This is how Hive talks to your repo.
+1. **Install the Forge App.** The Forge App is the app Hive installs on your forge (your source control system, e.g., GitHub, GitHub Enterprise, GitLab, or Gitea) — on **GitHub.com and GitHub Enterprise (GHE) it's a GitHub App**. This is how Hive talks to your repo. GitLab, Gitea, and Forgejo are **not supported for running a hive** today — see [Forge setup: GitLab, Gitea, and Forgejo](forge-app-setup.md).
    - **From the dashboard (easiest):** click **Install Forge App** in the welcome checklist, or open **Governor Config → Forge App** and use the install link there. Grant the app access to your repo.
    - **On GitHub.com:** the install button sends you to `github.com/apps/<app-slug>` — pick your org/repo and approve.
    - **On GitHub Enterprise (IBM, corporate):** the same flow lives on your **GHE host**, not github.com — the install page is `https://<your-ghe-host>/github-apps/<app-slug>`. Make sure your hive is pointed at your GHE host URL (Governor Config → Forge App shows which host is configured).
    - **Self-hosting or creating the app yourself?** See the [GitHub App setup guide](github-app-setup.md) for app creation, permissions, and the `/gh-setup` flow.
+   - **On GitLab, Gitea, or Forgejo?** There is no Forge App to install: those forges are **not supported for running a hive** today, and the rest of this guide assumes GitHub. See [Forge setup: GitLab, Gitea, and Forgejo](forge-app-setup.md) for what is and is not implemented.
 2. **⏰ Don't put this off.** Unconfigured hive instances are reclaimed on a timer. Finish the Forge App install in your first session or your hive may be reaped — see [What if my hive disappeared?](#what-if-my-hive-disappeared-inactive-hive-reaping) below.
 3. **Wait for the first heartbeat.** After installing, a heartbeat cycle has to run (a few minutes) before everything lights up green.
 
@@ -70,11 +71,11 @@ None of the level guidance below works until your hive is connected to your git 
 Hosted hives that stay **unconfigured or inactive are reclaimed ("reaped") on a timer** to free fleet capacity. When that happens:
 
 - Your hive stops appearing under **Usage** on the hub.
-- The old hive URL (`https://<id>.hive.kubestellar.io`) **times out** — it is gone, not just sleeping.
+- The old hive URL (`https://<id>.hive.hivecommons.dev`) **times out** — it is gone, not just sleeping.
 
 **This is normal and recoverable.** Nothing is wrong with your account. To get going again:
 
-1. **Request a new hive.** Go to the hub and click **Request a hive** (the `/get-started` wizard — on the hosted hub that's [hive.kubestellar.io/get-started](https://hive.kubestellar.io/get-started)). You'll get a fresh hive with a new URL — don't wait for the old URL to come back.
+1. **Request a new hive.** Go to the hub and click **Request a hive** (the `/get-started` wizard — on the hosted hub that's [hive.hivecommons.dev/get-started](https://hive.hivecommons.dev/get-started)). You'll get a fresh hive with a new URL — don't wait for the old URL to come back.
 2. **Complete Step 0 right away.** Install the [Forge App](#step-0--before-you-start-do-this-first) — the app for your source control system (GitHub, GitHub Enterprise, GitLab, or Gitea) — in your **first session** on the new hive. An installed Forge App plus regular heartbeats is what keeps a hive from being reaped again.
 3. **Update your bookmarks** to the new hive URL.
 

@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/beads"
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/governor"
-	"github.com/kubestellar/hive/pkg/tokens"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/beads"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/governor"
+	"github.com/hivecommons/hive/pkg/tokens"
 )
 
 func TestFormatHumanTime(t *testing.T) {
@@ -642,16 +642,9 @@ func TestBuildBeads_EmptyStores(t *testing.T) {
 }
 
 func TestBuildHealth_WithCachedHealth(t *testing.T) {
-	// Set cached health and then call with nil client
-	cachedHealthMu.Lock()
-	cachedHealth = map[string]any{"ci": 95, "tests": 100}
-	cachedHealthMu.Unlock()
-
-	defer func() {
-		cachedHealthMu.Lock()
-		cachedHealth = nil
-		cachedHealthMu.Unlock()
-	}()
+	// Seed cached health and then call with nil client; the shared hook
+	// restores the pre-test cache state in t.Cleanup (#5570).
+	setCachedHealth(t, map[string]any{"ci": 95, "tests": 100})
 
 	health := buildHealth(nil, nil)
 	if health["ci"] != 95 {
@@ -1004,10 +997,10 @@ func TestBuildBudget_WithTokenCollectorSummary(t *testing.T) {
 }
 
 func TestBuildHealth_NilClient_NoCached(t *testing.T) {
-	// Clear any cached state
-	cachedHealthMu.Lock()
-	cachedHealth = nil
-	cachedHealthMu.Unlock()
+	// Clear any cached state for the duration of this test only; the shared
+	// hook restores whatever was cached before, so this test cannot erase
+	// another test's fixture under -shuffle (#5570).
+	setCachedHealth(t, nil)
 
 	health := buildHealth(nil, nil)
 	if health["ci"] != 100 {
