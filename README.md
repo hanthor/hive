@@ -3,7 +3,7 @@
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14261/badge)](https://www.bestpractices.dev/projects/14261)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> This repository is a fork of [`kubestellar/hive`](https://github.com/kubestellar/hive)
+> This repository is a fork of [`hivecommons/hive`](https://github.com/hivecommons/hive)
 > that Tuna OS runs against its own repositories. Bugs, features, and security
 > reports for Hive itself go upstream — see [FORK.md](FORK.md) for what belongs
 > where and which documents here describe upstream rather than this fork.
