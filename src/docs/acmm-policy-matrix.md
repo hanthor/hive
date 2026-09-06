@@ -159,6 +159,36 @@ before.) `GET /api/acmm/evaluation` reports the effective default as
 are identical on both trackers; Linear uses `work_source.linear.api_key`, and
 the audit log records `tracker` alongside the URL either way.
 
+## Repositories whose module lives in a subdirectory
+
+The codebase criteria are spelled as root-relative paths (`go.mod`,
+`test/`, `.golangci.yml`, `.github/workflows/`, …). A repository that keeps
+its module under a subdirectory — this one has `src/go.mod`, `src/test/`,
+`src/.golangci.yml` — carries every artifact and matches almost none of them,
+so it self-evaluates at L0. `governor.acmm.repo_roots` names the extra
+directory to probe, per repository (keys are the names in `project.repos`):
+
+```yaml
+governor:
+  acmm:
+    repo_roots:
+      hive: src            # probe <pattern> and src/<pattern>
+```
+
+Each pattern is then tried at both `<pattern>` and `<root>/<pattern>` and the
+criterion passes if either exists. Criteria the evaluation could not decide at
+either root stay `unknown` (see above) rather than absent. Repositories not
+listed are probed at the root only, exactly as before. The root must be a
+plain relative path — no leading `/`, no `..`, `.` or empty segments, forward
+slashes only — and anything else fails config validation at load time, so a
+typo surfaces when the hive starts instead of as an evaluation that quietly
+finds nothing under the wrong directory.
+
+The extra root roughly doubles the `GetContents` calls for that repository
+(the shared parent directories are prefetched under both roots, so most probes
+are still answered from the cache), which counts toward the `?refresh=1`
+debounce documented in the [API reference](api-reference.md#packs-and-acmm).
+
 ## Changing a hive's ACMM level
 
 Promoting or demoting a running hive between levels is a single operation — the

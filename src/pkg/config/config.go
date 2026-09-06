@@ -5199,6 +5199,9 @@ func (c *Config) validate() error {
 	if !ValidateACMMIssueTracker(strings.TrimSpace(c.Governor.ACMM.IssueTracker)) {
 		return fmt.Errorf("governor: invalid acmm.issue_tracker %q (must be %s or %s, or empty for %s)", c.Governor.ACMM.IssueTracker, ACMMIssueTrackerGitHub, ACMMIssueTrackerWorkSource, ACMMIssueTrackerGitHub)
 	}
+	if err := ValidateACMMRepoRoots(c.Governor.ACMM.RepoRoots); err != nil {
+		return fmt.Errorf("governor: %w", err)
+	}
 	for name, agent := range c.Agents {
 		// One gate, shared with the config write path (dashboard agent-config
 		// save) and agreeing with what the launcher can actually dispatch. A

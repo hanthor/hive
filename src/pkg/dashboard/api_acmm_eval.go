@@ -530,11 +530,15 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 
 	for _, repo := range repos {
 		ctx, cancel := context.WithTimeout(context.Background(), acmmPerRepoTimeout)
-		dirCache := s.prefetchDirectories(ctx, owner, repo)
+		// governor.acmm.repo_roots: a repo whose module lives under src/ (or
+		// any subdirectory) is probed there too, so root-spelled criteria
+		// see it. Unlisted repos keep the root-only behavior.
+		root := s.deps.Config.Governor.ACMM.RepoRoot(repo)
+		dirCache := s.prefetchDirectoriesUnder(ctx, owner, repo, root)
 
 		var results []CriterionResult
 		for _, c := range universalCriteria {
-			passed, unknown := s.checkCriterion(ctx, owner, repo, c, dirCache)
+			passed, unknown := s.checkCriterionUnder(ctx, owner, repo, root, c, dirCache)
 			results = append(results, CriterionResult{
 				ID:       c.ID,
 				Name:     c.Name,
@@ -590,6 +594,13 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 // prefetchDirectories fetches directory listings for parent dirs that
 // many criteria share, reducing individual API calls.
 func (s *Server) prefetchDirectories(ctx context.Context, owner, repo string) map[string]map[string]bool {
+	return s.prefetchDirectoriesUnder(ctx, owner, repo, "")
+}
+
+// prefetchDirectoriesUnder is prefetchDirectories plus, when root is set, the
+// same directories under root, so the sub-root probes are answered from the
+// cache as often as the root ones.
+func (s *Server) prefetchDirectoriesUnder(ctx context.Context, owner, repo, root string) map[string]map[string]bool {
 	cache := make(map[string]map[string]bool)
 
 	dirs := []string{
@@ -602,6 +613,11 @@ func (s *Server) prefetchDirectories(ctx context.Context, owner, repo string) ma
 		".claude",
 		"docs",
 		"docs/security",
+	}
+	if root != "" {
+		for _, d := range append([]string(nil), dirs...) {
+			dirs = append(dirs, acmmUnderRoot(root, d))
+		}
 	}
 
 	// GoGitHub() is nil-receiver safe and returns nil, so the deref below would
@@ -650,15 +666,45 @@ const (
 // the repo. unknown is true when nothing was found AND at least one probe
 // got no answer, so the caller can tell "missing" from "could not tell".
 func (s *Server) checkCriterion(ctx context.Context, owner, repo string, c ACMMCriterion, dirCache map[string]map[string]bool) (passed, unknown bool) {
+	return s.checkCriterionUnder(ctx, owner, repo, "", c, dirCache)
+}
+
+// checkCriterionUnder is checkCriterion with an optional extra probe root
+// (governor.acmm.repo_roots): every pattern is tried at the repository root
+// and, when root is set, at root/<pattern>. Present anywhere passes; unknown
+// anywhere with no hit is unknown.
+func (s *Server) checkCriterionUnder(ctx context.Context, owner, repo, root string, c ACMMCriterion, dirCache map[string]map[string]bool) (passed, unknown bool) {
 	for _, pattern := range c.Patterns {
-		switch s.probePattern(ctx, owner, repo, pattern, dirCache) {
-		case probePresent:
-			return true, false
-		case probeUnknown:
-			unknown = true
+		for _, candidate := range acmmPatternVariants(root, pattern) {
+			switch s.probePattern(ctx, owner, repo, candidate, dirCache) {
+			case probePresent:
+				return true, false
+			case probeUnknown:
+				unknown = true
+			}
 		}
 	}
 	return false, unknown
+}
+
+// acmmPatternVariants lists the paths a criterion pattern is probed at: the
+// pattern itself, plus root/<pattern> when a repo root is configured. The
+// trailing "/" that marks a directory pattern is preserved.
+func acmmPatternVariants(root, pattern string) []string {
+	if root == "" {
+		return []string{pattern}
+	}
+	return []string{pattern, acmmUnderRoot(root, pattern)}
+}
+
+// acmmUnderRoot joins a configured root and a root-relative path without
+// losing a directory marker: ("src", "") is "src", ("src", "test/") is
+// "src/test/".
+func acmmUnderRoot(root, rel string) string {
+	if rel == "" {
+		return root
+	}
+	return root + "/" + rel
 }
 
 // patternExists is the boolean view of probePattern: true only for a
