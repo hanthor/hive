@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
 )
 
 // ---------- agentDefinition JSON serialization ----------
@@ -602,7 +602,7 @@ spec:
 
 	rec := doPost(s, "/api/agents/import", map[string]interface{}{
 		"source": "url",
-		"url":    "https://raw.githubusercontent.com/kubestellar/hive/main/agent.yaml",
+		"url":    "https://raw.githubusercontent.com/hivecommons/hive/main/agent.yaml",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
@@ -624,7 +624,7 @@ func TestHandleAgentImport_URLFetchFails(t *testing.T) {
 	s, _ := apiServer(t)
 	rec := doPost(s, "/api/agents/import", map[string]interface{}{
 		"source": "url",
-		"url":    "https://raw.githubusercontent.com/kubestellar/hive/main/agent.yaml",
+		"url":    "https://raw.githubusercontent.com/hivecommons/hive/main/agent.yaml",
 	})
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("expected 502, got %d: %s", rec.Code, rec.Body.String())
@@ -715,5 +715,53 @@ func TestValueOrDefault(t *testing.T) {
 	}
 	if got := valueOrDefault("", "fallback"); got != "fallback" {
 		t.Errorf("expected %q, got %q", "fallback", got)
+	}
+}
+
+func TestGhcrTagExistsWithClientUsesInjectedBaseURL(t *testing.T) {
+	var gotTokenPath, gotManifestPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			gotTokenPath = r.URL.Path + "?" + r.URL.RawQuery
+			_, _ = w.Write([]byte(`{"token":"test-token"}`))
+		case "/v2/hivecommons/hive/manifests/v4-test":
+			gotManifestPath = r.URL.Path
+			gotAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	if !ghcrTagExistsWithClient(srv.Client(), srv.URL, "v4-test") {
+		t.Fatal("tag should exist when injected registry returns 200")
+	}
+	if gotTokenPath != "/token?scope=repository:hivecommons/hive:pull" {
+		t.Fatalf("token request = %q", gotTokenPath)
+	}
+	if gotManifestPath != "/v2/hivecommons/hive/manifests/v4-test" || gotAuth != "Bearer test-token" {
+		t.Fatalf("manifest request path/auth = %q/%q", gotManifestPath, gotAuth)
+	}
+}
+
+func TestGhcrTagExistsWithClientHandlesFailures(t *testing.T) {
+	badJSON := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`not-json`)) }))
+	t.Cleanup(badJSON.Close)
+	if ghcrTagExistsWithClient(badJSON.Client(), badJSON.URL, "tag") {
+		t.Fatal("bad token JSON should be false")
+	}
+
+	missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			_, _ = w.Write([]byte(`{"token":"test-token"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(missing.Close)
+	if ghcrTagExistsWithClient(missing.Client(), missing.URL, "tag") {
+		t.Fatal("missing manifest should be false")
 	}
 }

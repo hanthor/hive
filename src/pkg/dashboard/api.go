@@ -2,7 +2,10 @@ package dashboard
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,16 +25,16 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/beads"
-	"github.com/kubestellar/hive/pkg/classify"
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/hub"
-	"github.com/kubestellar/hive/pkg/knowledge"
-	"github.com/kubestellar/hive/pkg/policies"
-	"github.com/kubestellar/hive/pkg/resolve"
-	"github.com/kubestellar/hive/pkg/timeline"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/beads"
+	"github.com/hivecommons/hive/pkg/classify"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/hub"
+	"github.com/hivecommons/hive/pkg/knowledge"
+	"github.com/hivecommons/hive/pkg/policies"
+	"github.com/hivecommons/hive/pkg/resolve"
+	"github.com/hivecommons/hive/pkg/timeline"
 )
 
 func (s *Server) RegisterAPI(deps *Dependencies) {
@@ -237,6 +240,11 @@ func (s *Server) RegisterAPI(deps *Dependencies) {
 	s.mux.HandleFunc("GET /api/packs", s.handlePacksList)
 	s.mux.HandleFunc("POST /api/packs/{level}/apply", s.handlePackApply)
 	s.mux.HandleFunc("PUT /api/packs/level", s.handlePackSetLevel)
+
+	// Operator-initiated refresh of the REPOSITORIES cards: re-enumerate
+	// every watched repo's open issues/PRs now instead of waiting out the
+	// governor's eval interval. Read-only — see handleReposRescan.
+	s.mux.HandleFunc("POST /api/repos/rescan", s.handleReposRescan)
 
 	s.mux.HandleFunc("GET /api/acmm/evaluation", s.handleACMMEvaluation)
 	s.mux.HandleFunc("POST /api/acmm/issue", s.handleACMMCreateIssue)
@@ -748,7 +756,7 @@ func (s *Server) commitsBehindStableTip(base, head string) (int, bool) {
 	if s.deps == nil || s.deps.GHClient == nil || s.deps.Ctx == nil {
 		return 0, false
 	}
-	count, err := s.deps.GHClient.CompareAheadBy(s.deps.Ctx, "kubestellar", "hive", base, head)
+	count, err := s.deps.GHClient.CompareAheadBy(s.deps.Ctx, "hivecommons", "hive", base, head)
 	if err != nil {
 		s.logger.Warn("failed to compare commits behind stable tip", "base", base, "head", head, "error", err)
 		return 0, false
@@ -795,7 +803,7 @@ func (s *Server) fetchRemoteHashForBranch(branch string) (string, error) {
 	if ctx == nil {
 		return "", fmt.Errorf("no context")
 	}
-	return s.deps.GHClient.LatestCommitHash(ctx, "kubestellar", "hive", branch)
+	return s.deps.GHClient.LatestCommitHash(ctx, "hivecommons", "hive", branch)
 }
 
 // fetchCommitMessage returns the first line of the commit message for a given SHA.
@@ -804,7 +812,7 @@ func (s *Server) fetchCommitMessage(sha string) string {
 	if s.deps == nil || s.deps.GHClient == nil || s.deps.Ctx == nil {
 		return ""
 	}
-	msg, err := s.deps.GHClient.CommitMessage(s.deps.Ctx, "kubestellar", "hive", sha)
+	msg, err := s.deps.GHClient.CommitMessage(s.deps.Ctx, "hivecommons", "hive", sha)
 	if err != nil {
 		s.logger.Warn("failed to fetch commit message", "sha", sha, "error", err)
 		return ""
@@ -812,7 +820,7 @@ func (s *Server) fetchCommitMessage(sha string) string {
 	return msg
 }
 
-// ghcrTagExistsCached checks whether a container tag exists on ghcr.io/kubestellar/hive,
+// ghcrTagExistsCached checks whether a container tag exists on ghcr.io/hivecommons/hive,
 // caching the result to avoid repeated network calls on each version poll.
 var (
 	ghcrCacheMu     sync.RWMutex
@@ -822,6 +830,11 @@ var (
 
 const ghcrCacheTTL = 2 * time.Minute
 const ghcrCheckTimeout = 5 * time.Second
+
+var (
+	ghcrCheckBaseURL = "https://ghcr.io"
+	ghcrCheckClient  = &http.Client{Timeout: ghcrCheckTimeout}
+)
 
 func ghcrTagExistsCached(tag string) bool {
 	ghcrCacheMu.RLock()
@@ -841,8 +854,15 @@ func ghcrTagExistsCached(tag string) bool {
 }
 
 func ghcrTagExists(tag string) bool {
-	client := &http.Client{Timeout: ghcrCheckTimeout}
-	tokenResp, err := client.Get("https://ghcr.io/token?scope=repository:kubestellar/hive:pull")
+	return ghcrTagExistsWithClient(ghcrCheckClient, ghcrCheckBaseURL, tag)
+}
+
+func ghcrTagExistsWithClient(client *http.Client, baseURL, tag string) bool {
+	if client == nil {
+		client = &http.Client{Timeout: ghcrCheckTimeout}
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+	tokenResp, err := client.Get(baseURL + "/token?scope=repository:hivecommons/hive:pull")
 	if err != nil {
 		return false
 	}
@@ -854,7 +874,7 @@ func ghcrTagExists(tag string) bool {
 		return false
 	}
 
-	manifestURL := fmt.Sprintf("https://ghcr.io/v2/kubestellar/hive/manifests/%s", tag)
+	manifestURL := fmt.Sprintf("%s/v2/hivecommons/hive/manifests/%s", baseURL, tag)
 	req, _ := http.NewRequest("HEAD", manifestURL, nil)
 	req.Header.Set("Authorization", "Bearer "+tok.Token)
 	req.Header.Set("Accept", "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json")
@@ -1163,11 +1183,13 @@ func buildSnapshotProd(s *Server, outputFile, mode string) {
 	dashURL := fmt.Sprintf("http://localhost:%d", s.port)
 	htmlSource := "/opt/hive/proxy/public/index.html"
 	builderScript := "/opt/hive/dashboard/build-snapshot.mjs"
-	cmd := exec.Command("node", builderScript,
+	args := []string{
+		builderScript,
 		"--mode", mode,
 		"--base-path", "/snapshot",
 		"--html", htmlSource,
-		dashURL, outputFile)
+		dashURL, outputFile,
+	}
 	// The builder fetches /api/status (and siblings) from localhost. Those
 	// endpoints require auth, so without a token the builder gets 401 and
 	// bakes an empty snapshot (blank Governor/Tokens/Cost/Repos/Beads/Agents
@@ -1175,13 +1197,18 @@ func buildSnapshotProd(s *Server, outputFile, mode string) {
 	// builder authenticates via the trusted X-Hive-Internal header path. The
 	// token is used ONLY as a request header for the localhost fetch; the
 	// builder never writes it into the snapshot HTML output.
-	cmd.Env = snapshotBuilderEnv(os.Environ(), s.authToken)
-	out, err := cmd.CombinedOutput()
+	out, err := runSnapshotBuilder(args, snapshotBuilderEnv(os.Environ(), s.authToken))
 	if err != nil {
 		s.logger.Warn("snapshot build failed", "error", err, "output", string(out))
 	} else {
 		s.logger.Info("snapshot built", "file", outputFile)
 	}
+}
+
+var runSnapshotBuilder = func(args []string, env []string) ([]byte, error) {
+	cmd := exec.Command("node", args...)
+	cmd.Env = env
+	return cmd.CombinedOutput()
 }
 
 // snapshotBuilderEnv returns the environment for the Node snapshot builder.
@@ -1328,13 +1355,12 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 
 // lifecycleTimelineOnce/lifecycleStore back the lazily-constructed lifecycle
 // timeline Store. Lazy construction keeps the zero-value Server valid (no
-// constructor change) and keeps memory bounded via timeline.MaxEvents.
+// constructor change) and keeps memory bounded via timeline.MaxJourneys.
 //
-// TODO(timeline): the governor eval loop should Record() real lifecycle events
-// into LifecycleTimeline() (issue enumerated → classified → kicked → pr_opened
-// → merged/blocked), e.g. via a tracing SpanProcessor adapter that calls
-// timeline.FromSpan. Until then the store is present but empty, and the
-// endpoint safely returns empty arrays.
+// The store is fed by real producers now (#5656): the governor eval loop
+// (enumerated, kicked), the scheduler's classifier (classified), the
+// attribution audit sink + PR-opened hook (pr_opened, merged) and the
+// escalation sweep (blocked) — see cmd/hive/lifecyclewire.go.
 var (
 	lifecycleTimelineOnce sync.Once
 	lifecycleStore        *timeline.Store
@@ -1349,18 +1375,29 @@ func (s *Server) LifecycleTimeline() *timeline.Store {
 	return lifecycleStore
 }
 
-// lifecycleTimelineDefaultLimit bounds how many recent events the
+// EnableLifecyclePersistence loads previously persisted lifecycle journeys
+// from path and turns on atomic re-persistence, so a pod restart no longer
+// zeroes the panel's merged/blocked history (#5656). Call once at startup,
+// before the governor starts recording; mirrors EnableSessionPersistence.
+func (s *Server) EnableLifecyclePersistence(path string) {
+	if err := s.LifecycleTimeline().EnablePersistence(path, s.logger); err != nil && s.logger != nil {
+		s.logger.Warn("lifecycle timeline persistence unavailable — journeys reset on restart",
+			"path", path, "error", err)
+	}
+}
+
+// lifecycleTimelineDefaultLimit bounds how many journeys the
 // /api/lifecycle-timeline endpoint returns by default when the caller does not
 // pass ?limit=.
 const lifecycleTimelineDefaultLimit = 200
 
-// handleLifecycleTimeline serves the issue→PR lifecycle timeline plus derived
+// handleLifecycleTimeline serves the issue→PR lifecycle journeys plus derived
 // fleet health as JSON. It is additive and read-only; an empty store yields
 // empty arrays (never null), so the dashboard can render unconditionally.
 //
 // Query params:
 //
-//	limit  — max recent events to return (default lifecycleTimelineDefaultLimit)
+//	limit  — max journeys to return (default lifecycleTimelineDefaultLimit)
 //	window — fleet-health look-back, in minutes (default timeline.DefaultFleetWindow)
 func (s *Server) handleLifecycleTimeline(w http.ResponseWriter, r *http.Request) {
 	limit := lifecycleTimelineDefaultLimit
@@ -1380,13 +1417,15 @@ func (s *Server) handleLifecycleTimeline(w http.ResponseWriter, r *http.Request)
 	store := s.LifecycleTimeline()
 	dto := store.Snapshot(limit, window)
 	if level := s.lifecycleACMMLevel(); level > 0 {
-		dto.Events = filterTimelineEventsByACMMLevel(dto.Events, level)
-		dto.Fleet = fleetHealthForTimelineEvents(store.Recent(0), window, level)
+		dto.Journeys = filterJourneysByACMMLevel(dto.Journeys, level)
+		// Re-derive fleet counts over the FULL filtered journey set (not the
+		// limit-truncated one) so the counters match what the level may see.
+		dto.Fleet = timeline.DeriveFleetHealth(filterJourneysByACMMLevel(store.Journeys(0), level), window)
 	}
 	// Defensive nil-guard: Snapshot already guarantees a non-nil slice, but
 	// keep the endpoint's array-always contract explicit.
-	if dto.Events == nil {
-		dto.Events = []timeline.Event{}
+	if dto.Journeys == nil {
+		dto.Journeys = []timeline.Journey{}
 	}
 	jsonResponse(w, dto)
 }
@@ -1398,53 +1437,17 @@ func (s *Server) lifecycleACMMLevel() int {
 	return detectACMMLevel(s.deps.Config)
 }
 
-func filterTimelineEventsByACMMLevel(events []timeline.Event, level int) []timeline.Event {
-	filtered := make([]timeline.Event, 0, len(events))
-	for _, event := range events {
-		if agent.AgentAvailableAtACMMLevel(event.Agent, level) {
-			filtered = append(filtered, event)
+// filterJourneysByACMMLevel drops journeys whose most recent agent is not
+// available at the given maturity level (the operability agents below L5).
+// Journeys with no agent yet (enumerated/classified only) always pass.
+func filterJourneysByACMMLevel(journeys []timeline.Journey, level int) []timeline.Journey {
+	filtered := make([]timeline.Journey, 0, len(journeys))
+	for _, j := range journeys {
+		if agent.AgentAvailableAtACMMLevel(j.Agent, level) {
+			filtered = append(filtered, j)
 		}
 	}
 	return filtered
-}
-
-func fleetHealthForTimelineEvents(events []timeline.Event, window time.Duration, level int) timeline.FleetHealth {
-	if window <= 0 {
-		window = timeline.DefaultFleetWindow
-	}
-	fh := timeline.FleetHealth{WindowMs: window.Milliseconds()}
-	cutoff := time.Now().Add(-window).UnixMilli()
-	merged := map[string]bool{}
-	blocked := map[string]bool{}
-	active := map[string]bool{}
-	for _, event := range events {
-		if event.At < cutoff || !agent.AgentAvailableAtACMMLevel(event.Agent, level) {
-			continue
-		}
-		fh.Events++
-		if event.IssueRef == "" {
-			continue
-		}
-		switch event.Kind {
-		case timeline.KindMerged:
-			merged[event.IssueRef] = true
-		case timeline.KindBlocked:
-			blocked[event.IssueRef] = true
-		default:
-			active[event.IssueRef] = true
-		}
-	}
-	for ref := range merged {
-		fh.Merged++
-		delete(active, ref)
-		delete(blocked, ref)
-	}
-	for ref := range blocked {
-		fh.Blocked++
-		delete(active, ref)
-	}
-	fh.InFlight = len(active)
-	return fh
 }
 
 func (s *Server) handleWidget(w http.ResponseWriter, r *http.Request) {
@@ -1686,6 +1689,44 @@ func (s *Server) claimAgentFieldOwnership(name, model, backend string) {
 	s.ClearSystemAlert("agent-field-save-failed")
 }
 
+// claimAgentPauseOwnership marks name's pause/run state operator-owned and
+// persists the marker to hive.yaml and the per-agent overlay — the same
+// two-layer durability as claimAgentFieldOwnership above, and for the same
+// reason: for managed agents the overlay replaces the hive.yaml entry on every
+// config load, so a marker written to only one layer does not survive. An
+// operator-owned pause state makes the agent immune to the ACMM pack
+// visibility sweep's "agent not in pack level N" pause (#5706). A no-op when
+// the claim is already recorded, so a routine resume does not rewrite config.
+func (s *Server) claimAgentPauseOwnership(name string) {
+	if s.deps == nil || s.deps.Config == nil {
+		return
+	}
+	ac, ok := s.deps.Config.Agents[name]
+	if !ok || ac.PauseIsOperatorOwned() {
+		return
+	}
+	ac.PauseOwner = config.FieldOwnerOperator
+	s.deps.Config.Agents[name] = ac
+	_ = s.deps.AgentMgr.UpdateConfig(name, ac)
+	if err := s.saveConfig(); err != nil {
+		s.deps.Logger.Error("failed to persist pause-state ownership", "agent", name, "error", err)
+		s.AddSystemAlert("agent-pause-owner-save-failed", "error",
+			"Could not record that you resumed "+name+" — an ACMM pack apply may re-pause it on the next restart: "+err.Error())
+		return
+	}
+	if ac.Managed {
+		if agentsDir := s.deps.Config.Data.AgentsDir; agentsDir != "" {
+			if err := config.SaveAgentFile(agentsDir, name, ac); err != nil {
+				s.deps.Logger.Error("failed to persist pause-state ownership to agent overlay", "agent", name, "error", err)
+				s.AddSystemAlert("agent-pause-owner-save-failed", "error",
+					"Could not record that you resumed "+name+" in its agent overlay — an ACMM pack apply may re-pause it on the next config load: "+err.Error())
+				return
+			}
+		}
+	}
+	s.ClearSystemAlert("agent-pause-owner-save-failed")
+}
+
 // validateModelForAgent rejects a model the agent's effective backend does not
 // offer, so an unhonorable choice surfaces as a 400 the operator can see
 // instead of silently degrading to a default at launch time.
@@ -1896,6 +1937,12 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// An explicit operator resume claims ownership of the agent's pause state
+	// (#5706). Without the claim, the ACMM pack visibility sweep that runs on
+	// every restart re-paused any non-pack agent as "agent not in pack level
+	// N" — so this resume silently lasted only until the next pod roll.
+	s.claimAgentPauseOwnership(name)
 
 	s.auditFromRequest(r, "resume", "", name)
 	s.refreshAndPersist()
@@ -2115,9 +2162,10 @@ func (s *Server) handleResetRestarts(w http.ResponseWriter, r *http.Request) {
 // --- Token access audit log ---
 
 const (
-	tokenAccessLogPath    = "/var/run/hive-metrics/token-access.jsonl"
 	tokenAccessMaxEntries = 100
 )
+
+var tokenAccessLogPath = "/var/run/hive-metrics/token-access.jsonl"
 
 func (s *Server) handleTokenAccess(w http.ResponseWriter, r *http.Request) {
 	// SECURITY (#3936, CWE-284): the token-access log records every gh CLI
@@ -2292,21 +2340,62 @@ func (s *Server) handleGHUserAuthStart(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Bind the flow to THIS caller. Both start and poll are public
+	// (isPublicPath), and the session cookie is minted on the POLL response —
+	// so without a client-held secret, any unauthenticated poller could race
+	// the legitimate operator and walk away with their freshly approved
+	// session. flow_id is that secret: crypto-random, returned only to the
+	// caller who started the flow, and required (constant-time) on every poll.
+	// The GitHub device_code stays server-side as before.
+	flowID, err := newDeviceFlowID()
+	if err != nil {
+		jsonError(w, "failed to start device flow", http.StatusInternalServerError)
+		return
+	}
 	s.deviceFlowState = state
+	s.deviceFlowID = flowID
 	s.auditFromRequest(r, "gh_auth_start", "", "")
 	jsonResponse(w, map[string]interface{}{
 		"user_code":        state.UserCode,
 		"verification_uri": state.VerificationURI,
 		"expires_in":       state.ExpiresIn,
 		"interval":         state.Interval,
+		"flow_id":          flowID,
 	})
 }
 
+// newDeviceFlowID mints the opaque per-flow secret handed to the client that
+// starts a device flow. 128 bits of crypto randomness, hex-encoded.
+func newDeviceFlowID() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := cryptorand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
 func (s *Server) handleGHUserAuthPoll(w http.ResponseWriter, r *http.Request) {
+	// Read the caller's flow binding BEFORE taking the lock — decodeBody does
+	// network I/O and must not serialize behind another poll's GitHub call.
+	var pollReq struct {
+		FlowID string `json:"flow_id"`
+	}
+	_ = decodeBody(r, &pollReq) // absent/invalid body leaves FlowID empty; enforced below
+
 	s.deviceFlowMu.Lock()
 	defer s.deviceFlowMu.Unlock()
 
 	if s.deviceFlowState == nil {
+		jsonError(w, "no device flow in progress — call /api/gh-user-auth/start first", http.StatusBadRequest)
+		return
+	}
+	// Enforce the client binding whenever this flow was minted with one (every
+	// flow started through handleGHUserAuthStart is). A poll that cannot prove
+	// it started the flow gets nothing — in particular it must never be the
+	// request the session cookie is set on. Constant-time compare: flow_id is
+	// a secret. State stays intact so the legitimate holder's polls proceed.
+	if s.deviceFlowID != "" &&
+		subtle.ConstantTimeCompare([]byte(pollReq.FlowID), []byte(s.deviceFlowID)) != 1 {
 		jsonError(w, "no device flow in progress — call /api/gh-user-auth/start first", http.StatusBadRequest)
 		return
 	}
@@ -2315,6 +2404,7 @@ func (s *Server) handleGHUserAuthPoll(w http.ResponseWriter, r *http.Request) {
 	token, status, err := github.PollDeviceFlow(clientID, s.deviceFlowState.DeviceCode, s.deps.Config.GitHub.OAuthBaseURL(), s.deps.Config.GitHub.OAuthAPIURL())
 	if err != nil {
 		s.deviceFlowState = nil
+		s.deviceFlowID = ""
 		jsonResponse(w, map[string]interface{}{"status": "error", "error": err.Error()})
 		return
 	}
@@ -2334,6 +2424,7 @@ func (s *Server) handleGHUserAuthPoll(w http.ResponseWriter, r *http.Request) {
 	user, err := github.ValidateToken(token, s.deps.Config.GitHub.OAuthAPIURL())
 	if err != nil || user == nil || user.Login == "" {
 		s.deviceFlowState = nil
+		s.deviceFlowID = ""
 		// Audit the failed login so the owner can see attempts that never got
 		// far enough to resolve a GitHub identity. Actor is "unknown" because we
 		// could not verify who they are.
@@ -2342,6 +2433,7 @@ func (s *Server) handleGHUserAuthPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.deviceFlowState = nil
+	s.deviceFlowID = ""
 	username := user.Login
 	avatarURL := user.AvatarURL
 
@@ -2621,22 +2713,31 @@ func (s *Server) handleGHUserAuthLogout(w http.ResponseWriter, r *http.Request) 
 	// Clear only THIS request's session so logging out affects one user, not
 	// everyone. Removing the disk token only makes sense when the logging-out
 	// user is the one whose token is persisted (the owner/last-authenticated
-	// user); on a direct-route spoke a read-only viewer logging out must not
-	// wipe the owner's persisted token.
+	// user); an anonymous POST must never wipe the owner's persisted token.
 	var loggedOut, loggedOutRole string
-	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
-		if sess := s.lookupSession(c.Value); sess != nil {
-			loggedOut = sess.Username
-			loggedOutRole = sess.Role
-		}
-		s.deleteSession(c.Value)
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil || c.Value == "" {
+		clearSessionCookie(w)
+		jsonError(w, "GitHub user session required", http.StatusUnauthorized)
+		return
 	}
+	sess := s.lookupSession(c.Value)
+	if sess == nil {
+		s.deleteSession(c.Value)
+		clearSessionCookie(w)
+		jsonError(w, "GitHub user session required", http.StatusUnauthorized)
+		return
+	}
+	loggedOut = sess.Username
+	loggedOutRole = sess.Role
+	s.deleteSession(c.Value)
+
 	// Only clear the persisted GitHub token when the logging-out user is the
 	// owner (read-write). Use the role bound to the session at login time — not
 	// a fresh config lookup — so a later allowlist change can't leave a
 	// logging-out owner's own token stranded on disk. Viewer logouts leave the
 	// hive's user client intact.
-	if !s.directRouteAuthzEnabled() || loggedOutRole == config.RoleOwner {
+	if loggedOutRole == config.RoleOwner {
 		if err := os.Remove(userTokenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			s.deps.Logger.Error("GitHub user token removal failed", "error", err)
 			jsonError(w, "failed to remove persisted GitHub credentials", http.StatusInternalServerError)
@@ -3614,6 +3715,16 @@ func (s *Server) handleAgentConfigGeneral(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	// Refuse to persist a backend/launch_cmd contradiction (#5921): saved
+	// silently, it produces an agent launched as one CLI but health-checked
+	// and diagnosed as another, relaunched as "hung" forever. Checked here —
+	// after every field edit above — so a save changing either half (or both)
+	// is judged on the final combination.
+	if err := s.deps.Config.Governor.ValidateLaunchCmdBackend(agentCfg.Backend, agentCfg.LaunchCmd); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	prevAgents := make(map[string]config.AgentConfig, len(s.deps.Config.Agents))
 	for k, v := range s.deps.Config.Agents {
 		prevAgents[k] = v
@@ -3726,6 +3837,11 @@ func (s *Server) handleAgentConfigCadences(w http.ResponseWriter, r *http.Reques
 			mode.Cadences[name] = cadence
 		}
 		s.deps.Config.Governor.Modes[modeName] = mode
+		// Operator edits claim ownership so the pack apply that runs on every
+		// restart (and on steady-state re-applies) cannot reconcile the cadence
+		// back to the pack default — the same contract model/backend edits
+		// already have (#5632).
+		s.deps.Config.Governor.ClaimCadenceOwnership(modeName, name)
 	}
 
 	if err := s.saveConfig(); err != nil {
@@ -4061,7 +4177,7 @@ func (s *Server) handleAgentPrompt(w http.ResponseWriter, r *http.Request) {
 		template = s.loadPromptTemplate(name)
 	}
 
-	const repoBaseURL = "https://github.com/kubestellar/hive/blob/HEAD/"
+	const repoBaseURL = "https://github.com/hivecommons/hive/blob/HEAD/"
 	sourceFiles := []map[string]string{}
 
 	templateName := ""
@@ -6157,8 +6273,11 @@ func (s *Server) handleGovernorRepos(w http.ResponseWriter, r *http.Request) {
 	// restore it — the "always exactly one default" guard below runs once the
 	// final repos+primary are known, and a reject must not leave a half-applied
 	// config in memory (which would then be persisted on the next unrelated save).
+	prevOrg := s.deps.Config.Project.Org
 	prevRepos := append([]string(nil), s.deps.Config.Project.Repos...)
 	prevPrimary := s.deps.Config.Project.PrimaryRepo
+	prevBaseURL := s.deps.Config.GitHub.BaseURL
+	prevAPIURL := s.deps.Config.GitHub.APIURL
 
 	spokeHost := s.hiveForgeHost()
 	validateRepos := prevRepos
@@ -6169,18 +6288,26 @@ func (s *Server) handleGovernorRepos(w http.ResponseWriter, r *http.Request) {
 	if body.PrimaryRepo != nil {
 		validatePrimary = *body.PrimaryRepo
 	}
-	// Normalize org-qualified entries ("myorg/myrepo" under org "myorg") to the
-	// bare repo name BEFORE validating, so the accepted value and the persisted
-	// value are the same shape. Without this an owner pasting the org/repo form
-	// GitHub shows everywhere is rejected with a 400 here, or — worse, on paths
-	// that skip this handler — persisted org-qualified and then resolved as
-	// "org/org/repo", which fails every agent. An entry qualified with a
-	// different org is left untouched and still 400s below.
-	validateRepos, _ = config.NormalizeProjectRepos(org, validateRepos)
-	validatePrimary, _ = config.NormalizeRepoForOrg(org, validatePrimary)
-	if issue := config.ValidateProjectRepoTargets(org, validateRepos, validatePrimary, spokeHost); issue != nil {
+	adoptOrg := org
+	if nextOrg, errMsg := governorReposAdoptOrg(org, validateRepos, validatePrimary, spokeHost); errMsg != "" {
+		jsonError(w, errMsg, http.StatusBadRequest)
+		return
+	} else if nextOrg != "" {
+		adoptOrg = nextOrg
+	}
+	validateRepos = normalizeGovernorRepoRefs(adoptOrg, validateRepos)
+	validatePrimary = normalizeGovernorRepoRef(adoptOrg, validatePrimary)
+	if issue := config.ValidateProjectRepoTargets(adoptOrg, validateRepos, validatePrimary, spokeHost); issue != nil {
 		jsonError(w, issue.Message, http.StatusBadRequest)
 		return
+	}
+	if adoptOrg != org {
+		s.logger.Info("project org changed from repo paste", "from", org, "to", adoptOrg)
+		org = adoptOrg
+		s.deps.Config.Project.Org = adoptOrg
+		if s.deps.GHClient != nil {
+			s.deps.GHClient.SetOrg(adoptOrg)
+		}
 	}
 	// Feed the normalized values back into the body so the persistence code
 	// below stores bare names even when its own url-parse branch does not fire.
@@ -6189,18 +6316,6 @@ func (s *Server) handleGovernorRepos(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.PrimaryRepo != nil {
 		body.PrimaryRepo = &validatePrimary
-	}
-	for _, ref := range body.Repos {
-		if h := repoRefHostLabel(ref); h != "" && !sameForgeHost(h, spokeHost) {
-			jsonError(w, fmt.Sprintf("repo %q is on %s but this hive is on %s — a hive's repos must all be on one GitHub host. Remove the mismatched repo or use a repo on %s.", strings.TrimSpace(ref), h, spokeHost, spokeHost), http.StatusBadRequest)
-			return
-		}
-	}
-	if body.PrimaryRepo != nil {
-		if h := repoRefHostLabel(*body.PrimaryRepo); h != "" && !sameForgeHost(h, spokeHost) {
-			jsonError(w, fmt.Sprintf("default repo %q is on %s but this hive is on %s — the default must live on this hive's forge.", strings.TrimSpace(*body.PrimaryRepo), h, spokeHost), http.StatusBadRequest)
-			return
-		}
 	}
 
 	if len(body.Repos) > 0 {
@@ -6273,9 +6388,13 @@ func (s *Server) handleGovernorRepos(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if primary == "" || !inList {
+			s.deps.Config.Project.Org = prevOrg
 			s.deps.Config.Project.Repos = prevRepos
 			s.deps.Config.Project.PrimaryRepo = prevPrimary
+			s.deps.Config.GitHub.BaseURL = prevBaseURL
+			s.deps.Config.GitHub.APIURL = prevAPIURL
 			if s.deps.GHClient != nil {
+				s.deps.GHClient.SetOrg(prevOrg)
 				s.deps.GHClient.SetRepos(prevRepos)
 			}
 			jsonError(w, "set a default repo before saving — one of the monitored repos must be marked as the default (the repo where the advisory issue is maintained)", http.StatusBadRequest)
@@ -6300,6 +6419,79 @@ func (s *Server) handleGovernorRepos(w http.ResponseWriter, r *http.Request) {
 // against, and mirrors config.GitHubConfig.HostLabel() (the same value the
 // dashboard reads as github_base_url's host). Falls back to public github.com
 // when no config is loaded (tests/early boot).
+
+type parsedGovernorRepoRef struct {
+	Owner string
+	Name  string
+	Host  string
+	OK    bool
+}
+
+func parseGovernorRepoRef(ref string) parsedGovernorRepoRef {
+	trimmed := strings.TrimSpace(ref)
+	if trimmed == "" {
+		return parsedGovernorRepoRef{}
+	}
+	if parsed, err := url.Parse(trimmed); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		parts := strings.SplitN(strings.TrimPrefix(parsed.Path, "/"), "/", 3)
+		if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+			return parsedGovernorRepoRef{Owner: parts[0], Name: parts[1], Host: strings.ToLower(parsed.Host), OK: true}
+		}
+		return parsedGovernorRepoRef{Host: strings.ToLower(parsed.Host)}
+	}
+	stripped := strings.Trim(trimmed, "/")
+	parts := strings.Split(stripped, "/")
+	if len(parts) >= 3 && strings.Contains(parts[0], ".") && parts[1] != "" && parts[2] != "" {
+		return parsedGovernorRepoRef{Owner: parts[1], Name: parts[2], Host: strings.ToLower(parts[0]), OK: true}
+	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] != "" && !strings.Contains(parts[0], ".") {
+		return parsedGovernorRepoRef{Owner: parts[0], Name: parts[1], OK: true}
+	}
+	return parsedGovernorRepoRef{}
+}
+
+func governorReposAdoptOrg(currentOrg string, repos []string, primary, spokeHost string) (string, string) {
+	adoptOrg := strings.TrimSpace(currentOrg)
+	refs := append([]string{}, repos...)
+	if strings.TrimSpace(primary) != "" {
+		refs = append(refs, primary)
+	}
+	for _, ref := range refs {
+		parsed := parseGovernorRepoRef(ref)
+		if parsed.Host != "" && !sameForgeHost(parsed.Host, spokeHost) {
+			return "", fmt.Sprintf("repo %q is on %s but this hive is on %s — a hive's repos must all be on one GitHub host. Remove the mismatched repo or use a repo on %s.", strings.TrimSpace(ref), parsed.Host, spokeHost, spokeHost)
+		}
+		if !parsed.OK || parsed.Owner == "" || strings.EqualFold(parsed.Owner, currentOrg) {
+			continue
+		}
+		if adoptOrg != "" && !strings.EqualFold(adoptOrg, currentOrg) && !strings.EqualFold(adoptOrg, parsed.Owner) {
+			return "", fmt.Sprintf("repos name multiple GitHub orgs (%s and %s). A hive can monitor one org at a time; submit repos from a single destination org to migrate.", adoptOrg, parsed.Owner)
+		}
+		adoptOrg = parsed.Owner
+	}
+	return adoptOrg, ""
+}
+
+func normalizeGovernorRepoRefs(org string, repos []string) []string {
+	if len(repos) == 0 {
+		return repos
+	}
+	out := make([]string, len(repos))
+	for i, repo := range repos {
+		out[i] = normalizeGovernorRepoRef(org, repo)
+	}
+	return out
+}
+
+func normalizeGovernorRepoRef(org, ref string) string {
+	parsed := parseGovernorRepoRef(ref)
+	if parsed.OK && parsed.Name != "" && (parsed.Owner == "" || strings.EqualFold(parsed.Owner, org)) {
+		return parsed.Name
+	}
+	normalized, _ := config.NormalizeRepoForOrg(org, ref)
+	return normalized
+}
+
 func (s *Server) hiveForgeHost() string {
 	if s.deps != nil && s.deps.Config != nil {
 		return s.deps.Config.GitHub.HostLabel()
@@ -6872,7 +7064,7 @@ func (s *Server) handleSidebarSet(w http.ResponseWriter, r *http.Request) {
 	okResponse(w, map[string]string{"status": "updated"})
 }
 
-const sidebarFile = "/data/sidebar.json"
+var sidebarFile = "/data/sidebar.json"
 
 func (s *Server) loadSidebarFromDisk() {
 	data, err := os.ReadFile(sidebarFile)

@@ -190,7 +190,7 @@ puts the operator's files where each mode already expects them.
 
 `%E` is the difference the unit file *shows* you. There is a second one it
 could not show, and it is why the units are no longer wanted by
-`default.target` ([#4478](https://github.com/kubestellar/hive/issues/4478)):
+`default.target` ([#4478](https://github.com/hivecommons/hive/issues/4478)):
 the two modes read that line differently.
 
 | | `[Install] WantedBy=default.target` would mean | A Hive that never becomes healthy |
@@ -303,7 +303,7 @@ systemd's leading `-` optional-file prefix here — see
 `EnvironmentFile=` is opaque: the unit names a path and nothing in the unit says
 what belongs in it, so a variable added to `src/docker-compose.yaml` used to
 reach Docker and silently never reach Podman. `src/deploy/
-test_standalone_runtime_parity.sh` ([#4404](https://github.com/kubestellar/hive/issues/4404))
+test_standalone_runtime_parity.sh` ([#4404](https://github.com/hivecommons/hive/issues/4404))
 asserts the two lists are the same set, so that divergence now fails CI. Add a
 variable to both or to neither.
 
@@ -417,7 +417,7 @@ sudo systemctl enable hive.service
 ```
 
 The boot wiring has two halves since
-[#4478](https://github.com/kubestellar/hive/issues/4478):
+[#4478](https://github.com/hivecommons/hive/issues/4478):
 
 1. `[Install] WantedBy=hive-boot.target` inside `hive.container` and
    `hive-gateway.container`. The generator turns it into
@@ -593,7 +593,7 @@ the measured difference.
 
 `README.md`'s Quick Start (Podman) asserts *"Docker is not required and is not
 used."* That was a design statement. This is the measurement, and it closes one
-of [#4188](https://github.com/kubestellar/hive/issues/4188)'s acceptance criteria
+of [#4188](https://github.com/hivecommons/hive/issues/4188)'s acceptance criteria
 — **but not the other**; see [what stays open](#what-this-does-not-establish)
 below.
 
@@ -655,7 +655,7 @@ because it is a deviation, though cloning is not what is under test.
 | `bin/hive-podman-preflight-ids.sh` | `pass=4 warn=0 fail=0` |
 | config + secrets staging, `dashboard.port` rewrite | `port:3002` |
 | `HIVE_SRC_DIR="$CONF" bin/hive-podman-preflight-host.sh` | `pass=8 warn=3 fail=0` |
-| `podman pull ghcr.io/kubestellar/hive:stable` | exit 0 |
+| `podman pull ghcr.io/hivecommons/hive:stable` | exit 0 |
 | four `install -Dm644` + `daemon-reload` | all four services `generated` |
 | `systemctl --user start hive-gateway.service` | **exit 0, 13s** |
 
@@ -669,7 +669,7 @@ Id=hive-gateway.service  ActiveState=active  SubState=running  Result=success
 $ curl -sf http://127.0.0.1:3001/api/health
 {"status":"ok"}
 
-hive          Up 28 seconds (healthy)  ghcr.io/kubestellar/hive:stable
+hive          Up 28 seconds (healthy)  ghcr.io/hivecommons/hive:stable
 hive-gateway  Up 17 seconds (healthy)  docker.io/library/nginx@sha256:4a73073b…
 ```
 
@@ -757,7 +757,7 @@ drop-in, `hive.container.d/10-image.conf`, which that page describes. A floating
 tag is not something you can roll back to, so pin before you need to.
 
 A **live rootless start was performed** on Fedora 44, Podman 5.8.4, cgroup v2,
-SELinux enforcing, against the real `ghcr.io/kubestellar/hive:stable` image:
+SELinux enforcing, against the real `ghcr.io/hivecommons/hive:stable` image:
 
 | | Observed |
 | --- | --- |
@@ -772,7 +772,7 @@ SELinux enforcing, against the real `ghcr.io/kubestellar/hive:stable` image:
 
 The gateway and network units were started live in the same way — Fedora 44,
 Podman 5.8.4 rootless, netavark, cgroup v2, SELinux enforcing, against the real
-`ghcr.io/kubestellar/hive:stable` and the digest-pinned `nginx:alpine`.
+`ghcr.io/hivecommons/hive:stable` and the digest-pinned `nginx:alpine`.
 `systemctl --user start hive-gateway.service` returned **0 after 11s**, having
 pulled `hive.service` up first; both containers reported `healthy`.
 

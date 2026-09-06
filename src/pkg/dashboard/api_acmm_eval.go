@@ -13,12 +13,18 @@ import (
 
 	gh "github.com/google/go-github/v72/github"
 
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/worksource"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/worksource"
 )
 
 const acmmEvalTTL = time.Hour
+
+// acmmRefreshDebounce is the floor under `?refresh=1` (#5877): an operator-
+// forced re-evaluation still returns the cached result when the cache is
+// younger than this, so holding the Re-evaluate button down cannot spend the
+// GitHub API budget (a full refresh is up to ~29 GetContents calls per repo).
+const acmmRefreshDebounce = time.Minute
 const acmmLevelThreshold = 0.70
 const acmmEvalTimeout = 30 * time.Second
 const acmmPerRepoTimeout = 20 * time.Second
@@ -59,6 +65,7 @@ type RepoEvaluation struct {
 	Repo            string            `json:"repo"`
 	CodebaseLevel   int               `json:"codebase_level"`
 	LevelName       string            `json:"level_name"`
+	BlockedAtLevel  int               `json:"blocked_at_level"`
 	CriteriaTotal   int               `json:"criteria_total"`
 	CriteriaPassed  int               `json:"criteria_passed"`
 	CriteriaUnknown int               `json:"criteria_unknown,omitempty"`
@@ -118,12 +125,22 @@ func (s *Server) handleACMMEvaluation(w http.ResponseWriter, r *http.Request) {
 		opsName = "Unknown"
 	}
 
+	// #5877: `?refresh=1` lets the operator bypass the hour-long TTL — the
+	// panel drives a fix-and-verify loop, and a fix could not be verified for
+	// up to an hour otherwise. It bypasses the TTL, not the cache machinery:
+	// the request is served from cache when the entry is younger than the
+	// debounce window, so a forced refresh is rate-limited server-side.
+	ttl := acmmEvalTTL
+	if r.URL.Query().Get("refresh") == "1" {
+		ttl = acmmRefreshDebounce
+	}
+
 	s.acmmEvalMu.RLock()
 	cached := s.acmmEvalCache
 	cacheAge := time.Since(s.acmmEvalCachedAt)
 	s.acmmEvalMu.RUnlock()
 
-	if cached != nil && cacheAge < acmmEvalTTL {
+	if cached != nil && cacheAge < ttl {
 		result := *cached
 		result.OperationalLevel = opsLevel
 		result.OperationalName = opsName
@@ -136,7 +153,7 @@ func (s *Server) handleACMMEvaluation(w http.ResponseWriter, r *http.Request) {
 	s.acmmEvalMu.Lock()
 	defer s.acmmEvalMu.Unlock()
 
-	if s.acmmEvalCache != nil && time.Since(s.acmmEvalCachedAt) < acmmEvalTTL {
+	if s.acmmEvalCache != nil && time.Since(s.acmmEvalCachedAt) < ttl {
 		result := *s.acmmEvalCache
 		result.OperationalLevel = opsLevel
 		result.OperationalName = opsName
@@ -542,6 +559,7 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 			Repo:            repo,
 			CodebaseLevel:   scored.CodebaseLevel,
 			LevelName:       scored.CodebaseLevelName,
+			BlockedAtLevel:  acmmBlockedAtLevel(scored.Levels),
 			CriteriaTotal:   scored.CriteriaTotal,
 			CriteriaPassed:  scored.CriteriaPassed,
 			CriteriaUnknown: scored.CriteriaUnknown,
@@ -802,6 +820,15 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func acmmBlockedAtLevel(levels []ACMMLevelScore) int {
+	for _, level := range levels {
+		if !level.Passed {
+			return level.Level
+		}
+	}
+	return -1
 }
 
 // cachedCriterionVerdict returns the most recent per-repo result for one

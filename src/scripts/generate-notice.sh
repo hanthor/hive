@@ -78,8 +78,26 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Installing go-licenses@${GO_LICENSES_VERSION} (pinned)..." >&2
-go install "github.com/google/go-licenses@${GO_LICENSES_VERSION}"
+install_go_licenses() {
+  local attempt max_attempts sleep_seconds
+  max_attempts=3
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    echo "Installing go-licenses@${GO_LICENSES_VERSION} (pinned), attempt ${attempt}/${max_attempts}..." >&2
+    if go install "github.com/google/go-licenses@${GO_LICENSES_VERSION}"; then
+      return 0
+    fi
+    if (( attempt == max_attempts )); then
+      break
+    fi
+    sleep_seconds=$((attempt * 5))
+    echo "go-licenses install failed; retrying in ${sleep_seconds}s..." >&2
+    sleep "${sleep_seconds}"
+  done
+  echo "generate-notice.sh: failed to install go-licenses@${GO_LICENSES_VERSION} after ${max_attempts} attempts" >&2
+  return 1
+}
+
+install_go_licenses
 
 GOBIN="$(go env GOPATH)/bin"
 GO_LICENSES_BIN="${GOBIN}/go-licenses"
@@ -149,7 +167,7 @@ HEADER
     # reports Hive packages as unlicensed. Hive's own code does not belong in
     # a THIRD-PARTY notice regardless, so excluding it is the correct scope.
     "${GO_LICENSES_BIN}" report --template="${REPORT_TEMPLATE}" \
-      --ignore github.com/kubestellar/hive ./...
+      --ignore github.com/hivecommons/hive ./...
   # Preserve the complete text while normalizing insignificant end-of-line
   # whitespace from upstream license files, so the committed output passes
   # repository whitespace checks and stays stable across tooling/editors.

@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/snapshot"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/snapshot"
 )
 
 // restoreAgentRuntimeState replays the per-agent runtime state persisted in
@@ -130,8 +130,8 @@ func restoreAgentRuntimeState(saved *snapshot.PersistedState, cfg *config.Config
 				logger.Info("backend override restored", "agent", name, "backend", as.BackendOverride)
 			}
 		}
-		if as.RestartCount > 0 {
-			agentMgr.SeedRestartCount(name, as.RestartCount)
+		if as.RestartCount > 0 || len(as.RestartEvents) > 0 || as.LastRestartReason != "" {
+			agentMgr.SeedRestartTelemetry(name, as.RestartCount, restartEventsFromSnapshot(as.RestartEvents), as.LastRestartReason)
 		}
 		// Without this the turn-loss measurement would reset on exactly the
 		// event it exists to measure, and every spoke would permanently report

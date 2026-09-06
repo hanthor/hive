@@ -21,7 +21,7 @@ import (
 // working App that has quietly stopped posting), never on a hive that is
 // merely slow. Kept a named constant with this reasoning so the threshold is
 // not a bare magic number.
-const advisoryStaleThreshold = 90 * time.Minute
+const advisoryStaleThreshold = advisoryFreshnessStaleAfter
 
 // appCanWriteForAdvisory reports whether a hive's GitHub App is in a state that
 // COULD post an advisory digest right now. It is the "app can write" gate on
@@ -46,7 +46,18 @@ func appCanWriteForAdvisory(e RegistryEntry) bool {
 		"wrong-installation", "insufficient-permissions",
 		// #2353: a write returned 403 on an otherwise-healthy install — the App
 		// demonstrably cannot write this repo, so it is NOT writable here.
-		"write-forbidden":
+		"write-forbidden",
+		// #5774: the configured repositories were transferred to another
+		// account and the installation covers NOTHING under the configured
+		// owner (that is a required clause of the classification, see
+		// InstallationCoverage.MovedTo) — so no repo this hive is pointed at,
+		// including the advisory repo, is writable.
+		//
+		// This is deliberately NOT extended to "repo-not-covered", which sits
+		// outside this list on purpose: that state fires when ANY configured
+		// repo is unticked, which need not be the advisory one, so it is not
+		// evidence that the digest post cannot land.
+		"repo-moved":
 		return false
 	default:
 		// "ok", "unknown", or empty (spoke too old to classify) — the App is
@@ -182,47 +193,18 @@ func carryAdvisoryPostTime(entry *RegistryEntry, prev RegistryEntry) {
 // returns false — never a false alarm — matching the rule the codebase already
 // applies to StartedAt and GitHubAPIURL.
 func advisoryStale(e RegistryEntry, now time.Time) (stale bool, reason string) {
-	// Gate 1: the hive must participate in advisory posting at all. No reported
-	// post time AND no reported error means "not advisory mode / old spoke" —
-	// UNKNOWN, never stale.
-	if e.AdvisoryLastPostedAt == "" && e.AdvisoryError == "" {
+	return advisoryStaleFromFreshness(e, advisoryFreshnessFor(e, now))
+}
+
+func advisoryStaleFromFreshness(e RegistryEntry, freshness AdvisoryIssueActivity) (stale bool, reason string) {
+	if freshness.Bucket != advisoryIssueBucketStale {
 		return false, ""
 	}
-
-	// Gate 2a: a failed post attempt is a stale signal on its own, and the most
-	// specific one — surface the reported cause. Only an App that was never
-	// delivered suppresses it (#4167): gating this on the broader
-	// appCanWriteForAdvisory let a write-forbidden digest failure raise the App
-	// banner and thereby silence the very pill it should have lit.
-	if e.AdvisoryError != "" {
-		if appAwaitingDelivery(e) {
-			return false, ""
-		}
+	if e.AdvisoryError != "" && !appAwaitingDelivery(e) {
 		return true, "last advisory post failed: " + e.AdvisoryError
 	}
-
-	// Gate 2b: with no error reported, an App that cannot write is expected to
-	// be quiet, not broken.
-	if !appCanWriteForAdvisory(e) {
-		return false, ""
-	}
-
-	// Gate 2c: with no error reported and EVERY agent deliberately quiet
-	// (paused / off-schedule), an ageing digest is the expected consequence of
-	// the operator's own pause — findings come from agents, and none are
-	// running to produce them. Not a fault, never a pill.
-	if allAgentsQuietByDesign(e) {
-		return false, ""
-	}
-
-	// Gate 3: no error, so decide on age. An unparseable timestamp is treated
-	// as UNKNOWN (not stale) so a malformed spoke value never false-alarms.
-	postedAt, err := time.Parse(time.RFC3339, e.AdvisoryLastPostedAt)
-	if err != nil {
-		return false, ""
-	}
-	if now.Sub(postedAt) > advisoryStaleThreshold {
+	if postedAt, ok := advisoryDigestLastActivity(e); ok {
 		return true, "advisory digest has not updated since " + postedAt.UTC().Format(time.RFC3339)
 	}
-	return false, ""
+	return true, "advisory digest has gone stale"
 }

@@ -5,7 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/inferencehealth"
 )
 
 // Hive-health verdict: does this spoke have RECENT OUTPUT back to its work
@@ -117,6 +118,12 @@ func hiveHealthBase(e RegistryEntry, rollup agentFleetRollup, app GitHubAppHealt
 	// every level that is expected to produce anything (L2+). At L1 there is no
 	// output to enable, so a precondition gap is not a health fault. ---
 	if e.ACMMLevel > acmmInceptionMax {
+		if gw, ok := mostRecentGatewayFaultForAgents(e.GatewayHealth, e.Agents); ok {
+			v.State = HealthStateRed
+			v.cause = causeInferenceGateway
+			v.Reason = inferencehealth.Reason(gw)
+			return v
+		}
 		if app.Bucket == ghAppBucketBroken {
 			v.State = HealthStateRed
 			v.cause = causeAppBroken
@@ -124,14 +131,21 @@ func hiveHealthBase(e RegistryEntry, rollup agentFleetRollup, app GitHubAppHealt
 			// "repo-not-covered" (App installed but this repo not ticked) needs
 			// a completely different remedy than a missing/invalid key.
 			if st := strings.TrimSpace(e.GitHubAppState); st != "" && st != GitHubAppTokenStatusOK && st != "unknown" {
-				v.Reason = "GitHub App: " + st
+				if detail := strings.TrimSpace(app.Detail); detail != "" {
+					v.Reason = detail
+				} else {
+					v.Reason = "GitHub App: " + st
+				}
+			} else if detail := strings.TrimSpace(app.Detail); detail != "" {
+				v.Reason = detail
 			} else {
 				v.Reason = "GitHub App broken"
 			}
 			return v
 		}
-		if reason := strings.TrimSpace(e.ProviderLimitReason); reason != "" {
+		if reason := strings.TrimSpace(e.ProviderLimitReason); reason != "" && e.ProviderLimitHiveWide {
 			v.State = HealthStateRed
+			v.cause = causeProviderQuota
 			v.Reason = providerLimitHealthReason(reason, e.ProviderLimitRebuffs)
 			return v
 		}
@@ -171,6 +185,7 @@ func hiveHealthBase(e RegistryEntry, rollup agentFleetRollup, app GitHubAppHealt
 			v.State = HealthStateRed
 			switch {
 			case rollup.QuotaExhausted == rollup.Problems:
+				v.cause = causeProviderQuota
 				v.Reason = fmt.Sprintf("%d agent(s) out of provider quota", rollup.QuotaExhausted)
 			case rollup.LoginStuck == rollup.Problems:
 				// Every blocked agent is wedged at a login prompt: name the one
@@ -178,11 +193,24 @@ func hiveHealthBase(e RegistryEntry, rollup agentFleetRollup, app GitHubAppHealt
 				// count — the EPM/alchemy at-a-glance case.
 				v.cause = causeLoginStuck
 				v.Reason = fmt.Sprintf("%d agent(s) stuck at login — re-login needed", rollup.LoginStuck)
+			case rollup.StartFailures == rollup.Problems:
+				if rollup.StartFailures == 1 && rollup.StartFailureReason != "" && rollup.StartFailureReason != "mixed" {
+					v.Reason = rollup.StartFailureReason
+				} else {
+					v.Reason = fmt.Sprintf("%d agent(s) starting failed — see agent verdicts", rollup.StartFailures)
+				}
+			case rollup.RestartStorms == rollup.Problems:
+				if rollup.RestartStorms == 1 && rollup.RestartStormReason != "" && rollup.RestartStormReason != "mixed" {
+					v.Reason = rollup.RestartStormReason
+				} else {
+					v.Reason = fmt.Sprintf("%d agent(s) restarting repeatedly — see agent verdicts", rollup.RestartStorms)
+				}
 			case rollup.DeadOrGone == rollup.Problems:
 				// Katamari/ibm-aiops-orchestrator live shapes: failed/dead agents
 				// need a restart whether the outage is partial or every expected
 				// agent is down. Name that cause instead of the generic "blocked"
 				// or "no agents running" wording.
+				v.cause = causeAgentsDown
 				v.Reason = fmt.Sprintf("%d agent(s) down — restart needed", rollup.DeadOrGone)
 			case rollup.IdleWithWork == rollup.Problems:
 				// Sessions are alive but every scheduled agent is sitting past
@@ -206,6 +234,7 @@ func hiveHealthBase(e RegistryEntry, rollup agentFleetRollup, app GitHubAppHealt
 				// still, queued work will not move until somebody resumes them, so
 				// amber is more honest than the green "off by schedule" verdict.
 				v.State = HealthStateAmber
+				v.cause = causeAllPaused
 				v.Reason = "all agents paused — resume to produce output"
 				return v
 			}
@@ -250,9 +279,10 @@ func hiveHealthBase(e RegistryEntry, rollup agentFleetRollup, app GitHubAppHealt
 				return noWritersOnDuty(v, "advisory", roster)
 			}
 		}
-		// Reuse the existing advisory/issue-activity bucketing rather than the
-		// per-repo activity collector.
-		adv := advisoryIssueActivityFor(e, now)
+		// Reuse the same advisory-digest freshness bucketing that drives the
+		// fleet chip and stale-advisory pill rather than the per-repo activity
+		// collector.
+		adv := advisoryFreshnessFor(e, now)
 		v.LastOutputAt = adv.LastActivityAt
 		// A reported post error is a harder signal than any timestamp: the
 		// spoke PROVED the digest is wedged. Stale/unknown buckets must not
@@ -288,7 +318,7 @@ func hiveHealthBase(e RegistryEntry, rollup agentFleetRollup, app GitHubAppHealt
 			return noWritersOnDuty(v, "merge", roster)
 		}
 		last, ok := newestOutput(e.RepoActivity, func(r RepoActivityWire) string { return r.Merges.NewestAt })
-		return bandFreshness(v, last, ok, queuedWork, now, "merge")
+		return explainOutputFreshness(e, bandFreshness(v, last, ok, queuedWork, now, "merge"), queuedWork, now)
 
 	default:
 		// L3–L5: judged on authored WRITES to the work source — issue/PR
@@ -306,7 +336,7 @@ func hiveHealthBase(e RegistryEntry, rollup agentFleetRollup, app GitHubAppHealt
 			return maxRFC3339(maxRFC3339(r.Issues.NewestAt, r.PRs.NewestAt),
 				maxRFC3339(r.Comments.NewestAt, r.Reviews.NewestAt))
 		})
-		verdict := bandFreshness(v, last, ok, queuedWork, now, "write")
+		verdict := explainOutputFreshness(e, bandFreshness(v, last, ok, queuedWork, now, "write"), queuedWork, now)
 		// A stale write stream is NOT an agent fault when the hive's output is
 		// parked on the HUMAN side of the gate: hold-labeled PRs awaiting
 		// review mean the agents produced, then correctly stood down to avoid
@@ -324,6 +354,70 @@ func hiveHealthBase(e RegistryEntry, rollup agentFleetRollup, app GitHubAppHealt
 		}
 		return verdict
 	}
+}
+
+func explainOutputFreshness(e RegistryEntry, v HealthVerdict, queuedWork int, now time.Time) HealthVerdict {
+	if v.State != HealthStateRed || !v.staleOutput {
+		return v
+	}
+	disposition := strings.TrimSpace(e.LastKickDisposition)
+	reason := strings.TrimSpace(e.LastKickSkipReason)
+	switch disposition {
+	case "advisory-only":
+		v.State = HealthStateAmber
+		v.staleOutput = false
+		if reason == "" {
+			reason = "ACMM advisory band produces advisory output, not writes"
+		}
+		v.Reason = "advisory-only — " + reason
+		return v
+	case "idle", "no-due-agents":
+		v.State = HealthStateAmber
+		v.staleOutput = false
+		if reason == "" {
+			reason = "no write-capable agents due"
+		}
+		v.Reason = "nothing to write — governor idle" + outputIdleSince(e.LastWriteCapableKickAt, now) + " because " + reason
+		return v
+	case "budget-suppressed":
+		v.State = HealthStateAmber
+		v.staleOutput = false
+		if reason == "" {
+			reason = "budget suppressed kicks"
+		}
+		v.Reason = "nothing written — " + reason
+		return v
+	case "agent-decided-not-writable":
+		v.State = HealthStateAmber
+		v.staleOutput = false
+		n := e.NotWritableQueued
+		if n <= 0 {
+			n = queuedWork
+		}
+		if n > 0 {
+			v.Reason = fmt.Sprintf("nothing writable — %d queued deemed not writable", n)
+		} else if reason != "" {
+			v.Reason = "nothing writable — " + reason
+		} else {
+			v.Reason = "nothing writable — agents declined write"
+		}
+		return v
+	case "kick-capable":
+		if !e.LastWriteCapableKickAt.IsZero() && now.Sub(e.LastWriteCapableKickAt) <= healthRecencyWindow {
+			v.Reason = fmt.Sprintf("pipeline broken — write-capable kick %s but no writes (%d queued)",
+				humanizeAge(now.Sub(e.LastWriteCapableKickAt)), queuedWork)
+		}
+		return v
+	default:
+		return v
+	}
+}
+
+func outputIdleSince(t time.Time, now time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return " since " + t.UTC().Format(time.RFC3339) + " (" + humanizeAge(now.Sub(t)) + ")"
 }
 
 // grantRoster splits a hive's agents holding a write grant into the ones the

@@ -24,16 +24,16 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/kubestellar/hive/pkg/advisory"
-	"github.com/kubestellar/hive/pkg/config"
-	ghpkg "github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/worksource"
+	"github.com/hivecommons/hive/pkg/advisory"
+	"github.com/hivecommons/hive/pkg/config"
+	ghpkg "github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/worksource"
 )
 
 const (
 	wsHeartbeatInterval = 30 * time.Second
 	wsHeartbeatTimeout  = 90 * time.Second
-	// wsTaskTimeout is the hub-owned LEASE TTL on task ownership (kubestellar/hive
+	// wsTaskTimeout is the hub-owned LEASE TTL on task ownership (hivecommons/hive
 	// #2568). A task's lease is renewed on assignment and on every task_progress
 	// report; if a connection holds a task but the lease has not been renewed within
 	// this window the cleanupLoop auto-releases it through the SAME cooldown path the
@@ -75,9 +75,9 @@ var wsUpgrader = websocket.Upgrader{
 }
 
 type ContributorConnection struct {
-	ws              *websocket.Conn
-	profile         *ContributorProfile
-	cliBackend      string
+	ws         *websocket.Conn
+	profile    *ContributorProfile
+	cliBackend string
 	// session is the OPTIONAL client-declared session label from auth_response
 	// (multi-session-per-account). Empty for a single-session contributor, which
 	// keeps identityOf() at the bare ContributorID. When set, identityOf()
@@ -181,7 +181,7 @@ type ContributorConnection struct {
 	// races surface as a "concurrent write to websocket connection" panic (seen in
 	// TestStaleGeneration_RevokedWorkerCannotOverwriteNewOwner). It is a SEPARATE
 	// lock from mu (which guards the state fields above): no write path holds mu
-	// while calling send, so the two never nest. See kubestellar/hive
+	// while calling send, so the two never nest. See hivecommons/hive
 	// contribute-ws concurrent-write fix.
 	writeMu sync.Mutex
 }
@@ -240,9 +240,9 @@ type WSMessage struct {
 	// Provider is optional, bounded receipt evidence derived by Pi relays from
 	// their canonical provider/model preference. It is never assignment or
 	// routing authority; Model remains the canonical selection transport.
-	Provider        string `json:"provider,omitempty"`
-	Model           string `json:"model,omitempty"`
-	// Session is an OPTIONAL client-declared session label (kubestellar/hive:
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+	// Session is an OPTIONAL client-declared session label (hivecommons/hive:
 	// multi-session-per-account). One GitHub account has ONE contributor profile
 	// (one ContributorID, one auth token, one trust tier), but a contributor may
 	// want to run several relays at once under that account — e.g. one per CLI
@@ -551,6 +551,15 @@ type ContributeWSHub struct {
 	completedTasksFile string
 	failedTasksFile    string
 	noPRStreaksFile    string
+	// taskLeasesFile is where the server-issued lease registry is persisted so it
+	// survives a hub restart (#5681). Overridable per hub for tests, like the
+	// sibling ledgers.
+	taskLeasesFile string
+	// startedAt is when this hub process came up. It bounds the window in which a
+	// lease restored from the previous process is honoured as a hold on its work
+	// item (#5681, leaseHoldGraceAfterStart). Written once at construction and only
+	// read afterwards, so it needs no lock.
+	startedAt          time.Time
 	noWorkVerdictsFile string
 	asyncActivitySave  bool
 	persistActivity    bool
@@ -590,7 +599,7 @@ type ContributeWSHub struct {
 	// Guarded by h.mu, like the other per-issue live state.
 	yankExclusions map[string]time.Time
 	// leases is the hub-owned, server-authoritative registry of the task the hub
-	// ISSUED to each contributor identity (kubestellar/hive C4). It is keyed by
+	// ISSUED to each contributor identity (hivecommons/hive C4). It is keyed by
 	// identity (identityOf: ContributorID, falling back to GitHubUsername) and holds
 	// exactly one lease per identity — the last task selectTask handed that identity.
 	//
@@ -610,24 +619,39 @@ type ContributeWSHub struct {
 }
 
 // taskLease is the server-authoritative record of a task the hub issued to a
-// contributor identity (kubestellar/hive C4). It binds the assignment to the
+// contributor identity (hivecommons/hive C4). It binds the assignment to the
 // {profile, task, repo, generation} tuple and an expiry so a reconnecting relay's
 // task_progress can only RE-ADOPT a task the hub actually assigned to it, under the
 // exact generation it was assigned, and only until the lease expires. It is minted
 // by recordLease at assignment and cleared by revokeLease on every release path; a
 // resume that does not match an unexpired lease here is rejected outright.
 type taskLease struct {
-	identity  string
-	taskID    string
-	repo      string
-	number    int
-	tier      string
-	gen       uint64
+	identity string
+	taskID   string
+	repo     string
+	number   int
+	// key is the canonical, source-aware work-item identity (worksource.Ref.Key —
+	// the same spelling WSTaskAssign.identityKey produces). It is carried so the
+	// double-assignment guard in selectTask can tell which ITEM a lease holds
+	// without re-deriving it from repo/number, which is wrong for external work:
+	// Linear and Jira items deliberately carry Number == 0 and put their identity
+	// in Key (#4245), so every zero-numbered item in a repo would collide as
+	// "repo#0" (#5120).
+	key  string
+	tier string
+	gen  uint64
+	// restored marks a lease loadLeases read from disk at startup rather than one
+	// recordLease minted in this process (#5681). It is deliberately NOT persisted:
+	// it means "issued by the PREVIOUS process, whose holder has not reconnected
+	// here yet", which is only ever true for the current boot. It is what lets the
+	// double-assignment guard hold an item for a relay the hub has not seen yet
+	// WITHOUT changing what a lease means in steady state.
+	restored  bool
 	expiresAt time.Time
 }
 
 // leaseTTL is how long a hub-issued task lease remains re-adoptable after the last
-// time the relay proved it was still working (kubestellar/hive C4). It is aligned
+// time the relay proved it was still working (hivecommons/hive C4). It is aligned
 // with wsTaskTimeout (the wedged-task backstop) and, since #4260, is measured from
 // the SAME event: recordLease stamps it at assignment and renewLease re-stamps it on
 // every accepted task_progress, exactly where reclaimExpiredLeases re-stamps
@@ -649,14 +673,25 @@ type taskLease struct {
 const leaseTTL = wsTaskTimeout
 
 // recordLease registers (or replaces) the server-authoritative lease for an
-// identity when the hub assigns it a task (kubestellar/hive C4). It stores the
+// identity when the hub assigns it a task (hivecommons/hive C4). It stores the
 // exact {task, repo, generation, tier} the hub issued plus an expiry, so a later
 // reconnect can be validated against what the server actually handed out — never
 // reconstructed from client-supplied fields. Called from selectTask under the new
 // assignment's generation.
 func (h *ContributeWSHub) recordLease(identity, taskID, repo string, number int, tier string, gen uint64, now time.Time) {
+	h.recordLeaseForKey(identity, taskID, repo, number, "", tier, gen, now)
+}
+
+// recordLeaseForKey is recordLease plus the assignment's canonical work-item key.
+// selectTask calls this form with chosen.ref.Key() so an EXTERNAL item's lease
+// carries its real identity; an empty key falls back to the repo#number spelling,
+// which is exact for GitHub work and is what the plain recordLease form records.
+func (h *ContributeWSHub) recordLeaseForKey(identity, taskID, repo string, number int, key, tier string, gen uint64, now time.Time) {
 	if identity == "" || taskID == "" {
 		return
+	}
+	if key == "" {
+		key = worksource.Ref{Repo: repo, Number: number}.Key()
 	}
 	h.leaseMu.Lock()
 	if h.leases == nil {
@@ -667,10 +702,13 @@ func (h *ContributeWSHub) recordLease(identity, taskID, repo string, number int,
 		taskID:    taskID,
 		repo:      repo,
 		number:    number,
+		key:       key,
 		tier:      tier,
 		gen:       gen,
 		expiresAt: now.Add(leaseTTL),
 	}
+	// #5681: a lease the hub issued must outlive the process that issued it.
+	h.saveLeasesLocked()
 	h.leaseMu.Unlock()
 }
 
@@ -695,12 +733,17 @@ func (h *ContributeWSHub) renewLease(identity, taskID string, now time.Time) {
 	h.leaseMu.Lock()
 	if l, ok := h.leases[identity]; ok && l.taskID == taskID {
 		l.expiresAt = now.Add(leaseTTL)
+		// #5681: persist the EXTENDED window. Without this a restart would restore
+		// the window as it stood at assignment, so a task that had been progressing
+		// for longer than leaseTTL — the exact case #4260 fixed in memory — would
+		// come back already expired and could not be resumed.
+		h.saveLeasesLocked()
 	}
 	h.leaseMu.Unlock()
 }
 
 // revokeLease removes the server-authoritative lease for an identity on any release
-// path (kubestellar/hive C4): disconnect, ready-abandon, task_complete, task_failed,
+// path (hivecommons/hive C4): disconnect, ready-abandon, task_complete, task_failed,
 // operator requeue, and lease-TTL expiry. Once revoked, a reconnecting relay's
 // task_progress for that task no longer matches any lease and cannot re-adopt it —
 // closing the window in which a released task could be resurrected from client
@@ -713,12 +756,16 @@ func (h *ContributeWSHub) revokeLease(identity, taskID string) {
 	h.leaseMu.Lock()
 	if l, ok := h.leases[identity]; ok && (taskID == "" || l.taskID == taskID) {
 		delete(h.leases, identity)
+		// #5681: a revoke that did not reach disk would be undone by the next
+		// restart, resurrecting a released task. Persist it with the same urgency
+		// as the in-memory delete.
+		h.saveLeasesLocked()
 	}
 	h.leaseMu.Unlock()
 }
 
 // lookupLease returns the active, unexpired server-issued lease for an identity that
-// EXACTLY matches the resume claim (kubestellar/hive C4): same task_id, same
+// EXACTLY matches the resume claim (hivecommons/hive C4): same task_id, same
 // canonical repo, same number, and same assignment generation. Any mismatch — no
 // lease, wrong task, wrong repo/number, wrong (or zero) generation, or an expired
 // lease — returns nil, so a reconnecting relay may only re-adopt the precise task the
@@ -742,6 +789,7 @@ func (h *ContributeWSHub) lookupLease(identity, taskID, repo string, number int,
 	if now.After(l.expiresAt) {
 		// Expired: drop it so it can never be re-adopted, and treat as no lease.
 		delete(h.leases, identity)
+		h.saveLeasesLocked()
 		return nil
 	}
 	if l.taskID != taskID || l.gen != clientGen {
@@ -754,6 +802,291 @@ func (h *ContributeWSHub) lookupLease(identity, taskID, repo string, number int,
 		return nil
 	}
 	return l
+}
+
+// persistedLease is the on-disk form of a taskLease (#5681).
+//
+// It carries the lease and nothing else. There is no credential in it: the scoped
+// GitHub token is minted per assignment and delivered separately (#2537), never
+// stored here. Restoring a lease therefore grants exactly one thing — the ability
+// to RE-ADOPT a task the hub already issued to that identity — and never the
+// ability to obtain a fresh credential without passing selectTask's gates.
+type persistedLease struct {
+	Identity  string    `json:"identity"`
+	TaskID    string    `json:"task_id"`
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"`
+	Key       string    `json:"key,omitempty"`
+	Tier      string    `json:"tier"`
+	Gen       uint64    `json:"gen"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func (h *ContributeWSHub) taskLeasesPath() string {
+	if h != nil && h.taskLeasesFile != "" {
+		return h.taskLeasesFile
+	}
+	return taskLeasesFile
+}
+
+// saveLeasesLocked writes the server-issued lease registry to disk (#5681).
+//
+// THE CALLER MUST HOLD leaseMu. The snapshot and the write happen under the same
+// lock deliberately: if the snapshot were taken under the lock and the rename done
+// outside it, two concurrent mutations could land their renames in the opposite
+// order and leave the file describing an OLDER registry than the one in memory —
+// and the whole point of the file is that it is what the next process boots from.
+// The cost is negligible: the file holds one record per contributor identity
+// (bounded by maxWSConnections) and every mutation site is low-frequency —
+// assignment, release, and one task_progress per relay per PROGRESS_REPORT_INTERVAL_MS.
+//
+// Leases already past their expiry are skipped rather than written: a lease that
+// can no longer be re-adopted must not be able to come back from disk.
+func (h *ContributeWSHub) saveLeasesLocked() {
+	if h == nil || !h.persistTaskLedgers {
+		return
+	}
+	now := time.Now()
+	records := make([]persistedLease, 0, len(h.leases))
+	for _, l := range h.leases {
+		if l == nil || l.expiresAt.IsZero() || now.After(l.expiresAt) {
+			continue
+		}
+		records = append(records, persistedLease{
+			Identity:  l.identity,
+			TaskID:    l.taskID,
+			Repo:      l.repo,
+			Number:    l.number,
+			Key:       l.key,
+			Tier:      l.tier,
+			Gen:       l.gen,
+			ExpiresAt: l.expiresAt,
+		})
+	}
+	data, err := json.Marshal(records)
+	if err != nil {
+		h.logger.Warn("[contribute-ws] task leases marshal failed", "error", err)
+		return
+	}
+	path := h.taskLeasesPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		h.logger.Warn("[contribute-ws] task leases directory creation failed", "error", err)
+		return
+	}
+	// Crash-safe persist per the #5625 idiom: a UNIQUE temp name (a fixed name
+	// lets a non-cooperating process clobber a commit in flight), fsync of the
+	// bytes before the rename (the whole point of this file is that the next
+	// process boots from it, so the record must be durable, not just renamed),
+	// and an fsync of the directory so the rename itself survives a crash.
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		h.logger.Warn("[contribute-ws] task leases temp creation failed", "error", err)
+		return
+	}
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		_ = tmp.Close()
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	// 0600, unlike the sibling ledgers: this file is the C4 authorization record
+	// that lookupLease matches a resume against, so it is owner-only on both sides
+	// — nothing else on the host has any business reading which contributor holds
+	// which work item, and nothing else has any business writing it. CreateTemp
+	// already makes 0600; the explicit chmod pins the invariant rather than
+	// inheriting it.
+	if err := tmp.Chmod(0o600); err != nil {
+		h.logger.Warn("[contribute-ws] task leases chmod failed", "error", err)
+		return
+	}
+	if _, err := tmp.Write(data); err != nil {
+		h.logger.Warn("[contribute-ws] task leases write failed", "error", err)
+		return
+	}
+	if err := tmp.Sync(); err != nil {
+		h.logger.Warn("[contribute-ws] task leases sync failed", "error", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		h.logger.Warn("[contribute-ws] task leases close failed", "error", err)
+		return
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		h.logger.Warn("[contribute-ws] task leases rename failed", "error", err)
+		return
+	}
+	keep = true
+	directory, err := os.Open(dir)
+	if err != nil {
+		h.logger.Warn("[contribute-ws] task leases directory open failed", "error", err)
+		return
+	}
+	defer func() { _ = directory.Close() }()
+	if err := directory.Sync(); err != nil {
+		h.logger.Warn("[contribute-ws] task leases directory sync failed", "error", err)
+	}
+}
+
+// loadLeases restores the server-issued lease registry at hub startup (#5681).
+//
+// Leases lived only in process memory. A hub restart — which self-upgrade rolls
+// (#5391) make routine rather than rare — erased every record of what the hub had
+// assigned, while the relays carried on working: they hold one task at a time and
+// re-assert it on reconnect (#4260). With the registry empty, EVERY in-flight
+// resume failed lookupLease, was answered "no active lease for this task", and had
+// its agent interrupted mid-turn — then was handed the identical issue back seconds
+// later. Ownership was never in question; only the record of it.
+//
+// This does not weaken C4. The restored record is still one the SERVER issued and
+// wrote itself; a resume still has to match it exactly on
+// {identity, task_id, repo, number, generation} and still has to be inside the
+// window. Nothing is reconstructed from client-supplied fields, and a lease whose
+// expiry has passed is dropped rather than loaded — so a stale file cannot
+// resurrect a task that is no longer re-adoptable.
+func (h *ContributeWSHub) loadLeases() {
+	if h == nil || !h.persistTaskLedgers {
+		return
+	}
+	data, err := os.ReadFile(h.taskLeasesPath())
+	if err != nil {
+		return
+	}
+	var records []persistedLease
+	if json.Unmarshal(data, &records) != nil {
+		h.logger.Warn("[contribute-ws] task leases file unreadable; starting with an empty registry")
+		return
+	}
+	now := time.Now()
+	var maxGen uint64
+	restored := 0
+
+	h.leaseMu.Lock()
+	if h.leases == nil {
+		h.leases = make(map[string]*taskLease)
+	}
+	for _, rec := range records {
+		// gen == 0 could never be matched by lookupLease (it refuses clientGen 0),
+		// so such a record is unusable; drop it rather than hold an issue hostage.
+		if rec.Identity == "" || rec.TaskID == "" || rec.Gen == 0 {
+			continue
+		}
+		if rec.ExpiresAt.IsZero() || now.After(rec.ExpiresAt) {
+			continue
+		}
+		key := rec.Key
+		if key == "" {
+			key = worksource.Ref{Repo: rec.Repo, Number: rec.Number}.Key()
+		}
+		h.leases[rec.Identity] = &taskLease{
+			identity:  rec.Identity,
+			taskID:    rec.TaskID,
+			repo:      rec.Repo,
+			number:    rec.Number,
+			key:       key,
+			tier:      rec.Tier,
+			gen:       rec.Gen,
+			restored:  true,
+			expiresAt: rec.ExpiresAt,
+		}
+		if rec.Gen > maxGen {
+			maxGen = rec.Gen
+		}
+		restored++
+	}
+	h.leaseMu.Unlock()
+
+	// #2568: taskGen is an in-memory counter that restarts at zero, so without this
+	// a post-restart assignment would mint generations that ALIAS the ones just
+	// restored — and the Gate (generationAccepted) would then accept a pre-restart
+	// straggler against a brand-new task that happened to draw the same number.
+	// Advancing the counter past every restored generation keeps what the hub
+	// issues strictly ahead of what it has already issued.
+	for {
+		cur := h.taskGen.Load()
+		if cur >= maxGen || h.taskGen.CompareAndSwap(cur, maxGen) {
+			break
+		}
+	}
+
+	if restored > 0 {
+		h.logger.Info("[contribute-ws] restored task leases across restart",
+			"count", restored, "max_gen", maxGen)
+	}
+}
+
+// pruneExpiredLeases drops leases that have aged out of their re-adoption window and
+// rewrites the file when anything changed (#5681). lookupLease already drops an
+// expired lease it happens to read, but a lease whose relay never comes back is
+// never looked up: without this it would sit in the registry — and in the
+// double-assignment guard below — until the process ended. Called from cleanupLoop
+// alongside the other stale-state reaping. Returns how many were dropped.
+func (h *ContributeWSHub) pruneExpiredLeases(now time.Time) int {
+	dropped := 0
+	h.leaseMu.Lock()
+	for identity, l := range h.leases {
+		if l == nil || l.expiresAt.IsZero() || now.After(l.expiresAt) {
+			delete(h.leases, identity)
+			dropped++
+		}
+	}
+	if dropped > 0 {
+		h.saveLeasesLocked()
+	}
+	h.leaseMu.Unlock()
+	return dropped
+}
+
+// leaseHoldGraceAfterStart is how long after startup the hub treats a RESTORED
+// lease as an active hold on its work item (#5681).
+//
+// It exists to cover exactly one window: the hub has just booted, it has restored
+// the leases the previous process issued, but the relays holding them have not
+// reconnected yet, so h.connections — the only thing the double-assignment guard
+// used to consult — is empty. Since those relays WILL resume (that is the whole
+// point of persisting the lease), handing the same item to somebody else during
+// those seconds would convert the old "lose the task" bug into a real double
+// assignment.
+//
+// It is bounded well under leaseTTL on purpose. A lease is NOT a hold in steady
+// state: a relay whose socket drops keeps its lease so it can resume (#4260), while
+// its item is left merely cooling down (#2356's speculative release hedge) rather
+// than blocked. Honouring leases as holds for the full TTL would silently replace
+// that hedge with a 30-minute park for every disconnect. The relay reconnects on a
+// one-second backoff and re-asserts its task immediately, so two minutes is many
+// times the window that actually needs covering, and after it the ordinary
+// live-connection guard is back in sole charge.
+const leaseHoldGraceAfterStart = 2 * time.Minute
+
+// leasedIssueKeys returns the canonical work-item keys that a RESTORED, unexpired
+// lease is holding for some identity OTHER than exceptIdentity, during the brief
+// post-restart grace window (#5681). Outside that window, or with nothing restored,
+// it returns nothing and the guard behaves exactly as it did before.
+//
+// A lease belonging to the REQUESTER is deliberately never an exclusion: asking for
+// work is itself the statement that it is not holding that task any more, and the
+// assignment replaces its lease.
+func (h *ContributeWSHub) leasedIssueKeys(exceptIdentity string, now time.Time) map[string]bool {
+	keys := make(map[string]bool)
+	if h == nil || h.startedAt.IsZero() || now.Sub(h.startedAt) > leaseHoldGraceAfterStart {
+		return keys
+	}
+	h.leaseMu.Lock()
+	defer h.leaseMu.Unlock()
+	for identity, l := range h.leases {
+		if l == nil || !l.restored || identity == exceptIdentity {
+			continue
+		}
+		if l.expiresAt.IsZero() || now.After(l.expiresAt) {
+			continue
+		}
+		if l.key != "" {
+			keys[l.key] = true
+		}
+	}
+	return keys
 }
 
 // rateLimitHourWindow and rateLimitDayWindow are the trailing (rolling) windows
@@ -886,6 +1219,8 @@ func NewContributeWSHub(logger *slog.Logger, server *Server) *ContributeWSHub {
 		completedTasksFile:    completedTasksFile,
 		failedTasksFile:       failedTasksFile,
 		noPRStreaksFile:       noPRStreaksFile,
+		taskLeasesFile:        taskLeasesFile,
+		startedAt:             time.Now(),
 		noWorkVerdictsFile:    noWorkVerdictsPath(),
 		asyncActivitySave:     asyncActivitySave,
 		persistActivity:       activityPersistenceEnabled,
@@ -902,6 +1237,10 @@ func NewContributeWSHub(logger *slog.Logger, server *Server) *ContributeWSHub {
 	hub.loadNoPRStreaks()
 	hub.loadNoWorkVerdicts()
 	hub.loadActivity()
+	// #5681: restore the leases the PREVIOUS process issued before any relay can
+	// reconnect, so an in-flight task survives the restart instead of being revoked
+	// out from under a working agent.
+	hub.loadLeases()
 	go hub.cleanupLoop()
 	return hub
 }
@@ -1182,6 +1521,11 @@ type completedTaskRecord struct {
 var failedTasksFile = "/data/contributors/failed-tasks.json"
 
 var noPRStreaksFile = "/data/contributors/no-pr-streaks.json"
+
+// taskLeasesFile is the durable home of the server-issued task-lease registry
+// (#5681). It sits beside the other contributor ledgers, but is written 0600: it is
+// the C4 authorization record a resume is matched against, not a report.
+var taskLeasesFile = "/data/contributors/task-leases.json"
 
 // noPRStreakRecord is the in-memory and on-disk shape of one no-PR completion
 // streak (#3980). LastAt is the most recent no-PR completion; the streak is
@@ -4569,6 +4913,12 @@ func (h *ContributeWSHub) cleanupLoop() {
 		// through the SAME cooldown+generation-bump path a manual requeue uses.
 		h.reclaimExpiredLeases(time.Now())
 
+		// #5681: drop leases that aged out without ever being looked up — a relay
+		// that never came back after a restart leaves one behind, and it would
+		// otherwise keep its issue out of the assignment pool until the process
+		// ended.
+		h.pruneExpiredLeases(time.Now())
+
 		// Deregister under the lock; CLOSE outside it.
 		//
 		// closeWithReason writes a Close frame with a deadline, so it can block for
@@ -4689,7 +5039,7 @@ func (h *ContributeWSHub) reclaimExpiredLeases(now time.Time) int {
 
 // mintScopedToken produces a scoped GitHub token for the given trust tier via the
 // GitHub App auth path, scoped to a single repository when repo is non-empty
-// (kubestellar/hive C4). This is the single mint path shared by task_assign and the
+// (hivecommons/hive C4). This is the single mint path shared by task_assign and the
 // heartbeat/resume token-refresh, so all three advertise tokens minted the same way.
 // See #2393 item 2.
 //
@@ -4724,7 +5074,7 @@ func (h *ContributeWSHub) mintScopedToken(tier, repo string) (string, error) {
 
 // repoNameOnly returns the bare repository name from an "owner/repo" (or already
 // bare) value, for the GitHub App installation-token Repositories option, which is
-// keyed on the repo name within the installation's org (kubestellar/hive C4). An
+// keyed on the repo name within the installation's org (hivecommons/hive C4). An
 // empty input yields "".
 func repoNameOnly(repo string) string {
 	repo = strings.TrimSpace(repo)
@@ -4912,6 +5262,12 @@ func (h *ContributeWSHub) taskUnavailable(reason string) *WSMessage {
 // buildTaskPrompt is the GitHub-shaped entry point retained for existing call
 // sites (ops-tab prompt preview, tests). New identity-aware callers use
 // buildTaskPromptForRef.
+//
+// One value comes from outside the task's own metadata: the base branch this
+// work belongs on (#5729), which taskBaseBranch derives from the issue title
+// and the branch this hive was built from. That is process-wide build metadata
+// rather than per-request state, so the preview still renders exactly what the
+// agent is sent.
 func buildTaskPrompt(repoFull string, number int, title string) string {
 	return buildTaskPromptForRef(worksource.Ref{Repo: repoFull, Number: number}, title)
 }
@@ -4943,7 +5299,16 @@ func buildTaskPromptForRef(ref worksource.Ref, title string) string {
 			" This work item lives in the %s work source, not in GitHub Issues; read it at %s.",
 			sourceLabel(ref.SourceType), ref.URL)
 	}
-	return buildTaskPromptBody(repoFull, issueRef, title, sourceHint)
+	// #5729: the prompt has to CARRY the base branch. The checkout is reused
+	// across tasks and nothing resets it, so the branch on disk answers the
+	// previous task, not this one — and an agent follows the instruction it was
+	// given over the state it finds. That was measured, not assumed: a working
+	// branch reset from v5 onto v4 mid-task, with zero commits and a clean tree,
+	// was put back on v5 by the agent, because the plan it had already formed
+	// said v5. Fixing the workspace alone cannot work; the instruction has to
+	// carry the answer.
+	return buildTaskPromptBody(repoFull, issueRef, title, sourceHint,
+		taskBaseBranch(title, upstreamBranch()))
 }
 
 // taskIDSegment is the per-item component of a task id. For GitHub-backed work
@@ -4966,7 +5331,68 @@ func sourceLabel(sourceType string) string {
 	return sourceType
 }
 
-func buildTaskPromptBody(repoFull, issueRef, title, sourceHint string) string {
+// releaseLineFromTitle extracts a leading release-line tag — "[v5] reviewer
+// lane follow-ups …" yields "v5" — and returns "" for every other title.
+//
+// The shape is deliberately narrow: `v` followed by digits and nothing else,
+// the same `^v(\d+)$` release-line shape pkg/hub's image_pulls.go matches and
+// .github/release-lines.yml's `release_lines` list uses. The lane prefixes the
+// classifier already routes on ("[quality]", "[architect]", …) cannot collide
+// with it, and a tag naming no real branch fails loudly at `gh pr create`
+// rather than silently redirecting the PR — which is the failure mode this
+// whole change exists to remove.
+func releaseLineFromTitle(title string) string {
+	t := strings.TrimSpace(title)
+	if !strings.HasPrefix(t, "[") {
+		return ""
+	}
+	end := strings.Index(t, "]")
+	if end < 0 {
+		return ""
+	}
+	tag := strings.ToLower(strings.TrimSpace(t[1:end]))
+	if len(tag) < 2 || tag[0] != 'v' {
+		return ""
+	}
+	for _, r := range tag[1:] {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return tag
+}
+
+// taskBaseBranch is the branch a task's work must be based on and its PR opened
+// against (kubestellar/hive#5729).
+//
+// A contributor relay works one issue at a time out of a single PERSISTENT
+// checkout, and nothing resets that checkout between tasks. The prompt never
+// named a base, so the base was whatever the PREVIOUS task happened to leave
+// checked out: on 2026-09-02 one `[v5]`-titled issue put the checkout on `v5`
+// and the four PRs after it — three of them fixes for defects live on the
+// deployed `v4` — were opened against `v5` too, and had to be backported by
+// hand. Nobody in the loop can see that going wrong: the agent has nothing to
+// check against, the contributor sees PRs opening and merging normally, and a
+// maintainer sees correctly-formed PRs on a plausible branch.
+//
+// hubBranch is the branch this hive itself is built from (upstreamBranch()) —
+// the same branch the contribute onboarding page already tells contributors to
+// clone (#3990), so "base your work on it" is the answer that was always
+// implied and never stated. A branch-specific issue overrides it: an issue
+// titled "[v5] …" is work for `v5` whatever branch this hive runs, which is
+// also why the inheritance had a plausible-looking first PR to start from.
+func taskBaseBranch(title, hubBranch string) string {
+	if line := releaseLineFromTitle(title); line != "" {
+		return line
+	}
+	return strings.TrimSpace(hubBranch)
+}
+
+// buildTaskPromptBody renders the assignment prompt's text. baseBranch is the
+// branch this task's work belongs on; it is empty only when the hive cannot
+// resolve one at all, which changes the wording below but never licenses
+// inheriting whatever branch the checkout happens to be on.
+func buildTaskPromptBody(repoFull, issueRef, title, sourceHint, baseBranch string) string {
 	// The workspace contract (kubestellar/hive#2545): your tmux pane already
 	// starts rooted in $HIVE_WORKSPACE_DIR (contributor-agent.sh creates it and
 	// launches the session with -c pointed there), but nothing had put a repo
@@ -4976,6 +5402,27 @@ func buildTaskPromptBody(repoFull, issueRef, title, sourceHint string) string {
 	// its own clone, was left sitting in an empty directory while the
 	// assignment slot stayed held. Spell out an actual clone into that known
 	// directory so there is a concrete first step rather than an implied one.
+	baseHint := fmt.Sprintf(
+		// An unresolved base is not a licence to inherit one. Name the only
+		// trustworthy substitute — the upstream repository's own default
+		// branch, read from the clone rather than from whatever the last task
+		// left behind — and keep the "do not use the branch you find" clause,
+		// which is the load-bearing half in both wordings.
+		"Do not assume the branch the checkout is currently on is the right base: it may "+
+			"be left over from a previous task. Resolve %s's own default branch "+
+			"('gh repo view %s --json defaultBranchRef'), start your work branch from it, "+
+			"and open the PR against it. ",
+		repoFull, repoFull)
+	if b := strings.TrimSpace(baseBranch); b != "" {
+		baseHint = fmt.Sprintf(
+			"Base this work on the '%s' branch of %s. The checkout may be left on a "+
+				"DIFFERENT branch by a previous task, so do not use whatever branch you "+
+				"find there: run 'git fetch upstream' and start your work branch from the "+
+				"base with 'git checkout -b <your-branch> upstream/%s'. Open the PR against "+
+				"the same branch with 'gh pr create --base %s', and confirm the PR's base "+
+				"is '%s' before you report done. ",
+			b, repoFull, b, b, b)
+	}
 	return fmt.Sprintf(
 		"You are a contributor to the %s hive. Work on issue %s: \"%s\".%s "+
 			"You do NOT have push access to the upstream repo. "+
@@ -4985,6 +5432,13 @@ func buildTaskPromptBody(repoFull, issueRef, title, sourceHint string) string {
 			"from a prior task, 'cd' into it and 'git fetch' instead of "+
 			"re-forking). Then 'cd' into that checkout, read the issue, "+
 			"understand what's needed, and take action. "+
+			// #5729: the base branch. Everything above deliberately REUSES a
+			// checkout across tasks, which is exactly what makes the branch
+			// left on disk the previous task's answer rather than this one's.
+			// Name the branch, name it before the agent forms a plan, and ask
+			// for the base back at the end — an agent never told a base cannot
+			// notice it inherited the wrong one.
+			"%s"+
 			// DCO is enforced on this repo (CONTRIBUTING.md) and an unsigned
 			// commit blocks the merge, but the prompt used to leave sign-off
 			// entirely to whatever each agent inferred from the repo. That
@@ -5044,7 +5498,7 @@ func buildTaskPromptBody(repoFull, issueRef, title, sourceHint string) string {
 			"only when you are actually done, and never before starting work. "+
 			"If you printed the no_work_needed line above, that already counts "+
 			"as your completion — do not print both.",
-		repoFull, issueRef, title, sourceHint, repoFull, repoFull,
+		repoFull, issueRef, title, sourceHint, repoFull, repoFull, baseHint,
 	)
 }
 
@@ -5156,7 +5610,7 @@ func (h *ContributeWSHub) canonicalRepoKey(repo string) string {
 	return repo
 }
 
-// resumeGateReason re-runs, for a RESUME (kubestellar/hive C4), the same admission
+// resumeGateReason re-runs, for a RESUME (hivecommons/hive C4), the same admission
 // gates a fresh selectTask assignment must clear that are NOT specific to a
 // particular candidate issue: the profile must not be revoked, the whole contribute
 // queue must not be suspended, and the contributor's trust tier must not be
@@ -5272,6 +5726,16 @@ func (h *ContributeWSHub) selectTask(c *ContributorConnection) *WSMessage {
 		conn.mu.Unlock()
 	}
 	h.mu.RUnlock()
+
+	// #5681: for the first leaseHoldGraceAfterStart of this process, also exclude
+	// items held by a lease RESTORED from the previous one. Those relays have not
+	// reconnected yet, so the live-connection scan above cannot see them — but they
+	// will resume, so offering their work to somebody else now would convert the
+	// old "lose the task" bug into a real double assignment. Outside that window
+	// this contributes nothing.
+	for key := range h.leasedIssueKeys(identityOf(c), time.Now()) {
+		activeIssues[key] = true
+	}
 
 	// #2436 finding 3 / #2566: enforce tier_limits per identity. The config ships
 	// populated MaxConcurrent/MaxPerHour/MaxPerDay defaults, so an operator
@@ -5781,7 +6245,11 @@ func (h *ContributeWSHub) selectTask(c *ContributorConnection) *WSMessage {
 	// reconnect can be validated against what the hub actually issued — the exact
 	// {task, repo, generation, tier} bound here — instead of reconstructing ownership
 	// from client-supplied task_progress fields. Revoked on every release path.
-	h.recordLease(identityOf(c), taskID, chosen.repoFull, chosen.number, c.profile.TrustTier, gen, time.Now())
+	// #5681: record the item's canonical key too, so the double-assignment guard can
+	// recognise the lease after a restart — including for external work, whose
+	// identity is Key rather than repo#number (#4245).
+	h.recordLeaseForKey(identityOf(c), taskID, chosen.repoFull, chosen.number,
+		chosen.ref.Key(), c.profile.TrustTier, gen, time.Now())
 
 	// #2566: record this assignment against the identity's rolling hourly/daily
 	// windows so the next selectTask enforces tier_limits.max_per_hour /
