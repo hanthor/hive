@@ -1,0 +1,187 @@
+# hive-project.yaml — Tuna OS Fleet (Production Reference)
+#
+# Production configuration for the hive.tunaos.org deployment.
+# Copy to /etc/hive/hive-project.yaml on the hive server.
+
+project:
+  name: "Tuna OS"
+  org: "tuna-os"
+  primary_repo: "tuna-os/tunaOS"
+  repos:
+    - tuna-os/tunaOS
+    - tuna-os/tunaos-packages
+    - tuna-os/wootc
+    - tuna-os/blueshell
+    - tuna-os/finupdate
+    - tuna-os/corral
+    - tuna-os/tromso
+    - tuna-os/xfce-linux
+    - tuna-os/tuna-installer-cosmic
+    - tuna-os/tuna-installer-kde
+    - tuna-os/tuna-installer-xfce
+    - tuna-os/tuna-installer-niri
+    - tuna-os/bootc-installer-asahi
+    - tuna-os/fisherman
+    - tuna-os/remora
+    - tuna-os/gtk-office-suite
+    - tuna-os/mandelbrot
+    - tuna-os/spindle
+    - tuna-os/dualcut
+    - tuna-os/protota
+    - tuna-os/mariner
+    - tuna-os/gnome-hive-monitor
+    - tuna-os/flatpak-index
+    - tuna-os/debian-copr
+    - tuna-os/bst-ci
+    - tuna-os/docs
+    - tuna-os/branding
+    - tuna-os/hive
+  website: "https://tunaos.org"
+  hive_repo: "tuna-os/hive"
+
+agents:
+  enabled:
+    - supervisor
+    - scanner
+    - sec-check
+    - bootc-curator
+    - packager
+    - desktop-integrator
+    - installer-qa
+    - upstream-shepherd
+    - desktop-advocate
+  beads_base: "/data/beads"
+  workdir: "/data/workspaces"
+  policy_dir: "examples/tuna-os/agents"
+
+classification:
+  complexity:
+    simple:
+      labels: ["i18n", "typo", "doc-fix", "bump-version", "formatting"]
+      title_patterns:
+        - '\b(typo|rename|spelling|i18n|bump\s+version|whitespace|lint)\b'
+      model: "haiku"
+    complex:
+      labels: ["architecture", "epic", "rfc", "rebase", "breaking-change", "redesign"]
+      title_patterns:
+        - '\b(rebase|upstream|refactor|redesign|migrat|breaking\s+change|rearchitect|partition)\b'
+      model: "opus"
+    default_model: "sonnet"
+
+  lanes:
+    bootc-curator:
+      labels: ["bootc", "ostree", "image", "layer", "yellowfin", "albacore", "skipjack", "kernel", "nvidia", "hwe"]
+      title_patterns:
+        - '\b(bootc|ostree|containerfile|base\s+image|digest|yellowfin|albacore|skipjack|layer\s+bloat|hwe|nvidia)\b'
+
+    packager:
+      labels: ["package", "rpm", "deb", "spec", "buildstream", "bst", "copr", "flatpak", "flathub", "appstream", "signing"]
+      title_patterns:
+        - '\b(package|rpm|deb|spec|specfile|buildstream|\.bst|copr|flatpak|flathub|appstream|repomd|gpg\s+sign)\b'
+
+    desktop-integrator:
+      labels: ["gtk", "gtk4", "libadwaita", "adwaita", "gnome", "hig", "wayland", "wlroots", "niri", "portal", "dbus", "iced", "cosmic", "qt6"]
+      title_patterns:
+        - '\b(gtk|gtk4|libadwaita|adwaita|gnome|hig|wayland|wlroots|niri|portal|dbus|iced|cosmic|qt6|headerbar|breakpoint)\b'
+
+    installer-qa:
+      labels: ["installer", "fisherman", "wootc", "asahi", "efi", "systemd-boot", "grub", "uki", "partition", "dual-boot", "secure-boot"]
+      title_patterns:
+        - '\b(installer|fisherman|wootc|asahi|efi|systemd-boot|grub|uki|partition|dual[- ]boot|secure[- ]boot)\b'
+
+    upstream-shepherd:
+      labels: ["upstream", "fork", "rebase", "sync", "cherry-pick", "divergence", "patch"]
+      title_patterns:
+        - '\b(upstream|fork|rebase|sync|cherry[- ]pick|divergence|upstreamable|patch\s+backport)\b'
+
+    desktop-advocate:
+      labels: ["community", "outreach", "distrowatch", "flathub", "docs", "showcase", "adopter"]
+      title_patterns:
+        - '\b(community|outreach|distrowatch|showcase|adopter|flathub\s+listing|release\s+announcement)\b'
+
+pipeline:
+  stages:
+    - name: enumerator
+      category: enumerator
+      script: enumerate-actionable.sh
+      output: /var/run/hive-metrics/actionable.json
+      consumers: all
+      phase: pre-kick
+      depends: []
+
+    - name: classifier
+      category: classifier
+      script: issue-classifier.sh
+      output: /var/run/hive-metrics/actionable.json
+      consumers: [scanner, bootc-curator, packager, desktop-integrator, installer-qa, upstream-shepherd]
+      phase: pre-kick
+      depends: [enumerator]
+
+    - name: merge-gate
+      category: gate
+      script: merge-gate.sh
+      output: /var/run/hive-metrics/merge-eligible.json
+      consumers: [scanner, bootc-curator, packager]
+      phase: pre-kick
+      depends: [enumerator]
+
+governor:
+  eval_interval_s: 300
+  threshold_scaling: linear
+  exempt_labels:
+    - hold
+    - on-hold
+    - do-not-merge
+    - changes-requested
+    - waiting-on-author
+    - wip
+
+  modes:
+    surge:
+      threshold: 20
+      supervisor: 5m
+      sec-check: 2m
+      scanner: 15m
+      bootc-curator: 1h
+      packager: 1h
+      desktop-integrator: 1h
+      installer-qa: 2h
+      upstream-shepherd: pause
+      desktop-advocate: pause
+    busy:
+      threshold: 10
+      supervisor: 5m
+      sec-check: 5m
+      scanner: 30m
+      bootc-curator: 2h
+      packager: 2h
+      desktop-integrator: 2h
+      installer-qa: 4h
+      upstream-shepherd: 6h
+      desktop-advocate: 12h
+    quiet:
+      threshold: 2
+      supervisor: 10m
+      sec-check: 10m
+      scanner: 1h
+      bootc-curator: 4h
+      packager: 4h
+      desktop-integrator: 4h
+      installer-qa: 6h
+      upstream-shepherd: 12h
+      desktop-advocate: 24h
+    idle:
+      threshold: 0
+      supervisor: 15m
+      sec-check: 15m
+      scanner: 2h
+      bootc-curator: 6h
+      packager: 6h
+      desktop-integrator: 6h
+      installer-qa: 12h
+      upstream-shepherd: 24h
+      desktop-advocate: 24h
+
+dashboard:
+  title: "Tuna OS Fleet Hive"
+  port: 3001
