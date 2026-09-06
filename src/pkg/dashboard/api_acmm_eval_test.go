@@ -331,7 +331,7 @@ func TestCheckCriterion_AnyPatternMatches(t *testing.T) {
 		Level:    0,
 		Patterns: []string{"does-not-exist.yml", "go.mod", "also-missing.txt"},
 	}
-	if !s.checkCriterion(context.TODO(), "o", "r", c, cache) {
+	if passed, _ := s.checkCriterion(context.TODO(), "o", "r", c, cache); !passed {
 		t.Fatal("expected checkCriterion to pass when any pattern matches")
 	}
 }
@@ -347,7 +347,7 @@ func TestCheckCriterion_NoPatternMatches(t *testing.T) {
 		Level:    0,
 		Patterns: []string{"missing-a.yml", "missing-b.yml"},
 	}
-	if s.checkCriterion(context.TODO(), "o", "r", c, cache) {
+	if passed, _ := s.checkCriterion(context.TODO(), "o", "r", c, cache); passed {
 		t.Fatal("expected checkCriterion to fail when no pattern matches")
 	}
 }
