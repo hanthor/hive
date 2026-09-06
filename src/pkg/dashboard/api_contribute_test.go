@@ -31,16 +31,19 @@ func setupContributeEnv(t *testing.T) {
 func redirectContributeWSDisk(t *testing.T, dir string) {
 	t.Helper()
 	oldActivity, oldCompleted, oldFailed, oldNoPR := activityFilePath, completedTasksFile, failedTasksFile, noPRStreaksFile
+	oldLeases := taskLeasesFile
 	oldAsyncActivitySave := asyncActivitySave
 	oldActivityPersistenceEnabled := activityPersistenceEnabled
 	activityFilePath = filepath.Join(dir, "activity.json")
 	completedTasksFile = filepath.Join(dir, "completed-tasks.json")
 	failedTasksFile = filepath.Join(dir, "failed-tasks.json")
 	noPRStreaksFile = filepath.Join(dir, "no-pr-streaks.json")
+	taskLeasesFile = filepath.Join(dir, "task-leases.json")
 	asyncActivitySave = false
 	activityPersistenceEnabled = false
 	t.Cleanup(func() {
 		activityFilePath, completedTasksFile, failedTasksFile, noPRStreaksFile = oldActivity, oldCompleted, oldFailed, oldNoPR
+		taskLeasesFile = oldLeases
 		asyncActivitySave = oldAsyncActivitySave
 		activityPersistenceEnabled = oldActivityPersistenceEnabled
 	})
@@ -191,7 +194,7 @@ func TestContributeLanding(t *testing.T) {
 		[]byte("HIVE_HUB</code> to comma-separated WebSocket URLs"),
 		[]byte("HIVE_REGISTRATION_TOKEN</code> to the matching comma-separated tokens in the same order"),
 		[]byte("one CLI/tmux session"),
-		[]byte("github.com/kubestellar/hive/pull/2846"),
+		[]byte("github.com/hivecommons/hive/pull/2846"),
 	} {
 		if !bytes.Contains(body, want) {
 			t.Errorf("landing page missing multi-hub help text %q", want)
@@ -1118,6 +1121,34 @@ func TestContributeActivity(t *testing.T) {
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("invalid JSON: %v", err)
+	}
+}
+
+func TestContributeActivityHonorsLimit(t *testing.T) {
+	setupContributeEnv(t)
+	s := NewServer(0, slog.Default())
+	s.registerContributeRoutes()
+	for i := 0; i < 7; i++ {
+		s.contributeHub.addActivity(fmt.Sprintf("user-%d", i), "task_complete", "scanner", "copilot", "gpt", "", fmt.Sprintf("repo#%d", i))
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/contribute/activity?limit=3", nil)
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp struct {
+		Activity []ActivityEntry `json:"activity"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if got := len(resp.Activity); got != 3 {
+		t.Fatalf("expected limit=3 to return 3 entries, got %d", got)
+	}
+	if resp.Activity[0].Username != "user-4" || resp.Activity[2].Username != "user-6" {
+		t.Fatalf("expected most recent tail user-4..user-6, got %#v", resp.Activity)
 	}
 }
 

@@ -1,9 +1,12 @@
 package hub
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hivecommons/hive/pkg/inferencehealth"
 )
 
 // ractivity builds a one-repo RepoActivityWire with the given create/merge
@@ -30,22 +33,155 @@ func withActivity(e RegistryEntry, repos ...RepoActivityWire) RegistryEntry {
 	return e
 }
 
+func TestHiveHealthFor_GatewayFaultPrecedesInferredAppBroken(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	e := RegistryEntry{
+		Online:    true,
+		ACMMLevel: 4,
+		Agents: []AgentSummary{{
+			Name: "quality", State: agentStateRunning, Backend: "litellm",
+			Enabled: true, ExpectedActive: true, CanOpenIssue: true, CanOpenPR: true, CanMerge: true,
+		}},
+		GatewayHealth: []inferencehealth.GatewayStatus{{
+			Name:        "litellm",
+			ErrorClass:  inferencehealth.ClassDNS,
+			LastErrorAt: now.Add(-time.Minute).Format(time.RFC3339),
+		}},
+	}
+	v := hiveHealthFor(e, okRollup(), GitHubAppHealth{Bucket: ghAppBucketBroken}, 21, now)
+	if v.State != HealthStateRed {
+		t.Fatalf("state = %s, want red", v.State)
+	}
+	if v.Reason != "inference gateway 'litellm' unreachable (dns)" {
+		t.Fatalf("reason = %q", v.Reason)
+	}
+	if v.Remediation == nil || !strings.Contains(v.Remediation.Action, "Settings → Model Gateways") {
+		t.Fatalf("remediation = %+v, want Model Gateways hint", v.Remediation)
+	}
+}
+
+func TestHiveHealthFor_GatewayDNSNamesEndpointHost(t *testing.T) {
+	now := time.Date(2026, 9, 4, 23, 0, 0, 0, time.UTC)
+	e := RegistryEntry{
+		Online:    true,
+		ACMMLevel: 4,
+		Agents: []AgentSummary{{
+			Name: "quality", State: agentStateRunning, Backend: "vllm", Enabled: true, ExpectedActive: true, CanOpenIssue: true, CanOpenPR: true, CanMerge: true,
+		}},
+		GatewayHealth: []inferencehealth.GatewayStatus{{
+			Name: "vllm", Host: "hive-vllm-svc.hive-inference.svc.cluster.local", ErrorClass: inferencehealth.ClassDNS, LastErrorAt: now.Format(time.RFC3339),
+		}},
+	}
+	v := hiveHealthFor(e, okRollup(), okApp(), 3, now)
+	if want := "vllm endpoint hive-vllm-svc.hive-inference.svc.cluster.local not resolvable on this cluster — set inference.vllm.endpoint or disable"; v.Reason != want {
+		t.Fatalf("reason = %q, want %q", v.Reason, want)
+	}
+}
+
+func TestHiveHealthFor_UnusedGatewayFaultDoesNotShadowAppVerdict(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	e := RegistryEntry{
+		Online:    true,
+		ACMMLevel: 4,
+		Agents: []AgentSummary{{
+			Name: "quality", State: agentStateRunning, Backend: "claude",
+			Enabled: true, ExpectedActive: true, CanOpenIssue: true, CanOpenPR: true, CanMerge: true,
+		}},
+		GatewayHealth: []inferencehealth.GatewayStatus{{
+			Name:        "unused-litellm",
+			ErrorClass:  inferencehealth.ClassDNS,
+			LastErrorAt: now.Add(-time.Minute).Format(time.RFC3339),
+		}},
+	}
+	v := hiveHealthFor(e, okRollup(), GitHubAppHealth{Bucket: ghAppBucketBroken}, 21, now)
+	if v.Reason != "GitHub App broken" {
+		t.Fatalf("reason = %q, want GitHub App broken because no agent uses the failing gateway", v.Reason)
+	}
+}
+
+func TestHiveHealthFor_GatewayAuthReason(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	e := RegistryEntry{
+		Online:    true,
+		ACMMLevel: 4,
+		Agents: []AgentSummary{{
+			Name: "quality", State: agentStateRunning, Backend: "litellm",
+			Enabled: true, ExpectedActive: true, CanOpenIssue: true, CanOpenPR: true, CanMerge: true,
+		}},
+		GatewayHealth: []inferencehealth.GatewayStatus{{
+			Name:        "litellm",
+			ErrorClass:  inferencehealth.ClassAuth,
+			HTTPStatus:  http.StatusUnauthorized,
+			LastErrorAt: now.Add(-time.Minute).Format(time.RFC3339),
+		}},
+	}
+	v := hiveHealthFor(e, okRollup(), GitHubAppHealth{Bucket: ghAppBucketBroken, Detail: "GitHub App 123 broken"}, 21, now)
+	if v.Reason != "inference gateway 'litellm' rejected key (401)" {
+		t.Fatalf("reason = %q", v.Reason)
+	}
+}
+
+func TestHiveHealthFor_GitHubAppStructuredReason(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	e := RegistryEntry{
+		Online:               true,
+		ACMMLevel:            4,
+		GitHubAppState:       "not-installed",
+		GitHubHost:           "github.ibm.com",
+		GitHubAppID:          123,
+		GitHubInstallationID: 456,
+		GitHubAppErrorClass:  "installation-not-found",
+		GitHubAppHTTPStatus:  404,
+	}
+	app := githubAppHealthFor(e, now)
+	v := hiveHealthFor(e, okRollup(), app, 21, now)
+	want := "GitHub App 123 on github.ibm.com: installation 456 not found (404) — reinstall or fix app_id/installation_id"
+	if v.Reason != want {
+		t.Fatalf("reason = %q, want %q", v.Reason, want)
+	}
+}
+
+func TestHiveHealthFor_PerAgentQuotaUsesRollupInsteadOfPrecondition(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	e := RegistryEntry{
+		Online:              true,
+		ACMMLevel:           4,
+		ProviderLimitReason: "1 agent(s) out of provider quota",
+		ProviderLimitAgents: []string{"guide"},
+	}
+	rollup := agentFleetRollup{Expected: 3, Running: 2, Able: 2, Known: 3, Problems: 1, QuotaExhausted: 1}
+	v := hiveHealthFor(e, rollup, okApp(), 21, now)
+	if v.Reason != "1 agent(s) out of provider quota" {
+		t.Fatalf("reason = %q, want per-agent quota rollup", v.Reason)
+	}
+}
+
+func TestHiveHealthFor_StartFailureReasonBeatsGenericDown(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	reason := "starting failed ×2: copilot: no CLI prompt after launch (last 5m ago)"
+	rollup := agentFleetRollup{Expected: 1, Known: 1, Problems: 1, StartFailures: 1, StartFailureReason: reason, DeadOrGone: 1}
+	v := hiveHealthFor(RegistryEntry{Online: true, ACMMLevel: 4}, rollup, okApp(), 21, now)
+	if v.Reason != reason {
+		t.Fatalf("reason = %q, want precise start failure", v.Reason)
+	}
+}
+
 // The verdict must band by ACMM level exactly as the operator defined:
 // L1 no-output→green, L2 advisory-fresh→green, L3–L5 creates (unmerged is fine),
 // L6 merges (unmerged+queued→red), with precondition + unknown gates on top.
 func TestHiveHealthFor_ACMMBands(t *testing.T) {
 	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
 	rfc := func(t time.Time) string { return t.UTC().Format(time.RFC3339) }
-	recent := rfc(now.Add(-1 * time.Hour))   // within 12h
-	oldTs := rfc(now.Add(-30 * time.Hour))   // outside 12h
-	freshAdv := rfc(now.Add(-2 * time.Hour)) // within advisory aging window
+	recent := rfc(now.Add(-1 * time.Hour))      // within 12h
+	oldTs := rfc(now.Add(-30 * time.Hour))      // outside 12h
+	freshAdv := rfc(now.Add(-30 * time.Minute)) // within advisory freshness window
 
 	base := func(level int) RegistryEntry {
 		// Every base entry carries one on-duty agent with full write grants so
 		// the freshness bands are actually exercised; the no-writers-on-duty
 		// cases build their own agent sets.
 		return RegistryEntry{Online: true, ACMMLevel: level, Agents: []AgentSummary{
-			{Name: "quality", State: agentStateRunning, Enabled: true, ExpectedActive: true,
+			{Name: "quality", State: agentStateRunning, Enabled: true, ExpectedActive: true, Backend: "litellm",
 				CanOpenIssue: true, CanOpenPR: true, CanMerge: true},
 		}}
 	}
@@ -459,5 +595,91 @@ func TestSanitizeRepoActivity(t *testing.T) {
 	}
 	if len(got[0].Agents) != 1 || got[0].Agents[0].Agent != "quality" || got[0].Agents[0].Merges.Count != 2 {
 		t.Errorf("agent activity not sanitized: %+v", got[0].Agents)
+	}
+}
+
+func TestHiveHealthFor_OutputFreshnessTelemetryExplainsNoWrite(t *testing.T) {
+	now := time.Date(2026, 9, 4, 15, 0, 0, 0, time.UTC)
+	old := now.Add(-4 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	base := func() RegistryEntry {
+		return withActivity(RegistryEntry{
+			Online:    true,
+			ACMMLevel: 4,
+			Agents: []AgentSummary{{
+				Name: "quality", State: agentStateRunning, Enabled: true,
+				ExpectedActive: true, CanOpenIssue: true, CanOpenPR: true,
+			}},
+		}, ractivity("o/r", old, old, "", ""))
+	}
+	tests := []struct {
+		name       string
+		mutate     func(*RegistryEntry)
+		wantState  string
+		wantReason string
+	}{
+		{
+			name: "recent write-capable kick means pipeline broken",
+			mutate: func(e *RegistryEntry) {
+				e.LastKickDisposition = "kick-capable"
+				e.LastWriteCapableKickAt = now.Add(-30 * time.Minute)
+			},
+			wantState:  HealthStateRed,
+			wantReason: "pipeline broken — write-capable kick 30m ago but no writes (8 queued)",
+		},
+		{
+			name: "governor idle means nothing due",
+			mutate: func(e *RegistryEntry) {
+				e.LastKickDisposition = "no-due-agents"
+				e.LastKickSkipReason = "no agents due in the current governor mode"
+				e.LastWriteCapableKickAt = now.Add(-4 * 24 * time.Hour)
+			},
+			wantState:  HealthStateAmber,
+			wantReason: "nothing to write — governor idle since 2026-08-31T15:00:00Z (4d ago) because no agents due in the current governor mode",
+		},
+		{
+			name: "advisory only band does not become pipeline red",
+			mutate: func(e *RegistryEntry) {
+				e.LastKickDisposition = "advisory-only"
+				e.LastKickSkipReason = "ACMM advisory band produces advisory output, not writes"
+			},
+			wantState:  HealthStateAmber,
+			wantReason: "advisory-only — ACMM advisory band produces advisory output, not writes",
+		},
+		{
+			name: "not writable queued items explain stale stream",
+			mutate: func(e *RegistryEntry) {
+				e.LastKickDisposition = "agent-decided-not-writable"
+				e.NotWritableQueued = 8
+			},
+			wantState:  HealthStateAmber,
+			wantReason: "nothing writable — 8 queued deemed not writable",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := base()
+			tt.mutate(&e)
+			v := hiveHealthFor(e, okRollup(), okApp(), 8, now)
+			if v.State != tt.wantState || v.Reason != tt.wantReason {
+				t.Fatalf("verdict = %s/%q, want %s/%q", v.State, v.Reason, tt.wantState, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestHiveHealthFor_OutputFreshnessLegacyKeepsNoWriteRed(t *testing.T) {
+	now := time.Date(2026, 9, 4, 15, 0, 0, 0, time.UTC)
+	old := now.Add(-4 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	e := withActivity(RegistryEntry{
+		Online:    true,
+		ACMMLevel: 4,
+		Agents: []AgentSummary{{
+			Name: "quality", State: agentStateRunning, Enabled: true,
+			ExpectedActive: true, CanOpenIssue: true, CanOpenPR: true,
+		}},
+	}, ractivity("o/r", old, old, "", ""))
+	v := hiveHealthFor(e, okRollup(), okApp(), 8, now)
+	if v.State != HealthStateRed || v.Reason != "no write in 4d (8 queued)" {
+		t.Fatalf("legacy verdict = %s/%q, want red/no write in 4d", v.State, v.Reason)
 	}
 }

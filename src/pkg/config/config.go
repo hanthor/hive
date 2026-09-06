@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/resolve"
+	"github.com/hivecommons/hive/pkg/resolve"
 	"gopkg.in/yaml.v3"
 )
 
@@ -510,113 +510,6 @@ type VarDef struct {
 	Headers map[string]string `yaml:"headers,omitempty"` // http
 }
 
-// DocSourceConfigYAML describes an external document to import as knowledge.
-type DocSourceConfigYAML struct {
-	Name     string `yaml:"name"`
-	URL      string `yaml:"url,omitempty"`
-	FilePath string `yaml:"file_path,omitempty"`
-	Layer    string `yaml:"layer"`
-}
-
-type KnowledgeConfig struct {
-	Enabled         bool                  `yaml:"enabled"`
-	Engine          string                `yaml:"engine"`
-	Layers          []KnowledgeLayer      `yaml:"layers"`
-	Vaults          []VaultConfig         `yaml:"vaults"`
-	GitSources      []GitSourceConfigYAML `yaml:"git_sources"`
-	Documents       []DocSourceConfigYAML `yaml:"documents"`
-	Curator         KnowledgeCurator      `yaml:"curator"`
-	Primer          KnowledgePrimer       `yaml:"primer"`
-	BeadSynthesizer BeadSynthesizerConfig `yaml:"bead_synthesizer"`
-}
-
-// BeadSynthesizerConfig controls automatic synthesis of completed beads into wiki facts.
-// Enabled defaults to true when knowledge is enabled; set to false to opt out.
-type BeadSynthesizerConfig struct {
-	Enabled          *bool            `yaml:"enabled,omitempty"`
-	Schedule         string           `yaml:"schedule"`
-	MinConfidence    float64          `yaml:"min_confidence"`
-	TargetLayer      string           `yaml:"target_layer"`
-	MaxFactsPerCycle int              `yaml:"max_facts_per_cycle"`
-	VaultPath        string           `yaml:"vault_path"`
-	RetentionPolicy  *RetentionPolicy `yaml:"retention_policy"`
-}
-
-// RetentionPolicy controls intelligent bead lifecycle management.
-type RetentionPolicy struct {
-	MaxBeads               int  `yaml:"max_beads"`
-	ArchiveAfterSynthDays  int  `yaml:"archive_after_synth_days"`
-	HighPriorityRetainDays int  `yaml:"high_priority_retain_days"`
-	PreserveWithDeps       bool `yaml:"preserve_with_deps"`
-}
-
-// IsEnabled returns whether bead synthesis is enabled (defaults to true).
-func (b BeadSynthesizerConfig) IsEnabled() bool {
-	if b.Enabled == nil {
-		return true
-	}
-	return *b.Enabled
-}
-
-// GitSourceConfigYAML describes a remote git repo (or subdirectory) to index
-// as a knowledge source. Any layer level can have git sources.
-type GitSourceConfigYAML struct {
-	Name    string `yaml:"name"`
-	URL     string `yaml:"url"`
-	Branch  string `yaml:"branch,omitempty"`
-	Subpath string `yaml:"subpath,omitempty"`
-	Layer   string `yaml:"layer"`
-}
-
-// VaultConfig describes a file-based Obsidian vault to auto-connect on startup.
-type VaultConfig struct {
-	Name      string `yaml:"name"`
-	Path      string `yaml:"path"`
-	AutoIndex bool   `yaml:"auto_index"`
-	GitSync   bool   `yaml:"git_sync"`
-}
-
-type KnowledgeLayer struct {
-	Type   string `yaml:"type"`
-	Path   string `yaml:"path,omitempty"`
-	URL    string `yaml:"url,omitempty"`
-	Shared bool   `yaml:"shared"`
-}
-
-type KnowledgeCurator struct {
-	// Enabled gates the scheduled auto-promotion loop. It is a pointer so an
-	// absent key is distinguishable from an explicit `enabled: false`, and it
-	// defaults to FALSE — unlike BeadSynthesizer, which defaults to true.
-	//
-	// The asymmetry is deliberate. Auto-promotion copies facts into a
-	// higher-precedence knowledge layer with no human review, and `schedule`
-	// has been parsed-but-unactioned since it was introduced (#5430), so every
-	// existing hive that set it did so without ever having the loop run. If
-	// the loop defaulted on, upgrading would silently begin mutating the org
-	// layer on hives that never opted in. Scheduled promotion is therefore
-	// opt-in: `schedule` alone does NOT start it.
-	Enabled              *bool    `yaml:"enabled,omitempty"`
-	Schedule             string   `yaml:"schedule"`
-	ExtractFrom          []string `yaml:"extract_from"`
-	AutoPromoteThreshold float64  `yaml:"auto_promote_threshold"`
-	// PromoteFrom / PromoteTo name the source and target layers for the
-	// scheduled promotion sweep. Empty values fall back to project→org.
-	PromoteFrom string `yaml:"promote_from,omitempty"`
-	PromoteTo   string `yaml:"promote_to,omitempty"`
-}
-
-// IsEnabled reports whether scheduled auto-promotion is active. Absent (nil)
-// means DISABLED — see the Enabled field comment for why this defaults false.
-func (k KnowledgeCurator) IsEnabled() bool {
-	return k.Enabled != nil && *k.Enabled
-}
-
-type KnowledgePrimer struct {
-	MaxFacts      int      `yaml:"max_facts"`
-	Priority      []string `yaml:"priority"`
-	MergeStrategy string   `yaml:"merge_strategy"`
-}
-
 type ProjectConfig struct {
 	Org         string   `yaml:"org"`
 	Name        string   `yaml:"name"`
@@ -668,7 +561,7 @@ func (p *ProjectConfig) ForgeKind() string {
 
 // CheckoutRootFor returns the host-local checkout root for one monitored repo,
 // or "" when none is configured. repo may be a bare name ("hive") or an
-// org-qualified slug ("kubestellar/hive"); only the name portion is used, since
+// org-qualified slug ("hivecommons/hive"); only the name portion is used, since
 // CheckoutsDir is keyed by bare repo name.
 //
 // Returning "" is the no-op case and is deliberately the default: a hive that
@@ -937,8 +830,23 @@ type AgentConfig struct {
 	// Stored as a string owner rather than a bool so "never set" (empty),
 	// "pack-owned" and "operator-owned" stay distinguishable across upgrades
 	// of hives whose config predates this field.
-	ModelOwner      string `yaml:"model_owner" json:"model_owner,omitempty"`
-	BackendOwner    string `yaml:"backend_owner" json:"backend_owner,omitempty"`
+	ModelOwner   string `yaml:"model_owner" json:"model_owner,omitempty"`
+	BackendOwner string `yaml:"backend_owner" json:"backend_owner,omitempty"`
+	// PauseOwner records WHO owns this agent's pause/run state, with the same
+	// FieldOwner* vocabulary as ModelOwner/BackendOwner. It is stamped
+	// FieldOwnerOperator when the operator creates the agent by hand via the
+	// dashboard API (such an agent is never a member of any pack's roster) and
+	// when the operator explicitly resumes the agent.
+	//
+	// Without this, the ACMM pack visibility sweep — which runs on EVERY
+	// restart ("ACMM pack applied on startup") — paused every non-pack agent
+	// with reason "agent not in pack level N", including reviewer-role agents
+	// the operator had explicitly created and resumed from the dashboard. The
+	// operator's run-state silently reverted on the next pod roll, every pod
+	// roll (#5706 — same clobber family as #5632; cadences grew the equivalent
+	// marker in #5668). Empty means "no operator claim": pack-created agents
+	// keep the sweep's pause/resume reconciliation unchanged.
+	PauseOwner      string `yaml:"pause_owner" json:"pause_owner,omitempty"`
 	StaleTimeout    int    `yaml:"stale_timeout" json:"stale_timeout,omitempty"`
 	RestartStrategy string `yaml:"restart_strategy" json:"restart_strategy,omitempty"`
 	LaunchCmd       string `yaml:"launch_cmd" json:"launch_cmd,omitempty"`
@@ -1044,6 +952,20 @@ type AgentConfig struct {
 	enabledSet bool
 	// name is the YAML map key, set during config load
 	name string
+	// sourceFile is the per-agent overlay file this entry was read from
+	// (e.g. /data/agent-configs/supervisor.yaml), empty when the entry came
+	// from the main config. Validation errors quote it so an operator is told
+	// WHICH of the several possible sources defined the offending value
+	// (#6024): hive.yaml, the ConfigMap seed and the overlay directory all
+	// feed the same agent map, and naming only the agent sent an operator
+	// hunting through files that were never the problem.
+	sourceFile string
+}
+
+// SourceFile returns the per-agent overlay file this entry was loaded from,
+// or "" when it came from the main config.
+func (a *AgentConfig) SourceFile() string {
+	return a.sourceFile
 }
 
 // Name returns the human-readable YAML key for this agent.
@@ -1275,6 +1197,48 @@ func (a AgentConfig) BackendIsOperatorOwned() bool {
 	return a.BackendOwner == FieldOwnerOperator
 }
 
+// PauseIsOperatorOwned reports whether an operator explicitly owns this
+// agent's pause/run state — stamped at dashboard-API create and on an explicit
+// operator resume — which makes the agent immune to the ACMM pack visibility
+// sweep's "agent not in pack level N" pause on apply/restart (#5706), the same
+// contract ModelIsOperatorOwned provides for models.
+func (a AgentConfig) PauseIsOperatorOwned() bool {
+	return a.PauseOwner == FieldOwnerOperator
+}
+
+// CadenceIsOperatorOwned reports whether an operator explicitly set the
+// cadence for agent in the given governor mode, which makes it immune to pack
+// reconciliation — the same contract ModelIsOperatorOwned provides for models.
+func (g *GovernorConfig) CadenceIsOperatorOwned(mode, agent string) bool {
+	return g.CadenceOwners[mode][agent] == FieldOwnerOperator
+}
+
+// ClaimCadenceOwnership marks the (mode, agent) cadence as operator-owned so
+// no subsequent pack apply reconciles it back to the pack default.
+func (g *GovernorConfig) ClaimCadenceOwnership(mode, agent string) {
+	if g.CadenceOwners == nil {
+		g.CadenceOwners = make(map[string]map[string]string)
+	}
+	if g.CadenceOwners[mode] == nil {
+		g.CadenceOwners[mode] = make(map[string]string)
+	}
+	g.CadenceOwners[mode][agent] = FieldOwnerOperator
+}
+
+// ReleaseCadenceOwnership drops the ownership marker for (mode, agent). Called
+// when the cadence entry itself is removed (e.g. the agent left the roster) so
+// a stale claim cannot outlive the value it protected.
+func (g *GovernorConfig) ReleaseCadenceOwnership(mode, agent string) {
+	owners, ok := g.CadenceOwners[mode]
+	if !ok {
+		return
+	}
+	delete(owners, agent)
+	if len(owners) == 0 {
+		delete(g.CadenceOwners, mode)
+	}
+}
+
 // EnabledExplicitlySet returns true when the user's YAML explicitly set the
 // "enabled" field (allowing us to distinguish "not specified" from "enabled: false").
 func (a *AgentConfig) EnabledExplicitlySet() bool {
@@ -1360,6 +1324,23 @@ type GovernorConfig struct {
 	// which cannot invert. It also keeps `threshold_source` out of ModeConfig's
 	// flat YAML map, where every non-`threshold` key is an agent cadence.
 	ThresholdsSource string `yaml:"thresholds_source,omitempty" json:"thresholds_source,omitempty"`
+
+	// CadenceOwners records WHO last set each governor mode cadence, keyed
+	// mode → agent → owner (FieldOwnerOperator). It is the cadence analogue of
+	// AgentConfig.ModelOwner/BackendOwner (#5558): a pack could never stomp an
+	// operator's model, but could always stomp their cadence — the asymmetry
+	// behind #5632, where every steady-state ApplyPack silently reverted
+	// operator-set cadences to the pack defaults. Only operator claims are
+	// recorded; an absent entry means "pack-owned (or pre-dating this field)",
+	// which keeps existing hives on today's behavior until an operator
+	// actually edits a cadence.
+	//
+	// Unlike ThresholdsSource this IS per-entry: cadences cannot invert a mode
+	// ladder the way thresholds can, and per-entry is exactly the granularity
+	// the Governor grid edits at. It lives here, not in ModeConfig, because
+	// ModeConfig's flat YAML map treats every non-`threshold` key as an agent
+	// cadence.
+	CadenceOwners map[string]map[string]string `yaml:"cadence_owners,omitempty" json:"cadence_owners,omitempty"`
 
 	// Advisory tunes the advisory digest experience: how many findings the
 	// digest shows, and how long a finding may go un-reconfirmed before the
@@ -4085,6 +4066,12 @@ func LoadWithOverrides(path, envPath string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("loading agent overlays: %w", err)
 		}
+		// Drop only the offending overlay, never the whole config (#6024).
+		// This must happen BEFORE the merge: once a bad entry is in cfg.Agents
+		// the later validate() fails the load and the process exits before the
+		// dashboard binds, which is precisely the trap - the only supported fix
+		// is an API served by the process that will not start.
+		overlays = cfg.RejectInvalidAgentOverlays(overlays)
 		cfg.MergeAgentOverrides(overlays)
 		// Re-apply defaults for overlay agents.
 		for name := range overlays {
@@ -4160,6 +4147,13 @@ func LoadWithDashboardOverlay(path string) (*Config, error) {
 	if !overlay.Governor.WorkSource.IsZero() {
 		cfg.Governor.WorkSource = overlay.Governor.WorkSource
 	}
+	// Operator-owned governor cadences (#5632): PUT /api/config/agent/{name}/
+	// cadences persists to the overlay, but this reload used to rebuild
+	// Governor.Modes from the seed alone — so a ConfigMap remount dropped both
+	// the operator's cadence AND its ownership marker from memory, and the next
+	// pack apply saw nothing to respect. Adopt them BEFORE the fullness guard,
+	// like WorkSource, so a short overlay still carries them.
+	adoptOperatorCadenceOverrides(cfg, &overlay)
 	if len(overlay.RemovedAgents) > 0 {
 		cfg.RemovedAgents = overlay.RemovedAgents
 		cfg.PruneRemovedAgents()
@@ -4192,6 +4186,41 @@ func LoadWithDashboardOverlay(path string) (*Config, error) {
 	// so honoring its resolver policy would let a compromised overlay enable
 	// script/http execution. Keep this true if overlay merging is ever expanded.
 	return cfg, nil
+}
+
+// adoptOperatorCadenceOverrides re-applies the dashboard overlay's
+// OPERATOR-OWNED governor cadences (and their ownership markers) on top of the
+// seed's governor config. Only entries the overlay marks FieldOwnerOperator
+// are copied — pack-seeded cadences keep following the seed, so this cannot
+// carry a stale pack value forward. Nothing here touches overlay.Variables or
+// any other security-sensitive block (see the invariant at the end of
+// LoadWithDashboardOverlay).
+func adoptOperatorCadenceOverrides(cfg *Config, overlay *Config) {
+	for modeName, owners := range overlay.Governor.CadenceOwners {
+		overlayMode, hasMode := overlay.Governor.Modes[modeName]
+		if !hasMode {
+			continue
+		}
+		for agentName, owner := range owners {
+			if owner != FieldOwnerOperator {
+				continue
+			}
+			cadence, hasCadence := overlayMode.Cadences[agentName]
+			if !hasCadence {
+				continue
+			}
+			if cfg.Governor.Modes == nil {
+				cfg.Governor.Modes = make(map[string]ModeConfig)
+			}
+			mode := cfg.Governor.Modes[modeName]
+			if mode.Cadences == nil {
+				mode.Cadences = make(map[string]Cadence)
+			}
+			mode.Cadences[agentName] = cadence
+			cfg.Governor.Modes[modeName] = mode
+			cfg.Governor.ClaimCadenceOwnership(modeName, agentName)
+		}
+	}
 }
 
 // findConfigEnv returns the path to a config.env file, or "" if none found.
@@ -5010,6 +5039,107 @@ func (g GovernorConfig) ValidateBackend(backend string) error {
 	return fmt.Errorf("%s)", msg)
 }
 
+// LaunchCmdDeclaredBackend extracts the CLI backend a custom launch_cmd
+// actually launches, or "" when it cannot tell (empty command, an unknown
+// wrapper script, an unrecognized binary).
+//
+// Two spellings are understood:
+//   - the standard wrapper: `agent-launch.sh --backend <b> ...`
+//   - a direct CLI invocation whose binary IS a known backend name
+//     (`bob --model auto`, `copilot --allow-all`, ...), optionally behind
+//     leading VAR=value environment assignments.
+//
+// "" is deliberately the answer for anything else: an operator wrapper the
+// hive cannot see into must never be flagged as a mismatch.
+func LaunchCmdDeclaredBackend(launchCmd string) string {
+	fields := strings.Fields(launchCmd)
+	i := 0
+	// Skip leading environment assignments (FOO=bar copilot ...).
+	for i < len(fields) && !strings.HasPrefix(fields[i], "-") && strings.Contains(fields[i], "=") {
+		i++
+	}
+	if i >= len(fields) {
+		return ""
+	}
+	bin := filepath.Base(fields[i])
+	if bin == "agent-launch.sh" {
+		for j := i + 1; j < len(fields); j++ {
+			if fields[j] == "--backend" && j+1 < len(fields) {
+				return fields[j+1]
+			}
+		}
+		return ""
+	}
+	if IsCLIBackend(bin) {
+		return bin
+	}
+	return ""
+}
+
+// ValidateLaunchCmdBackend rejects an agent whose declared backend and custom
+// launch_cmd CONFIDENTLY disagree — e.g. `backend: copilot` with
+// `launch_cmd: bob --model auto` (#5921). That contradiction used to be
+// accepted silently, and it cannot work: the hive launches the launch_cmd's
+// binary in the pane but every health/readiness/diagnostic path follows the
+// declared backend, so the agent is launched as one CLI, judged as another,
+// and relaunched as "hung" forever.
+//
+// Confidence rules — "" (no opinion) never errors:
+//   - An empty launch_cmd, or one whose binary the hive does not recognize
+//     (an operator wrapper), is not evidence of anything.
+//   - A declared CLI backend must match the launch_cmd's backend exactly.
+//   - Inference backends and configured gateway names run the claude CLI, so
+//     only a launch_cmd launching a DIFFERENT known CLI is a contradiction.
+func (g GovernorConfig) ValidateLaunchCmdBackend(backend, launchCmd string) error {
+	declared := LaunchCmdDeclaredBackend(launchCmd)
+	if declared == "" || backend == "" {
+		return nil
+	}
+	if strings.EqualFold(declared, backend) {
+		return nil
+	}
+	if IsCLIBackend(backend) {
+		return fmt.Errorf("backend %q contradicts launch_cmd %q (it launches %q): the agent would be launched as %s but health-checked and diagnosed as %s, then relaunched as \"hung\" forever — set backend to %s or fix launch_cmd",
+			backend, launchCmd, declared, declared, backend, declared)
+	}
+	// Inference backends and gateway names are served by the claude CLI.
+	if IsInferenceBackend(backend) || g.isGatewayName(backend) {
+		if declared == "claude" {
+			return nil
+		}
+		return fmt.Errorf("backend %q routes through the claude CLI but launch_cmd %q launches %q — clear launch_cmd or point it at claude",
+			backend, launchCmd, declared)
+	}
+	return nil
+}
+
+// agentSourceLabel renders an agent's name for a validation error, naming the
+// per-agent overlay file it came from when there is one (#6024).
+//
+// "agent supervisor" alone is ambiguous: hive.yaml, the ConfigMap seed, the
+// dashboard overlay and /data/agent-configs/<name>.yaml all land in the same
+// agent map, so an operator reading the crash message has no way to know which
+// file to edit - and the overlay directory is the one they are least likely to
+// look in. "agent supervisor (from /data/agent-configs/supervisor.yaml)" turns
+// an 8-hour hunt into a single edit.
+func agentSourceLabel(name, sourceFile string) string {
+	if sourceFile == "" {
+		return name
+	}
+	return fmt.Sprintf("%s (from %s)", name, sourceFile)
+}
+
+// isGatewayName reports whether backend names a configured model gateway,
+// matched case-insensitively to mirror ResolveGateway.
+func (g GovernorConfig) isGatewayName(backend string) bool {
+	for _, gw := range g.ResolvedGateways() {
+		if gw.Name != "" && strings.EqualFold(gw.Name, backend) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Config) validate() error {
 	if c.Project.Org == "" {
 		return fmt.Errorf("project.org is required")
@@ -5069,6 +5199,9 @@ func (c *Config) validate() error {
 	if !ValidateACMMIssueTracker(strings.TrimSpace(c.Governor.ACMM.IssueTracker)) {
 		return fmt.Errorf("governor: invalid acmm.issue_tracker %q (must be %s or %s, or empty for %s)", c.Governor.ACMM.IssueTracker, ACMMIssueTrackerGitHub, ACMMIssueTrackerWorkSource, ACMMIssueTrackerGitHub)
 	}
+	if err := ValidateACMMRepoRoots(c.Governor.ACMM.RepoRoots); err != nil {
+		return fmt.Errorf("governor: %w", err)
+	}
 	for name, agent := range c.Agents {
 		// One gate, shared with the config write path (dashboard agent-config
 		// save) and agreeing with what the launcher can actually dispatch. A
@@ -5076,7 +5209,14 @@ func (c *Config) validate() error {
 		// routes that agent through it, matched case-insensitively to mirror
 		// ResolveGateway.
 		if err := c.Governor.ValidateBackend(agent.Backend); err != nil {
-			return fmt.Errorf("agent %s: %w", name, err)
+			return fmt.Errorf("agent %s: %w", agentSourceLabel(name, agent.sourceFile), err)
+		}
+		// A launch_cmd that confidently launches a DIFFERENT backend than the
+		// declared one is rejected here, at load/save time, instead of being
+		// accepted silently and producing an agent that is launched as one CLI
+		// but judged as another and relaunched as "hung" forever (#5921).
+		if err := c.Governor.ValidateLaunchCmdBackend(agent.Backend, agent.LaunchCmd); err != nil {
+			return fmt.Errorf("agent %s: %w", agentSourceLabel(name, agent.sourceFile), err)
 		}
 		if !ValidateCavemanMode(agent.CavemanMode) {
 			return fmt.Errorf("agent %s: invalid caveman_mode %q (must be lite, full, ultra, or wenyan)", name, agent.CavemanMode)

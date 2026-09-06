@@ -153,7 +153,7 @@ case "$1 $2" in
       echo "gh: a pull request for branch release-gate/v4.0.1 already exists"
       exit 1
     fi
-    echo "https://github.com/kubestellar/hive/pull/9999"
+    echo "https://github.com/hivecommons/hive/pull/9999"
     exit 0 ;;
   "pr close")
     exit 0 ;;
@@ -176,7 +176,7 @@ run_step() {
   RPR_SCENARIO="$1" RPR_TAG_SCENARIO="${2:-ok}" RPR_STATE="$st" \
     RELEASE_PUSH_GH006_WINDOW="${3:-120}" \
     VERSION="4.0.1" SHA="deadbeefcafe" GITHUB_OUTPUT="$st/gh_output" \
-    GITHUB_REPOSITORY="kubestellar/hive" \
+    GITHUB_REPOSITORY="hivecommons/hive" \
     PATH="$tmp/bin:$PATH" bash "$tmp/push_v4.sh" > "$st/out" 2>&1
   rc=$?
   output=$(cat "$st/out")

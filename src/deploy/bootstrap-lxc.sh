@@ -19,7 +19,7 @@ set -euo pipefail
 #
 # Usage:
 #   apt-get update -qq && apt-get install -y -qq curl
-#   curl -fsSL https://raw.githubusercontent.com/kubestellar/hive/HEAD/src/deploy/bootstrap-lxc.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/hivecommons/hive/HEAD/src/deploy/bootstrap-lxc.sh | bash
 #
 # After bootstrap, edit /opt/hive/.env and run:
 #   cd /opt/hive/src/deploy && docker compose -f docker-compose.yaml --env-file /opt/hive/.env up -d
@@ -55,7 +55,7 @@ if [ -d "${HIVE_DIR}/.git" ]; then
   echo "Hive repo already exists at ${HIVE_DIR}, pulling latest..."
   cd "${HIVE_DIR}" && git pull --rebase origin "${HIVE_BRANCH}"
 else
-  git clone --branch "${HIVE_BRANCH}" --single-branch https://github.com/kubestellar/hive.git "${HIVE_DIR}"
+  git clone --branch "${HIVE_BRANCH}" --single-branch https://github.com/hivecommons/hive.git "${HIVE_DIR}"
 fi
 
 echo "=== Phase 4: Build Docker image ==="

@@ -16,9 +16,9 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v72/github"
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/ioscan"
-	"github.com/kubestellar/hive/pkg/logscrub"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/ioscan"
+	"github.com/hivecommons/hive/pkg/logscrub"
 )
 
 // ErrNoGitHubClient is returned by *Client methods invoked on a nil receiver.
@@ -31,7 +31,11 @@ import (
 var ErrNoGitHubClient = errors.New("no github client configured (hive is running without GitHub credentials)")
 
 type Client struct {
-	client       *gh.Client
+	client *gh.Client
+	// rateLimits clamps rate-limit readings to be monotone within a window
+	// (kubestellar/hive#5733). Per-client because the artifact it corrects is a
+	// property of THIS client's token minting. Zero value is ready to use.
+	rateLimits   rateLimitTracker
 	org          string
 	reposMu      sync.RWMutex
 	repos        []string
@@ -478,6 +482,16 @@ func NewClientForTest(serverURL string, org string, repos []string, logger *slog
 	}
 	c.client.BaseURL = base
 	return c
+}
+
+// SetOrg is nil-receiver safe for the same reason as SetRepos: dashboard saves
+// and hub heartbeat delivery can retarget a running hive without rebuilding the
+// GitHub client, so the owner's namespace must stay in sync with config.
+func (c *Client) SetOrg(org string) {
+	if c == nil {
+		return
+	}
+	c.org = org
 }
 
 // SetRepos is nil-receiver safe. A hive that booted without usable GitHub
@@ -1278,6 +1292,12 @@ type RateLimitEntry struct {
 	Limit     int       `json:"limit"`
 	Remaining int       `json:"remaining"`
 	Reset     time.Time `json:"reset"`
+	// ObservedAt is when this reading was actually taken. Reset alone cannot
+	// answer "how old is this number" — it moves independently of the sample,
+	// and on the deployment in kubestellar/hive#5733 it was 8.5 minutes adrift
+	// of reality while the card sat pinned at the full limit. A value that
+	// stops updating is now visibly stale rather than silently confident.
+	ObservedAt time.Time `json:"observed_at"`
 }
 
 func (c *Client) RateLimits(ctx context.Context) (*RateLimitInfo, error) {
@@ -1308,6 +1328,19 @@ func (c *Client) RateLimits(ctx context.Context) (*RateLimitInfo, error) {
 			Reset:     limits.GraphQL.Reset.Time,
 		}
 	}
+
+	// Clamp to monotone-within-window before anything sees these numbers
+	// (kubestellar/hive#5733). A just-minted installation token reports a fresh,
+	// EMPTY bucket for the installation's shared budget, and latching that made
+	// the dashboard claim 100% headroom at ~89% real usage. Applied here rather
+	// than in the dashboard so every consumer of RateLimits() inherits it — the
+	// status card and /api/gh-rate-limits are both display paths, and a future
+	// caller that gates work on headroom must not be handed the raw artifact.
+	// See ratelimit_window.go for the mechanism and why the obvious
+	// reset-based clamp does not work.
+	info.Core = c.rateLimits.observe("core", info.Core)
+	info.Search = c.rateLimits.observe("search", info.Search)
+	info.GraphQL = c.rateLimits.observe("graphql", info.GraphQL)
 
 	return info, nil
 }
@@ -1423,6 +1456,10 @@ func (c *Client) PathExistsAtRef(ctx context.Context, owner, repo, path, ref str
 
 // SearchPRCount searches GitHub for PRs by author within an org.
 // state is "open" or "merged".
+// NOTE (org transfer): the org qualifier uses the CONFIGURED org verbatim.
+// Unlike the REST repo endpoints, GitHub SEARCH does not follow repository
+// transfers or redirects — after a repo moves orgs, a stale configured org
+// here quietly searches the old (now empty) org and returns 0.
 func (c *Client) SearchPRCount(ctx context.Context, author, org, state string) (int, error) {
 	qualifier := fmt.Sprintf("type:pr author:%s org:%s", author, org)
 	if state == "merged" {
@@ -1450,6 +1487,9 @@ func (c *Client) SearchOutreachPRCount(ctx context.Context, author, org, project
 	}
 	// Match the old hive query: author:X type:pr is:STATE "ProjectName" in:title -org:ORG
 	// The -org: prefix excludes PRs within the org, showing only external outreach PRs.
+	// NOTE (org transfer): like SearchPRCount, the -org: qualifier takes the
+	// CONFIGURED org verbatim — GitHub search does not follow repo transfers,
+	// so a stale org keeps counting PRs against the old org name.
 	// Without the projectName filter, this returns ALL external PRs by the author, inflating the count.
 	qualifier := fmt.Sprintf("type:pr author:%s -org:%s \"%s\" in:title", author, org, projectName)
 	if state == "merged" {

@@ -112,6 +112,32 @@ Auth levels are derived from dashboard middleware (`isPublicPath`, dashboard tok
 | `GET` | `/api/config/sidebar` | Dashboard auth/session | Sidebar Get | `pkg/dashboard/api.go:172` |
 | `PUT` | `/api/config/sidebar` | Dashboard auth/session | Sidebar Set | `pkg/dashboard/api.go:173` |
 | `GET` | `/api/config/backends` | Dashboard auth/session | Backends | `pkg/dashboard/api.go:174` |
+| `GET` | `/api/config/governor/threshold-scaling` | Dashboard auth/session | Governor Threshold Scaling Get | `pkg/dashboard/api.go:152` |
+| `PUT` | `/api/config/governor/threshold-scaling` | Dashboard auth/session | Governor Threshold Scaling Set | `pkg/dashboard/api.go:153` |
+| `POST` | `/api/config/governor/budget/reset` | Dashboard auth/session | Governor Budget Reset | `pkg/dashboard/api.go:156` |
+| `PUT` | `/api/config/governor/watchdog` | Dashboard auth/session | Governor Watchdog | `pkg/dashboard/api.go:159` |
+| `GET` | `/api/config/escalation` | Dashboard auth/session | Escalation Config Get | `pkg/dashboard/api.go:162` |
+| `PUT` | `/api/config/escalation` | Dashboard auth/session | Escalation Config Set | `pkg/dashboard/api.go:163` |
+| `GET` | `/api/config/review` | Dashboard auth/session | Review Config Get | `pkg/dashboard/api.go:166` |
+| `PUT` | `/api/config/review` | Dashboard auth/session | Review Config Set | `pkg/dashboard/api.go:167` |
+| `PUT` | `/api/config/governor/features` | Dashboard auth/session | Governor Features | `pkg/dashboard/api.go:173` |
+| `GET` | `/api/config/governor/general-advanced` | Dashboard auth/session | Governor General Advanced Get | `pkg/dashboard/api.go:174` |
+| `PUT` | `/api/config/governor/general-advanced` | Dashboard auth/session | Governor General Advanced Set | `pkg/dashboard/api.go:175` |
+| `GET` | `/api/config/auto-merge` | Dashboard auth/session | Auto-Merge Config Get | `pkg/dashboard/api.go:179` |
+| `PUT` | `/api/config/auto-merge` | Dashboard auth/session | Auto-Merge Config Set | `pkg/dashboard/api.go:180` |
+| `GET` | `/api/config/convergence` | Dashboard auth/session | Convergence Config Get | `pkg/dashboard/api.go:185` |
+| `PUT` | `/api/config/convergence` | Dashboard auth/session | Convergence Config Set | `pkg/dashboard/api.go:186` |
+| `GET` | `/api/config/governor/advisory` | Dashboard auth/session | Governor Advisory Get | `pkg/dashboard/api.go:188` |
+| `PUT` | `/api/config/governor/advisory` | Dashboard auth/session | Governor Advisory Set | `pkg/dashboard/api.go:189` |
+| `GET` | `/api/config/governor/replan` | Dashboard auth/session | Governor Replan Get | `pkg/dashboard/api.go:190` |
+| `PUT` | `/api/config/governor/replan` | Dashboard auth/session | Governor Replan Set | `pkg/dashboard/api.go:191` |
+| `GET` | `/api/config/governor/work-source` | Dashboard auth/session | Governor Work Source Get | `pkg/dashboard/api.go:192` |
+| `PUT` | `/api/config/governor/work-source` | Dashboard auth/session | Governor Work Source Set | `pkg/dashboard/api.go:193` |
+| `PUT` | `/api/config/governor/security` | Dashboard auth/session | Governor Security | `pkg/dashboard/api.go:194` |
+| `GET` | `/api/config/governor/project-observability` | Dashboard auth/session | Governor Project Observability Get | `pkg/dashboard/api.go:195` |
+| `PUT` | `/api/config/governor/project-observability` | Dashboard auth/session | Governor Project Observability Set | `pkg/dashboard/api.go:196` |
+| `GET` | `/api/config/governor/inference-auth` | Dashboard auth/session | Governor Inference Auth Get | `pkg/dashboard/api.go:211` |
+| `PUT` | `/api/config/governor/inference-auth` | Dashboard auth/session | Governor Inference Auth Set | `pkg/dashboard/api.go:212` |
 
 ## Agents and controls
 
@@ -135,6 +161,12 @@ Auth levels are derived from dashboard middleware (`isPublicPath`, dashboard tok
 | `POST` | `/api/agents` | Dashboard auth/session | Agent Create | `pkg/dashboard/api.go:161` |
 | `POST` | `/api/agents/import` | Dashboard auth/session | Agent Import | `pkg/dashboard/api.go:162` |
 | `DELETE` | `/api/agents/{name}` | Dashboard auth/session | Agent Delete | `pkg/dashboard/api.go:163` |
+| `GET` | `/api/agents/{name}/log` | Dashboard auth/session | Agent Full Log | `pkg/dashboard/api.go:72` |
+| `GET` | `/api/agents/{name}/terminal-urls` | Dashboard auth/session | Agent Terminal URLs | `pkg/dashboard/api.go:76` |
+| `GET` | `/api/agents/{name}/kicks` | Dashboard auth/session | Agent Kick Log List | `pkg/dashboard/api.go:79` |
+| `GET` | `/api/agents/{name}/kicks/{id}` | Dashboard auth/session | Agent Kick Log Get | `pkg/dashboard/api.go:80` |
+| `GET` | `/agents/{name}/kicks` | Dashboard auth/session | Agent Kick History Page (HTML) | `pkg/dashboard/api.go:81` |
+| `POST` | `/api/agents/{name}/login-code` | Dashboard auth/session | Agent Login Code | `pkg/dashboard/api.go:102` |
 
 ### Kick is asynchronous
 
@@ -157,7 +189,8 @@ Read the result from `GET /api/kick/{agent}/status`, which returns `status` of `
 | `GET` | `/api/packs` | Dashboard auth/session | Packs List | `pkg/dashboard/api.go:165` |
 | `POST` | `/api/packs/{level}/apply` | Dashboard auth/session | Pack Apply | `pkg/dashboard/api.go:166` |
 | `PUT` | `/api/packs/level` | Dashboard auth/session | Pack Set Level | `pkg/dashboard/api.go:167` |
-| `GET` | `/api/acmm/evaluation` | Dashboard auth/session | ACMMEvaluation | `pkg/dashboard/api.go:169` |
+| `POST` | `/api/repos/rescan` | Dashboard auth/session | Re-enumerate watched repositories' open issues/PRs for the dashboard Repositories cards. The scan is read-only with respect to agents/governor actions, collapses concurrent requests, and debounces repeated presses for 30 seconds (`repoRescanDebounce`) so the button cannot hammer GitHub | `pkg/dashboard/api.go`, `pkg/dashboard/api_repos_rescan.go` |
+| `GET` | `/api/acmm/evaluation` | Dashboard auth/session | ACMMEvaluation — combined codebase + operational result, cached server-side for 1 hour (`acmmEvalTTL`). `?refresh=1` (the dashboard's "🔄 Re-evaluate" button, #5877) bypasses the hourly TTL but is debounced server-side: requests within 1 minute of the last evaluation (`acmmRefreshDebounce`) still serve the cache, since a full refresh costs up to ~29 GitHub GetContents calls per repo. The response's `last_evaluated_at` timestamp reports when the cached evaluation was computed. Repos listed in `governor.acmm.repo_roots` are probed under that subdirectory as well (roughly twice the calls for that repo) — see [ACMM policy matrix](acmm-policy-matrix.md#repositories-whose-module-lives-in-a-subdirectory) | `pkg/dashboard/api.go:244`, `pkg/dashboard/api_acmm_eval.go` |
 | `POST` | `/api/acmm/issue` | Dashboard auth/session | ACMMCreate Issue — files on GitHub or, with `governor.acmm.issue_tracker: work_source` / body `tracker: "work_source"` on a Linear-sourced hive, on Linear; response `tracker` says which. See [ACMM policy matrix](acmm-policy-matrix.md#where-acmm-gap-issues-are-filed) | `pkg/dashboard/api.go:170` |
 | `GET` | `/api/acmm-recommendation` | Dashboard auth/session | Advisory level-up recommendation (`acmmadvisor.Recommendation`, JSON): never changes the applied level — see [ACMM advisor](acmm-advisor.md) | `pkg/dashboard/api.go:230` |
 
@@ -174,6 +207,8 @@ Read the result from `GET /api/kick/{agent}/status`, which returns `status` of `
 | `GET` | `/api/cost/history` | Dashboard auth/session | Cost History | `pkg/dashboard/api.go:84` |
 | `GET` | `/api/trend/history` | Dashboard auth/session | Trend History | `pkg/dashboard/api.go:85` |
 | `GET` | `/api/timeseries` | Dashboard auth/session | Time Series | `pkg/dashboard/api.go:86` |
+| `GET` | `/api/providers/headroom` | Dashboard auth/session | Providers Headroom | `pkg/dashboard/api.go:52` |
+| `GET` | `/api/budget/history` | Dashboard auth/session | Budget History | `pkg/dashboard/api.go:113` |
 
 ## Knowledge
 
@@ -215,6 +250,8 @@ Read the result from `GET /api/kick/{agent}/status`, which returns `status` of `
 | `POST` | `/api/knowledge/documents/{slug}/reimport` | Dashboard auth/session | Document Reimport | `pkg/dashboard/api.go:210` |
 | `GET` | `/api/knowledge/context7/search` | Dashboard auth/session | Context7 Search | `pkg/dashboard/api.go:211` |
 | `POST` | `/api/knowledge/cleanup-orphans` | Dashboard auth/session | Cleanup Orphans | `pkg/dashboard/api.go:212` |
+| `GET` | `/api/knowledge/channels` | Dashboard auth/session | Knowledge Channels List | `pkg/dashboard/api.go:262` |
+| `POST` | `/api/knowledge/channels` | Dashboard auth/session | Knowledge Channel Create | `pkg/dashboard/api.go:263` |
 
 ## Contribute
 
@@ -248,6 +285,11 @@ Read the result from `GET /api/kick/{agent}/status`, which returns `status` of `
 | `POST` | `/api/contributors/{id}/revoke` | Dashboard auth/session | Contributor Revoke | `pkg/dashboard/api_contribute.go:299` |
 | `POST` | `/api/contributors/{id}/requeue` | Dashboard auth/session | Contributor Requeue | `pkg/dashboard/api_contribute.go:300` |
 | `DELETE` | `/api/contributors/{id}` | Dashboard auth/session | Contributor Delete | `pkg/dashboard/api_contribute.go:301` |
+| `GET` | `/contribute/dossier/{username}` | Public | Contributor Dossier Page (HTML) | `pkg/dashboard/api_contribute.go:301` |
+| `GET` | `/api/contribute/run-stats` | Public | Contribute Run Stats | `pkg/dashboard/api_contribute.go:340` |
+| `GET` | `/api/contribute/dossier` | Public | Contribute Dossier Get | `pkg/dashboard/api_contribute.go:371` |
+| `POST` | `/api/contribute/dossier` | Public | Contribute Dossier Update | `pkg/dashboard/api_contribute.go:372` |
+| `GET` | `/api/leaderboard/contributor/{username}/heraldry` | Public | Contributor Heraldry | `pkg/dashboard/api_contribute.go:399` |
 
 ### `/api/v1` contributor subpaths
 
@@ -257,7 +299,11 @@ header, using either the `Bearer <token>` scheme (hosted clients) or the
 legacy `token <token>` scheme (what `gh auth token` and older hive CLIs
 send). Both are accepted; the legacy scheme is retained for backward
 compatibility. Credentials in the query string (`?token=`) are NOT supported
-and are rejected, because query strings land in ingress and access logs.
+and are rejected, because query strings land in ingress and access logs. The
+same rule applies to the shared dashboard owner token: send it in the
+`Authorization` header, not in URLs. Dashboard terminal links use
+`/api/terminal/handoff` to mint a ≤60-second single-use `code` for the browser
+navigation instead of putting the owner token in the terminal URL.
 
 Authorization: every `/api/v1` path except `/api/v1/me` additionally requires
 the caller to be in the hive's authorized-users allowlist (any role), and
@@ -344,6 +390,16 @@ always resolved server-side from the validated token.
 | `POST` | `/api/banner-dismissed` | Dashboard auth/session | Banner Dismissed | `pkg/dashboard/api.go:55` |
 | `GET` | `/api/history` | Dashboard auth/session | History | `pkg/dashboard/api.go:59` |
 | `GET` | `/api/timeline` | Dashboard auth/session | Timeline | `pkg/dashboard/api.go:61` |
+| `GET` | `/api/lifecycle-timeline` | Dashboard auth/session | Issue→PR lifecycle journeys plus derived stage timeline | `pkg/dashboard/api.go:67` |
+| `GET` | `/api/convergence/soak` | Dashboard auth/session | Convergence Soak Status | `pkg/dashboard/api.go:187` |
+| `POST` | `/api/plan/from-issue` | Dashboard auth/session | Plan From Issue | `pkg/dashboard/api.go:313` |
+| `GET` | `/api/plan/{epicID}` | Dashboard auth/session | Plan Tree | `pkg/dashboard/api.go:314` |
+| `POST` | `/api/plan/{epicID}/approve` | Dashboard auth/session | Plan Approve | `pkg/dashboard/api.go:315` |
+| `POST` | `/api/plan/{epicID}/reject` | Dashboard auth/session | Plan Reject | `pkg/dashboard/api.go:316` |
+| `POST` | `/api/plan/{epicID}/child/{childID}` | Dashboard auth/session | Plan Child Action | `pkg/dashboard/api.go:317` |
+| `POST` | `/api/linear/agent/install` | Dashboard auth/session | Linear Agent Install (OAuth start) | `pkg/dashboard/api_linear_agent.go:271` |
+| `GET` | `/api/linear/agent/status` | Dashboard auth/session | Linear Agent Status | `pkg/dashboard/api_linear_agent.go:272` |
+| `POST` | `/api/linear/agent/disconnect` | Dashboard auth/session | Linear Agent Disconnect | `pkg/dashboard/api_linear_agent.go:273` |
 | `GET` | `/api/widget` | Dashboard auth/session | Widget | `pkg/dashboard/api.go:62` |
 | `GET` | `/api/pane/{agent}` | Dashboard auth/session | Pane | `pkg/dashboard/api.go:63` |
 | `GET` | `/api/role` | Dashboard auth/session | Role | `pkg/dashboard/api.go:65` |

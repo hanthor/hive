@@ -18,8 +18,8 @@ from source) the directory layout:
 
 | | v2 | v4 |
 | --- | --- | --- |
-| Compose image | `ghcr.io/kubestellar/hive:v2-latest` | `ghcr.io/kubestellar/hive:stable` |
-| Kubernetes image | `hive:latest` | `ghcr.io/kubestellar/hive:stable` |
+| Compose image | `ghcr.io/hivecommons/hive:v2-latest` | `ghcr.io/hivecommons/hive:stable` |
+| Kubernetes image | `hive:latest` | `ghcr.io/hivecommons/hive:stable` |
 | Compose published ports | `3001`, `7681` | `3001` only |
 | Source tree | `v2/` | `src/` |
 | Build context | `v2/Dockerfile` | `src/Dockerfile` |
@@ -30,7 +30,7 @@ from source) the directory layout:
 `v2` branch does not have. `v2` is in low-rate maintenance rather than fully
 stopped — it still receives occasional backports — but it is not where
 development happens, and new work targets `v4`
-(see [CONTRIBUTING.md](https://github.com/kubestellar/hive/blob/v4/CONTRIBUTING.md)).
+(see [CONTRIBUTING.md](https://github.com/hivecommons/hive/blob/v4/CONTRIBUTING.md)).
 
 The `v2-latest` image tag belongs to the `v2` branch and **resolves to a
 different, older digest than the v4 channels**. It is not a rolling tag that
@@ -76,8 +76,8 @@ mapping to "fix" the breakage — doing so restores an unauthenticated shell.
 ### Image and build context
 
 ```diff
--    image: ghcr.io/kubestellar/hive:v2-latest
-+    image: ghcr.io/kubestellar/hive:stable
+-    image: ghcr.io/hivecommons/hive:v2-latest
++    image: ghcr.io/hivecommons/hive:stable
      build:
        context: ..
 -      dockerfile: v2/Dockerfile
@@ -85,7 +85,7 @@ mapping to "fix" the breakage — doing so restores an unauthenticated shell.
 ```
 
 `stable` is the operator-blessed release channel. For a reproducible deployment,
-pin a digest instead — `ghcr.io/kubestellar/hive@sha256:<digest>` — and manage
+pin a digest instead — `ghcr.io/hivecommons/hive@sha256:<digest>` — and manage
 upgrades yourself.
 
 ### Other compose changes worth knowing
@@ -96,7 +96,7 @@ upgrades yourself.
   auto-update profile, so Watchtower no longer receives the full daemon socket.
   See [auto-update-profile.md](auto-update-profile.md) before enabling it.
 - Standalone image references now come from one source of truth,
-  [`src/deploy/standalone-images.sh`](https://github.com/kubestellar/hive/blob/v4/src/deploy/standalone-images.sh),
+  [`src/deploy/standalone-images.sh`](https://github.com/hivecommons/hive/blob/v4/src/deploy/standalone-images.sh),
   which a build test enforces.
 
 ## Kubernetes
@@ -109,7 +109,7 @@ needs unless you carry them across.
 
 ```diff
 -          image: hive:latest
-+          image: ghcr.io/kubestellar/hive:stable
++          image: ghcr.io/hivecommons/hive:stable
 ```
 
 **Pod securityContext** — `fsGroup: 1002` is added:

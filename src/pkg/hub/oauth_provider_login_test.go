@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kubestellar/hive/pkg/auth"
+	"github.com/hivecommons/hive/pkg/auth"
 )
 
 func TestHandleProviderLoginUnknownProvider(t *testing.T) {
@@ -58,8 +58,8 @@ func TestHandleProviderLoginStartsProviderFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse location: %v", err)
 	}
-	if got := parsed.Query().Get("redirect_uri"); got != oauthRedirectURI {
-		t.Fatalf("redirect_uri = %q, want %q", got, oauthRedirectURI)
+	if got := parsed.Query().Get("redirect_uri"); got != oauthRedirectURI() {
+		t.Fatalf("redirect_uri = %q, want %q", got, oauthRedirectURI())
 	}
 	var stateCookie *http.Cookie
 	for _, c := range rec.Result().Cookies() {
