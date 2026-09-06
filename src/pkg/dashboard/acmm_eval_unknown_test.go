@@ -57,15 +57,22 @@ func newTriStateServer(t *testing.T) *Server {
 func TestProbePattern_TriState(t *testing.T) {
 	s := newTriStateServer(t)
 	empty := map[string]map[string]bool{}
-	cases := map[string]probeResult{
-		"go.mod":      probePresent,
-		"missing.txt": probeAbsent,
-		"broken.txt":  probeUnknown,
-		"limited.txt": probeUnknown,
+	// Ordered, with the rate-limited probe LAST: go-github remembers a 403
+	// rate-limit answer client-side and short-circuits every later call on
+	// the same client until the reset time, so probing it first would turn
+	// the go.mod case into unknown and make this test order-dependent.
+	cases := []struct {
+		path string
+		want probeResult
+	}{
+		{"go.mod", probePresent},
+		{"missing.txt", probeAbsent},
+		{"broken.txt", probeUnknown},
+		{"limited.txt", probeUnknown},
 	}
-	for path, want := range cases {
-		if got := s.probePattern(t.Context(), "myorg", "repo1", path, empty); got != want {
-			t.Errorf("probePattern(%q) = %v, want %v", path, got, want)
+	for _, tc := range cases {
+		if got := s.probePattern(t.Context(), "myorg", "repo1", tc.path, empty); got != tc.want {
+			t.Errorf("probePattern(%q) = %v, want %v", tc.path, got, tc.want)
 		}
 	}
 	// The boolean view is true only for a definite hit — an unknown probe
