@@ -3,6 +3,7 @@ package dashboard
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -33,18 +34,23 @@ const acmmIssueLabelDesc = "ACMM criterion gap identified by hive evaluation"
 
 // ACMMEvaluation is the combined codebase + operational ACMM evaluation result.
 type ACMMEvaluation struct {
-	CodebaseLevel     int               `json:"codebase_level"`
-	CodebaseLevelName string            `json:"codebase_level_name"`
-	OperationalLevel  int               `json:"operational_level"`
-	OperationalName   string            `json:"operational_name"`
-	OverallLevel      int               `json:"overall_level"`
-	CriteriaTotal     int               `json:"criteria_total"`
-	CriteriaPassed    int               `json:"criteria_passed"`
-	LastEvaluatedAt   string            `json:"last_evaluated_at"`
-	Levels            []ACMMLevelScore  `json:"levels"`
-	CriteriaResults   []CriterionResult `json:"criteria_results,omitempty"`
-	RepoResults       []RepoEvaluation  `json:"repo_results,omitempty"`
-	Error             string            `json:"error,omitempty"`
+	CodebaseLevel     int    `json:"codebase_level"`
+	CodebaseLevelName string `json:"codebase_level_name"`
+	OperationalLevel  int    `json:"operational_level"`
+	OperationalName   string `json:"operational_name"`
+	OverallLevel      int    `json:"overall_level"`
+	CriteriaTotal     int    `json:"criteria_total"`
+	CriteriaPassed    int    `json:"criteria_passed"`
+	// CriteriaUnknown counts criteria the evaluation could not decide because
+	// GitHub did not answer (rate limit, per-repo deadline, 5xx). They are
+	// scored as not-matched so an incomplete evaluation can never inflate a
+	// level, and they are never eligible for a gap issue.
+	CriteriaUnknown int               `json:"criteria_unknown,omitempty"`
+	LastEvaluatedAt string            `json:"last_evaluated_at"`
+	Levels          []ACMMLevelScore  `json:"levels"`
+	CriteriaResults []CriterionResult `json:"criteria_results,omitempty"`
+	RepoResults     []RepoEvaluation  `json:"repo_results,omitempty"`
+	Error           string            `json:"error,omitempty"`
 	// IssueTracker is where "Open Issue" files by default for this hive —
 	// "github" or "linear" — after resolving governor.acmm.issue_tracker
 	// against the work source. The dashboard's tracker selector defaults
@@ -62,6 +68,7 @@ type RepoEvaluation struct {
 	BlockedAtLevel  int               `json:"blocked_at_level"`
 	CriteriaTotal   int               `json:"criteria_total"`
 	CriteriaPassed  int               `json:"criteria_passed"`
+	CriteriaUnknown int               `json:"criteria_unknown,omitempty"`
 	Levels          []ACMMLevelScore  `json:"levels"`
 	CriteriaResults []CriterionResult `json:"criteria_results"`
 }
@@ -75,6 +82,9 @@ type ACMMLevelScore struct {
 	Passed    bool    `json:"passed"`
 	Total     int     `json:"total"`
 	Matched   int     `json:"matched"`
+	// Unknown is how many of Total could not be evaluated. Total still
+	// includes them, so Score is a floor, never an estimate.
+	Unknown int `json:"unknown,omitempty"`
 }
 
 // CriterionResult records whether an individual criterion was detected.
@@ -85,7 +95,16 @@ type CriterionResult struct {
 	Category string   `json:"category"`
 	Patterns []string `json:"patterns"`
 	Passed   bool     `json:"passed"`
-	Repo     string   `json:"repo,omitempty"`
+	// Unknown is set when no pattern was found AND at least one probe got no
+	// answer from GitHub. A criterion is only "missing" when every probe was
+	// a definite 404; anything else — rate limit, the per-repo deadline
+	// expiring mid-evaluation, a 5xx — is not evidence of absence. Before
+	// this flag existed those errors read as "file absent", and the
+	// dashboard's Open All filed gap issues for files that were there
+	// (tunaOS#2286/#2287/#2298/#2299 asked for tests/, tests/e2e/,
+	// .github/workflows/ and codecov.yml on a repo that had all four).
+	Unknown bool   `json:"unknown,omitempty"`
+	Repo    string `json:"repo,omitempty"`
 }
 
 // ACMMIssueRequest is the payload for creating an ACMM gap issue.
@@ -217,6 +236,21 @@ func (s *Server) handleACMMCreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A gap issue is only meaningful for a criterion the last evaluation
+	// found MISSING. Filing for one that passes is noise; filing for one the
+	// evaluation could not decide is how a rate-limited run turned into
+	// bogus "Add CI/CD pipeline" issues on a repo with 40 workflows.
+	if verdict, ok := s.cachedCriterionVerdict(req.Repo, req.CriterionID); ok {
+		switch {
+		case verdict.Passed:
+			http.Error(w, fmt.Sprintf("criterion %s currently passes in %s; re-evaluate before filing", req.CriterionID, req.Repo), http.StatusConflict)
+			return
+		case verdict.Unknown:
+			http.Error(w, fmt.Sprintf("criterion %s could not be evaluated in %s (GitHub did not answer: rate limit, timeout or error); re-evaluate before filing", req.CriterionID, req.Repo), http.StatusConflict)
+			return
+		}
+	}
+
 	title, body := acmmIssueContent(criterion)
 
 	// Invocation-attribution trail: this issue is created by the hive on an
@@ -243,6 +277,20 @@ func (s *Server) handleACMMCreateIssue(w http.ResponseWriter, r *http.Request) {
 	ghClient := s.deps.GHClient.GoGitHub()
 	if ghClient == nil {
 		http.Error(w, "GitHub client not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	// The dashboard remembers issues it opened only for the current page
+	// load, so a reload — or a second operator — re-files the same gap. The
+	// repo is the durable record: reuse an open acmm issue for this
+	// criterion when one exists.
+	if existing := s.findOpenACMMIssue(ctx, ghClient, owner, req.Repo, criterion.ID); existing != nil {
+		jsonResponse(w, map[string]interface{}{
+			"tracker":      acmmIssueDestinationGitHub,
+			"issue_number": existing.GetNumber(),
+			"issue_url":    existing.GetHTMLURL(),
+			"existing":     true,
+		})
 		return
 	}
 
@@ -385,7 +433,7 @@ func acmmIssueContent(criterion *ACMMCriterion) (title, body string) {
 	body = fmt.Sprintf("## ACMM Gap: %s\n\n"+
 		"**Level:** L%d %s\n"+
 		"**Category:** %s\n"+
-		"**Criterion ID:** `%s`\n\n"+
+		"%s\n\n"+
 		"### What's needed\n\n"+
 		"This repository is missing one of the following files or directories:\n\n"+
 		"%s\n"+
@@ -401,7 +449,7 @@ func acmmIssueContent(criterion *ACMMCriterion) (title, body string) {
 		criterion.Name,
 		criterion.Level, levelName,
 		criterion.Category,
-		criterion.ID,
+		acmmCriterionMarker(criterion.ID),
 		patternsStr.String(),
 		criterion.Level, levelName,
 		acmmCriterionWhyItMatters(criterion.Level, criterion.Category),
@@ -475,8 +523,10 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 	}
 
 	var repoEvals []RepoEvaluation
-	// Aggregate: a criterion passes if it passes in ANY repo.
+	// Aggregate: a criterion passes if it passes in ANY repo, and is unknown
+	// if it passed nowhere but could not be evaluated somewhere.
 	aggPassed := make(map[string]bool)
+	aggUnknown := make(map[string]bool)
 
 	for _, repo := range repos {
 		ctx, cancel := context.WithTimeout(context.Background(), acmmPerRepoTimeout)
@@ -484,7 +534,7 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 
 		var results []CriterionResult
 		for _, c := range universalCriteria {
-			passed := s.checkCriterion(ctx, owner, repo, c, dirCache)
+			passed, unknown := s.checkCriterion(ctx, owner, repo, c, dirCache)
 			results = append(results, CriterionResult{
 				ID:       c.ID,
 				Name:     c.Name,
@@ -492,10 +542,14 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 				Category: c.Category,
 				Patterns: c.Patterns,
 				Passed:   passed,
+				Unknown:  unknown,
 				Repo:     repo,
 			})
 			if passed {
 				aggPassed[c.ID] = true
+			}
+			if unknown {
+				aggUnknown[c.ID] = true
 			}
 		}
 		cancel()
@@ -508,6 +562,7 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 			BlockedAtLevel:  acmmBlockedAtLevel(scored.Levels),
 			CriteriaTotal:   scored.CriteriaTotal,
 			CriteriaPassed:  scored.CriteriaPassed,
+			CriteriaUnknown: scored.CriteriaUnknown,
 			Levels:          scored.Levels,
 			CriteriaResults: scored.CriteriaResults,
 		})
@@ -523,6 +578,7 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 			Category: c.Category,
 			Patterns: c.Patterns,
 			Passed:   aggPassed[c.ID],
+			Unknown:  !aggPassed[c.ID] && aggUnknown[c.ID],
 		})
 	}
 
@@ -575,19 +631,47 @@ func (s *Server) prefetchDirectories(ctx context.Context, owner, repo string) ma
 	return cache
 }
 
-// checkCriterion returns true if any of the criterion's patterns exist in the repo.
-func (s *Server) checkCriterion(ctx context.Context, owner, repo string, c ACMMCriterion, dirCache map[string]map[string]bool) bool {
+// probeResult is the tri-state answer to "does this path exist in the repo".
+type probeResult int
+
+const (
+	// probeAbsent is a definite answer: GitHub said 404, or the parent
+	// directory was listed and the entry is not in it.
+	probeAbsent probeResult = iota
+	// probePresent is a definite answer: the path exists.
+	probePresent
+	// probeUnknown means GitHub did not answer the question — rate limit,
+	// abuse limit, the per-repo deadline expiring mid-evaluation, a 5xx, or
+	// no client at all. It is NOT evidence that the path is missing.
+	probeUnknown
+)
+
+// checkCriterion reports whether any of the criterion's patterns exist in
+// the repo. unknown is true when nothing was found AND at least one probe
+// got no answer, so the caller can tell "missing" from "could not tell".
+func (s *Server) checkCriterion(ctx context.Context, owner, repo string, c ACMMCriterion, dirCache map[string]map[string]bool) (passed, unknown bool) {
 	for _, pattern := range c.Patterns {
-		if s.patternExists(ctx, owner, repo, pattern, dirCache) {
-			return true
+		switch s.probePattern(ctx, owner, repo, pattern, dirCache) {
+		case probePresent:
+			return true, false
+		case probeUnknown:
+			unknown = true
 		}
 	}
-	return false
+	return false, unknown
 }
 
-// patternExists checks if a file or directory path exists, using the
-// pre-fetched directory cache when possible.
+// patternExists is the boolean view of probePattern: true only for a
+// definite hit. Callers that need to distinguish absent from unknown use
+// probePattern directly.
 func (s *Server) patternExists(ctx context.Context, owner, repo, path string, dirCache map[string]map[string]bool) bool {
+	return s.probePattern(ctx, owner, repo, path, dirCache) == probePresent
+}
+
+// probePattern checks if a file or directory path exists, using the
+// pre-fetched directory cache when possible. A cached listing is
+// authoritative for its directory; only the live fallback can be unknown.
+func (s *Server) probePattern(ctx context.Context, owner, repo, path string, dirCache map[string]map[string]bool) probeResult {
 	isDir := strings.HasSuffix(path, "/")
 	cleanPath := strings.TrimSuffix(path, "/")
 
@@ -600,17 +684,38 @@ func (s *Server) patternExists(ctx context.Context, owner, repo, path string, di
 
 	if entries, ok := dirCache[parent]; ok {
 		if isDir {
-			return entries[base+"/"] || entries[base]
+			if entries[base+"/"] || entries[base] {
+				return probePresent
+			}
+			return probeAbsent
 		}
-		return entries[base]
+		if entries[base] {
+			return probePresent
+		}
+		return probeAbsent
 	}
 
 	ghClient := s.deps.GHClient.GoGitHub()
 	if ghClient == nil {
-		return false
+		return probeUnknown
 	}
 	_, _, _, err := ghClient.Repositories.GetContents(ctx, owner, repo, cleanPath, nil)
-	return err == nil
+	switch {
+	case err == nil:
+		return probePresent
+	case isGitHubNotFound(err):
+		return probeAbsent
+	default:
+		return probeUnknown
+	}
+}
+
+// isGitHubNotFound reports whether err is GitHub answering 404 for the path —
+// the only error that means "absent". Rate-limit and abuse-limit errors are
+// distinct types in go-github and never match; neither do context deadlines.
+func isGitHubNotFound(err error) bool {
+	var er *gh.ErrorResponse
+	return errors.As(err, &er) && er.Response != nil && er.Response.StatusCode == http.StatusNotFound
 }
 
 // scoreResults calculates per-level scores and the overall codebase level.
@@ -618,20 +723,28 @@ func (s *Server) scoreResults(results []CriterionResult) ACMMEvaluation {
 	type levelBucket struct {
 		total   int
 		matched int
+		unknown int
 	}
 	buckets := make(map[int]*levelBucket)
 
 	totalPassed := 0
+	totalUnknown := 0
 	for _, r := range results {
 		b, ok := buckets[r.Level]
 		if !ok {
 			b = &levelBucket{}
 			buckets[r.Level] = b
 		}
+		// An unknown criterion stays in total and out of matched: the level
+		// score is a floor. Excluding it from the denominator would let two
+		// known passes and six unanswered probes read as 100%.
 		b.total++
 		if r.Passed {
 			b.matched++
 			totalPassed++
+		} else if r.Unknown {
+			b.unknown++
+			totalUnknown++
 		}
 	}
 
@@ -660,6 +773,7 @@ func (s *Server) scoreResults(results []CriterionResult) ACMMEvaluation {
 			Passed:    score >= acmmLevelThreshold,
 			Total:     b.total,
 			Matched:   b.matched,
+			Unknown:   b.unknown,
 		})
 	}
 
@@ -694,6 +808,7 @@ func (s *Server) scoreResults(results []CriterionResult) ACMMEvaluation {
 		CodebaseLevelName: codeLevelName,
 		CriteriaTotal:     len(results),
 		CriteriaPassed:    totalPassed,
+		CriteriaUnknown:   totalUnknown,
 		LastEvaluatedAt:   time.Now().UTC().Format(time.RFC3339),
 		Levels:            levelScores,
 		CriteriaResults:   results,
@@ -714,4 +829,70 @@ func acmmBlockedAtLevel(levels []ACMMLevelScore) int {
 		}
 	}
 	return -1
+}
+
+// cachedCriterionVerdict returns the most recent per-repo result for one
+// criterion, if an evaluation has been cached. ok is false when nothing has
+// been evaluated yet or the repo/criterion is not in the cache, in which
+// case the caller has no grounds to refuse and proceeds as before.
+func (s *Server) cachedCriterionVerdict(repo, criterionID string) (CriterionResult, bool) {
+	s.acmmEvalMu.RLock()
+	cached := s.acmmEvalCache
+	s.acmmEvalMu.RUnlock()
+	if cached == nil {
+		return CriterionResult{}, false
+	}
+	for _, re := range cached.RepoResults {
+		if re.Repo != repo {
+			continue
+		}
+		for _, c := range re.CriteriaResults {
+			if c.ID == criterionID {
+				return c, true
+			}
+		}
+	}
+	return CriterionResult{}, false
+}
+
+// acmmCriterionMarker is the line acmmIssueContent writes into every gap
+// issue body; findOpenACMMIssue matches on it, so the two must agree.
+func acmmCriterionMarker(criterionID string) string {
+	return "**Criterion ID:** `" + criterionID + "`"
+}
+
+// findOpenACMMIssue returns an open issue in owner/repo carrying the acmm
+// label whose body names criterionID, or nil. A failure to list is not a
+// reason to refuse the request — it falls through to creation, which is the
+// pre-existing behavior — but it is logged so a silent dedupe miss can be
+// seen. Pull requests share the issues endpoint and are skipped.
+func (s *Server) findOpenACMMIssue(ctx context.Context, ghClient *gh.Client, owner, repo, criterionID string) *gh.Issue {
+	marker := acmmCriterionMarker(criterionID)
+	opts := &gh.IssueListByRepoOptions{
+		State:       "open",
+		Labels:      []string{acmmIssueLabelName},
+		ListOptions: gh.ListOptions{PerPage: 100},
+	}
+	for page := 0; page < 5; page++ {
+		issues, resp, err := ghClient.Issues.ListByRepo(ctx, owner, repo, opts)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("acmm: could not list open gap issues; proceeding to create", "repo", owner+"/"+repo, "criterion", criterionID, "err", err)
+			}
+			return nil
+		}
+		for _, issue := range issues {
+			if issue.IsPullRequest() {
+				continue
+			}
+			if strings.Contains(issue.GetBody(), marker) {
+				return issue
+			}
+		}
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.ListOptions.Page = resp.NextPage
+	}
+	return nil
 }
