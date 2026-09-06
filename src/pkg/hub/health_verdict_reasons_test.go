@@ -41,12 +41,12 @@ func TestHiveHealthForReasons(t *testing.T) {
 			name: "L2 advisory fresh — reason carries a single humanized age",
 			entry: func() RegistryEntry {
 				e := writer(base(2))
-				e.AdvisoryLastPostedAt = rfc(now.Add(-2 * time.Hour))
+				e.AdvisoryLastPostedAt = rfc(now.Add(-30 * time.Minute))
 				return e
 			}(),
 			rollup: okRollup(), app: okApp(), queued: 3,
 			wantState:  HealthStateGreen,
-			wantReason: "advisory 2h ago",
+			wantReason: "advisory 30m ago",
 		},
 		{
 			name: "L2 advisory stale — red",
@@ -87,6 +87,7 @@ func TestHiveHealthForReasons(t *testing.T) {
 				e := base(3)
 				e.ProviderLimitReason = "provider spending limit reached — 682 refused calls: litellm refused the request on a spending limit (429)"
 				e.ProviderLimitRebuffs = 682
+				e.ProviderLimitHiveWide = true
 				return e
 			}(),
 			rollup: agentFleetRollup{Expected: 3, Running: 0, Known: 3, Problems: 3, IdleWithWork: 3},
@@ -100,6 +101,7 @@ func TestHiveHealthForReasons(t *testing.T) {
 				e := base(3)
 				e.ProviderLimitReason = "litellm refused the request on a spending limit (429)"
 				e.ProviderLimitRebuffs = 682
+				e.ProviderLimitHiveWide = true
 				return e
 			}(),
 			rollup: agentFleetRollup{Expected: 3, Running: 0, Known: 3, Problems: 3, IdleWithWork: 3},

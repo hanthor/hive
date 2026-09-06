@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,44 +49,44 @@ import (
 
 	gh "github.com/google/go-github/v72/github"
 
-	"github.com/kubestellar/hive/pkg/advisory"
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/beads"
-	"github.com/kubestellar/hive/pkg/classify"
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/dashboard"
-	"github.com/kubestellar/hive/pkg/defsrc"
-	"github.com/kubestellar/hive/pkg/discord"
-	"github.com/kubestellar/hive/pkg/escalation"
-	"github.com/kubestellar/hive/pkg/forge"
-	"github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/governor"
-	"github.com/kubestellar/hive/pkg/hooks"
-	"github.com/kubestellar/hive/pkg/hub"
-	"github.com/kubestellar/hive/pkg/intent"
-	"github.com/kubestellar/hive/pkg/ioscan"
-	"github.com/kubestellar/hive/pkg/knowledge"
-	"github.com/kubestellar/hive/pkg/logscrub"
-	"github.com/kubestellar/hive/pkg/mint"
-	"github.com/kubestellar/hive/pkg/notify"
-	"github.com/kubestellar/hive/pkg/planning"
-	"github.com/kubestellar/hive/pkg/policies"
-	"github.com/kubestellar/hive/pkg/proclock"
-	"github.com/kubestellar/hive/pkg/promptsrc"
-	"github.com/kubestellar/hive/pkg/proxy"
-	"github.com/kubestellar/hive/pkg/pushbroker"
-	"github.com/kubestellar/hive/pkg/retro"
-	"github.com/kubestellar/hive/pkg/review"
-	"github.com/kubestellar/hive/pkg/rotation"
-	"github.com/kubestellar/hive/pkg/scheduler"
-	"github.com/kubestellar/hive/pkg/snapshot"
-	"github.com/kubestellar/hive/pkg/timeline"
-	"github.com/kubestellar/hive/pkg/tokens"
-	"github.com/kubestellar/hive/pkg/tracing"
-	"github.com/kubestellar/hive/pkg/trajectory"
-	"github.com/kubestellar/hive/pkg/watchdog"
-	"github.com/kubestellar/hive/pkg/watsonx"
-	"github.com/kubestellar/hive/pkg/worksource"
+	"github.com/hivecommons/hive/pkg/advisory"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/beads"
+	"github.com/hivecommons/hive/pkg/classify"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/dashboard"
+	"github.com/hivecommons/hive/pkg/defsrc"
+	"github.com/hivecommons/hive/pkg/discord"
+	"github.com/hivecommons/hive/pkg/escalation"
+	"github.com/hivecommons/hive/pkg/forge"
+	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/governor"
+	"github.com/hivecommons/hive/pkg/hooks"
+	"github.com/hivecommons/hive/pkg/hub"
+	"github.com/hivecommons/hive/pkg/intent"
+	"github.com/hivecommons/hive/pkg/ioscan"
+	"github.com/hivecommons/hive/pkg/knowledge"
+	"github.com/hivecommons/hive/pkg/logscrub"
+	"github.com/hivecommons/hive/pkg/mint"
+	"github.com/hivecommons/hive/pkg/notify"
+	"github.com/hivecommons/hive/pkg/planning"
+	"github.com/hivecommons/hive/pkg/policies"
+	"github.com/hivecommons/hive/pkg/proclock"
+	"github.com/hivecommons/hive/pkg/promptsrc"
+	"github.com/hivecommons/hive/pkg/proxy"
+	"github.com/hivecommons/hive/pkg/pushbroker"
+	"github.com/hivecommons/hive/pkg/retro"
+	"github.com/hivecommons/hive/pkg/review"
+	"github.com/hivecommons/hive/pkg/rotation"
+	"github.com/hivecommons/hive/pkg/scheduler"
+	"github.com/hivecommons/hive/pkg/snapshot"
+	"github.com/hivecommons/hive/pkg/timeline"
+	"github.com/hivecommons/hive/pkg/tokens"
+	"github.com/hivecommons/hive/pkg/tracing"
+	"github.com/hivecommons/hive/pkg/trajectory"
+	"github.com/hivecommons/hive/pkg/watchdog"
+	"github.com/hivecommons/hive/pkg/watsonx"
+	"github.com/hivecommons/hive/pkg/worksource"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -217,6 +218,32 @@ func agentActivityFor(mgr *agent.Manager, cfg *config.Config, govState governor.
 		act.Backend = backend
 	}
 
+	// #5958: an agent the spoke has stopped relaunching must say so, with the
+	// reason. Without this the hub sees state=failed and renders the same
+	// "restart needed" that sent operators clicking a button which could not
+	// fix a login prompt or a rejected key.
+	if sf, ok := mgr.StartFailureState(name); ok && strings.TrimSpace(sf.Reason) != "" && sf.Count > 0 {
+		act.StartFailureReason = sf.Reason
+		act.StartFailureCount = sf.Count
+		act.StartFailureLastAt = sf.LastAt
+		act.StartBlocked = sf.Blocked
+		if sf.Blocked {
+			act.StartBlockedReason = sf.Reason
+		}
+		if sf.LastExitCode != nil {
+			act.StartFailureExitCode = sf.LastExitCode
+		}
+		act.StartFailureSignal = sf.LastSignal
+	}
+	if total, last24h, lastAt, reason, ok := mgr.RestartTelemetry(name); ok {
+		act.Restarts.Total = total
+		act.Restarts.Last24h = last24h
+		act.Restarts.LastReason = reason
+		if !lastAt.IsZero() {
+			act.Restarts.LastRestartAt = lastAt.UTC().Format(time.RFC3339)
+		}
+	}
+
 	return act
 }
 
@@ -260,15 +287,97 @@ func quotaExhaustedAgentReason(count int) string {
 	return fmt.Sprintf("%d agent(s) out of provider quota", count)
 }
 
-func providerLimitHeartbeatFields(agents []hub.AgentSummary) (reason string, rebuffs int) {
+func providerLimitHeartbeatFields(agents []hub.AgentSummary) (reason string, rebuffs int, hiveWide bool, names []string) {
 	errMsg, _, _, rebuffs := dashboard.InferenceBudgetExceeded()
 	if errMsg != "" {
 		if rebuffs > 1 {
-			return fmt.Sprintf("provider spending limit reached — %d refused calls: %s", rebuffs, errMsg), rebuffs
+			return fmt.Sprintf("provider spending limit reached — %d refused calls: %s", rebuffs, errMsg), rebuffs, true, nil
 		}
-		return "provider spending limit reached — " + errMsg, rebuffs
+		return "provider spending limit reached — " + errMsg, rebuffs, true, nil
 	}
-	return quotaExhaustedAgentReason(quotaExhaustedAgentCount(agents)), 0
+	for _, a := range agents {
+		if a.QuotaExhausted && !a.Paused &&
+			!strings.EqualFold(a.State, "paused") &&
+			strings.EqualFold(a.State, "running") {
+			names = append(names, a.Name)
+		}
+	}
+	sort.Strings(names)
+	return quotaExhaustedAgentReason(len(names)), 0, false, names
+}
+
+func outputFreshnessHeartbeatFields(acmmLevel int, govState governor.State, agents []hub.AgentSummary) (lastWriteKickAt, disposition, reason string, notWritableQueued int) {
+	notWritableQueued = govState.QueueHold
+	var newest time.Time
+	for _, a := range agents {
+		if !agentCanProduceJudgedOutput(acmmLevel, a) {
+			continue
+		}
+		if t := govState.LastKick[a.Name]; !t.IsZero() && t.After(newest) {
+			newest = t
+		}
+	}
+	if !newest.IsZero() {
+		lastWriteKickAt = newest.UTC().Format(time.RFC3339)
+	}
+	switch {
+	case acmmLevel > 0 && acmmLevel <= 2:
+		disposition = "advisory-only"
+		reason = "ACMM advisory band produces advisory output, not writes"
+	case govState.BudgetExhausted:
+		disposition = "budget-suppressed"
+		reason = "governor budget exhausted"
+	case govState.QueueIssues+govState.QueuePRs == 0 && govState.QueueHold > 0:
+		disposition = "agent-decided-not-writable"
+		reason = "queued items are held or otherwise not writable"
+	case govState.QueueIssues+govState.QueuePRs == 0:
+		disposition = "idle"
+		reason = "no actionable work queued"
+	case len(govState.Cadences) == 0:
+		disposition = "no-due-agents"
+		reason = "no agents due in the current governor mode"
+	default:
+		dueCapable := false
+		now := time.Now()
+		for _, a := range agents {
+			if !agentCanProduceJudgedOutput(acmmLevel, a) {
+				continue
+			}
+			if cad, ok := govState.Cadences[a.Name]; ok && !cad.Paused {
+				last := govState.LastKick[a.Name]
+				if cad.Schedule.Mode() != config.CadenceModeInterval {
+					if _, ok := cad.Schedule.DueOccurrence(last, now, config.CadenceCatchUpWindow); ok {
+						dueCapable = true
+						break
+					}
+					continue
+				}
+				if cad.Interval <= 0 || last.IsZero() || now.Sub(last) >= cad.Interval {
+					dueCapable = true
+					break
+				}
+			}
+		}
+		if !dueCapable {
+			disposition = "no-due-agents"
+			reason = "no write-capable agents due in the current governor mode"
+		} else {
+			disposition = "kick-capable"
+			reason = "write-capable agents are eligible to kick"
+		}
+	}
+	return lastWriteKickAt, disposition, reason, notWritableQueued
+}
+
+func agentCanProduceJudgedOutput(acmmLevel int, a hub.AgentSummary) bool {
+	switch {
+	case acmmLevel >= 6:
+		return a.CanMerge
+	case acmmLevel >= 3:
+		return a.CanOpenIssue || a.CanOpenPR
+	default:
+		return false
+	}
 }
 
 // prospectiveGitHubIdentity returns the GitHub identity the spoke WOULD hold
@@ -677,11 +786,13 @@ func describeKeySource(v string) string {
 	return v
 }
 
+var githubAppTokenCachePath = github.TokenCachePath
+
 func githubAppTokenHeartbeatFields(cfg *config.Config, detail string) (status, lastMintAt, lastErr string) {
 	if cfg == nil || !cfg.GitHub.HasApp() {
 		return "", "", ""
 	}
-	info, err := os.Stat(github.TokenCachePath)
+	info, err := os.Stat(githubAppTokenCachePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return hub.GitHubAppTokenStatusMissing, "", detail
@@ -693,6 +804,56 @@ func githubAppTokenHeartbeatFields(cfg *config.Config, detail string) (status, l
 		return hub.GitHubAppTokenStatusStale, lastMintAt, detail
 	}
 	return hub.GitHubAppTokenStatusOK, lastMintAt, ""
+}
+
+var githubHTTPStatusRe = regexp.MustCompile(`\b([1-5][0-9]{2})\b`)
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func githubAppStructuredFailure(state, detail string) (class string, httpStatus int) {
+	switch strings.TrimSpace(state) {
+	case github.AppStateNotInstalled.String():
+		class = "not-installed"
+	case github.AppStateWrongInstallation.String():
+		class = "wrong-installation"
+	case github.AppStateInsufficientPerms.String():
+		class = "insufficient-permissions"
+	case github.AppStateKeyMissing.String():
+		class = "key-missing"
+	case github.AppStateKeyInvalid.String():
+		class = "key-invalid"
+	case github.AppStateNoAppAssigned.String():
+		class = "no-app-assigned"
+	case github.AppStateRepoNotCovered.String():
+		class = "repo-not-covered"
+	case github.AppStateRepoMoved.String():
+		class = "repo-moved"
+	case github.AppStateWriteForbidden.String():
+		class = "write-forbidden"
+	}
+	if class == "" && strings.TrimSpace(detail) != "" {
+		class = "token-error"
+	}
+	for _, m := range githubHTTPStatusRe.FindAllStringSubmatch(detail, -1) {
+		if len(m) == 2 {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				httpStatus = n
+			}
+		}
+	}
+	if httpStatus != 0 {
+		if (class == "token-error" || class == "not-installed") && httpStatus == http.StatusNotFound {
+			class = "installation-not-found"
+		}
+	}
+	return class, httpStatus
 }
 
 // githubAuth is the outcome of resolving this hive's GitHub credentials at
@@ -1010,6 +1171,15 @@ func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "version") {
 		fmt.Printf("hive %s (commit %s, branch %s)\n", version, gitShort, gitBranch)
 		return
+	}
+	// `hive validate` / `hive --config-check`: load the config exactly as a real
+	// boot does - agent overlays included, since an overlay file is what bricked
+	// a spoke in #6024 - report the first error, and exit non-zero WITHOUT
+	// starting anything. Before this the only way to learn a config was invalid
+	// was to watch a pod crash-loop. Handled here, ahead of flag.Parse, for the
+	// same reason --version is: it takes its own flag set.
+	if len(os.Args) > 1 && (os.Args[1] == "validate" || os.Args[1] == "--config-check") {
+		os.Exit(runConfigCheck(os.Args[2:], os.Stdout, os.Stderr))
 	}
 	startTime := time.Now()
 	defaultConfig := "/etc/hive/hive.yaml"
@@ -2001,14 +2171,27 @@ func main() {
 	// history persist).
 	dashSrv.EnableSessionPersistence("/data/dashboard-sessions.json")
 
+	// Lifecycle timeline journeys persist on the PVC too (#5656): the ring is
+	// the panel's only memory of merged/blocked outcomes, so a pod roll must
+	// not zero the fleet counters. Enabled before any producer records.
+	dashSrv.EnableLifecyclePersistence("/data/lifecycle-timeline.json")
+
+	// The scheduler's classifier pass records KindClassified journeys the
+	// moment lane routing decides an issue's lane — same store, no extra work.
+	sched.SetLifecycleRecorder(dashSrv.LifecycleTimeline())
+
 	// Attribution audit sink: every hive-mediated PR/issue creation lands in
 	// the dashboard audit log (audit.jsonl + ring) UNCONDITIONALLY — the
 	// trailer toggle never gates this. Creations before this point (the
 	// startup advisory-issue ensure) fall back to the hive log inside
-	// recordCreationAudit, so no creation goes unrecorded.
+	// recordCreationAudit, so no creation goes unrecorded. The same stream
+	// feeds the lifecycle timeline: agent_pr_created → pr_opened and
+	// pr_merged → merged (both automerge sweep paths, MergePR from the
+	// dashboard queue and the merge watcher), see recordLifecycleFromAudit.
 	if ghClient != nil {
 		ghClient.SetAttributionAudit(func(action, detail, agent string) {
 			dashSrv.AuditLog("system", action, detail, agent)
+			recordLifecycleFromAudit(dashSrv, cfg.Project.Org, action, detail, agent)
 		})
 	}
 
@@ -2234,8 +2417,7 @@ func main() {
 		dashSrv.UpdateStatusIfFresh(payload, buildEpoch)
 	}
 
-	const cachedActionablePath = "/data/last-actionable.json"
-	if data, err := os.ReadFile(cachedActionablePath); err == nil {
+	if data, err := os.ReadFile(lastActionablePath); err == nil {
 		var cached github.ActionableResult
 		if err := json.Unmarshal(data, &cached); err == nil {
 			lastActionable.Store(&cached)
@@ -2642,7 +2824,14 @@ func main() {
 	// the pr-request watcher narrates opened PRs into the session.
 	sched.SetInflightLookup(dashSrv.LinearSessionHolder)
 	if ghClient != nil {
-		ghClient.SetPROpenedHook(dashSrv.LinearAgentPROpened)
+		ghClient.SetPROpenedHook(func(agentName, repo string, number int, url string) {
+			dashSrv.LinearAgentPROpened(agentName, repo, number, url)
+			// Same typed hook feeds the lifecycle timeline: the watcher fires
+			// it on the exact path that opened the PR, with the agent name the
+			// audit stream attributes to the governor flow (#5656). The store
+			// dedupes with the audit-sink bridge by (ref, kind).
+			recordPROpened(dashSrv, cfg.Project.Org, agentName, repo, number, url)
+		})
 	}
 
 	dashSrv.RegisterAPI(&dashboard.Dependencies{
@@ -2690,6 +2879,12 @@ func main() {
 		},
 		EnumerateFunc: func() {
 			runEvalCycle(ctx, cfg, ghClient, gov, sched, agentMgr, dashSrv, notifier, beadStores, tokenCollector, metricsCollector, nousState, &lastActionable, advisoryStore, advisoryIssues, nil, logger)
+		},
+		// The REPOSITORIES "Rescan" button. Unlike EnumerateFunc above — which
+		// runs the WHOLE eval cycle, kicks included — this only refreshes what
+		// the operator is looking at. See rescanRepos.
+		RescanReposFunc: func(rescanCtx context.Context) (*github.ActionableResult, error) {
+			return rescanRepos(rescanCtx, cfg, ghClient, &lastActionable, refreshDashboard, logger)
 		},
 		AdvisoryResetFunc: func(newPrimaryRepo string) {
 			logger.Info("advisory reset: primary repo changed, creating new advisory issue", "repo", newPrimaryRepo)
@@ -3326,6 +3521,7 @@ func main() {
 		// raise an advisory and stop kicking agents at a gateway that is
 		// refusing on a money limit.
 		dashboard.SetInferenceBudgetProvider(githubProxy.InferenceBudgetExceeded)
+		dashboard.SetGatewayHealthProvider(githubProxy.GatewayHealth)
 
 		// Wire the inference token sink so the translator records per-agent
 		// usage (from the gateway's OpenAI usage block) into the same metrics
@@ -3344,11 +3540,13 @@ func main() {
 		// otherwise all pre-existing Copilot spend would vanish.
 		tokenCollector.SetCopilotLiveCapture(time.Now().UnixMilli())
 
-		vllmEndpoints := parseEndpointList(envOrDefault("HIVE_VLLM_ENDPOINT", "http://hive-vllm-svc.hive-inference.svc.cluster.local:8000"))
+		vllmEndpoints := parseEndpointList(os.Getenv("HIVE_VLLM_ENDPOINT"))
 		llmdEndpoints := parseEndpointList(envOrDefault("HIVE_LLMD_ENDPOINT", "http://hive-llm-d-epp.hive-inference.svc.cluster.local:8000"))
 		inferenceEndpoints := map[string][]string{
-			"vllm":  vllmEndpoints,
 			"llm-d": llmdEndpoints,
+		}
+		if len(vllmEndpoints) > 0 {
+			inferenceEndpoints["vllm"] = vllmEndpoints
 		}
 		// litellm has no in-cluster default: register it only when an
 		// endpoint is configured (yaml or HIVE_LITELLM_ENDPOINT), so an
@@ -3500,6 +3698,12 @@ func main() {
 				}
 				// vllm/llm-d endpoints are unauthenticated with a public
 				// or in-cluster CA — no bearer key or custom CA bundle.
+				if len(endpoints) == 0 {
+					logger.Warn("inference backend selected but no endpoint configured",
+						"agent", agentName, "model", model, "backend", backend)
+					githubProxy.ClearInferenceRoute(agentName)
+					return
+				}
 				endpoint := proxy.FindEndpointForModel(endpoints, model, "", "")
 				if endpoint == "" {
 					logger.Warn("no endpoint serves model, using first endpoint",
@@ -3806,7 +4010,9 @@ func main() {
 				tasksCompleted7d = &n
 			}
 
-			providerLimitReason, providerLimitRebuffs := providerLimitHeartbeatFields(agents)
+			providerLimitReason, providerLimitRebuffs, providerLimitHiveWide, providerLimitAgents := providerLimitHeartbeatFields(agents)
+			ghAppTokenStatus, ghAppTokenLastMintAt, ghAppTokenError := githubAppTokenHeartbeatFields(cfg, dashSrv.GetGitHubAppPermIssue())
+			ghAppErrorClass, ghAppHTTPStatus := githubAppStructuredFailure(dashSrv.GetGitHubAppState(), firstNonEmpty(dashSrv.GetGitHubAppPermIssue(), ghAppTokenError))
 
 			// Remediation-hint detectors (#5577). All three read state the
 			// spoke already maintains — no new GitHub calls, no new file
@@ -3817,6 +4023,8 @@ func main() {
 			agentErrorStreaks := tokenCollector.AgentErrorStreaks()
 			consentWedged := agentMgr.ConsentWedgedAgents()
 			noCadenceAgents := gov.NoCadenceAgents()
+			lastWriteKickAt, kickDisposition, kickSkipReason, notWritableQueued :=
+				outputFreshnessHeartbeatFields(acmmLvl, govState, agents)
 
 			return &hub.HeartbeatPayload{
 				AgentsWithModel:      &agentsWithModel,
@@ -3837,7 +4045,8 @@ func main() {
 				// record only when it sees the gateway named here, so a lost
 				// delivery is re-offered rather than dropped. Names only — the
 				// key never leaves the spoke.
-				GatewayNames: dashSrv.ConfiguredGatewayNames(),
+				GatewayNames:  dashSrv.ConfiguredGatewayNames(),
+				GatewayHealth: dashSrv.GatewayHealthState(),
 				// Hash only, never the raw token: lets the hub verify this
 				// spoke's upgrade-proof credential without reading the
 				// hive-secrets secret from a cluster it may not reach
@@ -3904,6 +4113,12 @@ func main() {
 				}(),
 				ProviderLimitReason:     providerLimitReason,
 				ProviderLimitRebuffs:    providerLimitRebuffs,
+				ProviderLimitHiveWide:   providerLimitHiveWide,
+				ProviderLimitAgents:     providerLimitAgents,
+				LastWriteCapableKickAt:  lastWriteKickAt,
+				LastKickDisposition:     kickDisposition,
+				LastKickSkipReason:      kickSkipReason,
+				NotWritableQueued:       notWritableQueued,
 				RepoTargetMisconfigured: repoTargetMisconfigured(),
 				RepoTargetIssue:         repoTargetIssueMessage(),
 				Repos:                   cfg.Project.Repos,
@@ -4029,24 +4244,17 @@ func main() {
 				// base_url and api_url — a GHE placeholder with base_url:"" but
 				// api_url: github.ibm.com must report github.ibm.com, not be
 				// silently rendered as github.com in the spokes table.
-				GitHubHost:         cfg.GitHub.HostLabel(),
-				GitHubAppRequired:  dashSrv.IsGitHubAppRequired(),
-				GitHubAppPermIssue: dashSrv.GetGitHubAppPermIssue(),
-				GitHubAppState:     dashSrv.GetGitHubAppState(),
-				GitHubAppTokenStatus: func() string {
-					status, _, _ := githubAppTokenHeartbeatFields(cfg, dashSrv.GetGitHubAppPermIssue())
-					return status
-				}(),
-				GitHubAppTokenLastMintAt: func() string {
-					_, lastMintAt, _ := githubAppTokenHeartbeatFields(cfg, dashSrv.GetGitHubAppPermIssue())
-					return lastMintAt
-				}(),
-				GitHubAppTokenError: func() string {
-					_, _, errMsg := githubAppTokenHeartbeatFields(cfg, dashSrv.GetGitHubAppPermIssue())
-					return errMsg
-				}(),
-				PendingGitHubAppInstall: dashSrv.IsPendingGitHubAppInstall(),
-				AutoUpgrade:             cfg.Hub.AutoUpgrade,
+				GitHubHost:               cfg.GitHub.HostLabel(),
+				GitHubAppRequired:        dashSrv.IsGitHubAppRequired(),
+				GitHubAppPermIssue:       dashSrv.GetGitHubAppPermIssue(),
+				GitHubAppState:           dashSrv.GetGitHubAppState(),
+				GitHubAppTokenStatus:     ghAppTokenStatus,
+				GitHubAppTokenLastMintAt: ghAppTokenLastMintAt,
+				GitHubAppTokenError:      ghAppTokenError,
+				GitHubAppErrorClass:      ghAppErrorClass,
+				GitHubAppHTTPStatus:      ghAppHTTPStatus,
+				PendingGitHubAppInstall:  dashSrv.IsPendingGitHubAppInstall(),
+				AutoUpgrade:              cfg.Hub.AutoUpgrade,
 				ClusterHealth: func() *hub.HeartbeatClusterHealthReport {
 					if os.Getenv("HIVE_CLUSTER_ID") == "" {
 						return nil
@@ -4154,7 +4362,7 @@ func main() {
 							"hint", "the spoke must be able to get/patch its own Deployment; check the hive-self-upgrade Role/RoleBinding in this namespace",
 						)
 						hub.ReportUpgradeFailure(hubURL, cfg.HiveID, targetSHA, gitShort,
-							fmt.Sprintf("self-upgrade failed after %d attempts: %s", m.Attempts, m.LastError), logger)
+							upgradeFailureSummary(m.Attempts, m.LastError), logger)
 						return
 					}
 					// Exponential backoff between attempts so a hard failure does not
@@ -4238,7 +4446,9 @@ func main() {
 				if cfg.ACMMLevel != nil {
 					acmmLvl = *cfg.ACMMLevel
 				}
-				providerLimitReason, providerLimitRebuffs := providerLimitHeartbeatFields(agents)
+				providerLimitReason, providerLimitRebuffs, providerLimitHiveWide, providerLimitAgents := providerLimitHeartbeatFields(agents)
+				lastWriteKickAt, kickDisposition, kickSkipReason, notWritableQueued :=
+					outputFreshnessHeartbeatFields(acmmLvl, govState, agents)
 				return &hub.HeartbeatPayload{
 					HiveID: cfg.HiveID,
 					Org:    cfg.Project.Org,
@@ -4265,6 +4475,12 @@ func main() {
 					RepoTargetIssue:         repoTargetIssueMessage(),
 					ProviderLimitReason:     providerLimitReason,
 					ProviderLimitRebuffs:    providerLimitRebuffs,
+					ProviderLimitHiveWide:   providerLimitHiveWide,
+					ProviderLimitAgents:     providerLimitAgents,
+					LastWriteCapableKickAt:  lastWriteKickAt,
+					LastKickDisposition:     kickDisposition,
+					LastKickSkipReason:      kickSkipReason,
+					NotWritableQueued:       notWritableQueued,
 					// Remediation-hint detectors (#5577): all three are
 					// cheap in-memory reads, so even this minimal upgrading
 					// beat carries them — the pod is about to restart, and
@@ -4620,11 +4836,17 @@ func main() {
 			// the in-cluster K8s API — the pod has no kubectl binary, but its
 			// SA holds the hive-self-upgrade role (patch on deployment/hive).
 			// K8s then rolls the pod onto the new tag.
-			image := "ghcr.io/kubestellar/hive:" + tag
+			image := "ghcr.io/hivecommons/hive:" + tag
 			if err := hub.SwitchImageSelf(logger, image); err != nil {
 				logger.Warn("branch switch via heartbeat failed", "tag", tag, "image", image, "error", err)
 				return
 			}
+		}), hub.AgentRestartResetCallback(func(name string) {
+			if err := agentMgr.ResetRestartCount(name); err != nil {
+				logger.Warn("agent restart reset from hub failed", "agent", name, "error", err)
+				return
+			}
+			logger.Info("audit: agent restart counter reset from hub", "agent", name)
 		}), hub.AuthorizedUsersCallback(func(users []string, names map[string]string) {
 			// The hub delivered its authoritative access list. Reconcile our
 			// login allowlist so Manage Access grants take effect on this
@@ -5449,11 +5671,12 @@ func diagnoseGitHubAppFull(ctx context.Context, appAuth *github.AppAuth, expecte
 }
 
 // maxTimelineEnumeratePerCycle bounds how many enumerated-issue events a single
-// eval cycle records into the lifecycle timeline. The timeline Store is a
-// bounded ring (timeline.MaxEvents); capping per-cycle enumeration keeps a large
-// actionable backlog from evicting the entire ring in one pass and keeps the
-// recording loop O(1)-bounded so it never slows the eval cycle.
-const maxTimelineEnumeratePerCycle = 50
+// eval cycle records into the lifecycle timeline, keeping the recording loop
+// O(1)-bounded so it never slows the eval cycle. Since #5656 the store dedupes
+// by (ref, kind) — re-enumeration refreshes the journey instead of appending —
+// so the cap no longer protects the ring from eviction floods; it matches the
+// endpoint's default journey limit so every renderable journey gets refreshed.
+const maxTimelineEnumeratePerCycle = 200
 
 // lifecycleRecorder narrows *dashboard.Server to just the timeline accessor the
 // recording helpers need, so they stay trivially testable with a fake and never
@@ -5463,10 +5686,12 @@ type lifecycleRecorder interface {
 }
 
 // recordEnumeratedIssues records a KindEnumerated event for each enumerated
-// actionable issue, bounded by maxTimelineEnumeratePerCycle. It is fully
-// guarded: a nil recorder, nil store, or nil actionable set is a no-op, and
-// Record itself is nil-safe. This must never slow or break the eval loop, so it
-// does no I/O and touches only the in-memory bounded ring.
+// actionable issue, bounded by maxTimelineEnumeratePerCycle. The store dedupes
+// by (ref, kind), so each cycle refreshes the journeys' enumerated stage
+// rather than appending a flood (#5656). It is fully guarded: a nil recorder,
+// nil store, or nil actionable set is a no-op, and Record itself is nil-safe.
+// This must never slow or break the eval loop, so it does no blocking I/O
+// (journey persistence is throttled and atomic inside the store).
 //
 // PR-open/merge lifecycle spans are emitted by the same tracing mapper when
 // callers record those timeline events; this helper only has enumerated issues.
@@ -5659,10 +5884,21 @@ func classifyGitHubAppFailure(ctx context.Context, appAuth *github.AppAuth, expe
 	// every caller reaches here from a failed GitHub call or from the
 	// dashboard's Re-check. Re-check is therefore the operator-invokable way to
 	// read a specific installation's grants.
+	// #5774: record the write-path grants on the SAME line, for the same
+	// reason and with the same posture. The App migration that blocked every
+	// agent PR flow was invisible here because this verdict read Issues and
+	// nothing else: a hive that could file issues and could not push a branch
+	// reported "ok", and so did a healthy one. Contents/Pull-requests/Workflows
+	// are recorded, never enforced — see GrantsAgentPushFlow for why requiring
+	// them would misreport the read-only advisory tier — and, like the grants
+	// above, they are emitted for EVERY verdict including AppStateOK, because
+	// the installation that looks healthy is precisely the one worth counting.
 	logger.Info("github app credential verdict",
 		"owner", expectedOwner, "state", state.String(),
 		"grants", d.ExecutionGrants(),
-		"visual_hive_execution_grants", d.GrantsVisualHiveExecution())
+		"visual_hive_execution_grants", d.GrantsVisualHiveExecution(),
+		"push_flow_grants", d.PushFlowGrants(),
+		"agent_push_flow_grants", d.GrantsAgentPushFlow())
 	if state == github.AppStateOK {
 		return false, "", github.AppStateOK
 	}
@@ -5745,6 +5981,27 @@ func classifyGitHubAppRepoCoverage(ctx context.Context, appAuth *github.AppAuth,
 	missing := cov.Missing(org, repos)
 	if len(missing) == 0 {
 		return false, "", github.AppStateOK
+	}
+
+	// #5774: a coverage miss whose shape is an org TRANSFER gets its own
+	// verdict, checked first because the not-covered copy is actively wrong for
+	// it. "Tick this repo in the installation's repository access" cannot be
+	// followed when the repository has left that account — there is nothing
+	// there to tick — and this classifier exists in the first place because
+	// sending an operator to a fix that cannot work costs them real debugging
+	// time. MovedTo returns nothing unless the shape is unambiguous (see its
+	// three clauses), so the not-covered verdict below remains the default.
+	if moves := cov.MovedTo(org, repos); len(moves) > 0 {
+		d := github.AppAuthDiagnosis{
+			State:           github.AppStateRepoMoved,
+			ExpectedAccount: org,
+			InstallationID:  appAuth.InstallationID(),
+			APIURL:          appAuth.APIURL(),
+			RepoMoves:       moves,
+		}
+		logger.Warn("github app repo coverage: configured repositories were transferred to another account",
+			"configured_org", org, "now_under", github.MovedOwner(moves), "repos", len(moves))
+		return true, d.Message(), github.AppStateRepoMoved
 	}
 
 	d := github.AppAuthDiagnosis{
@@ -6006,17 +6263,18 @@ func runEvalCycle(
 
 	lastActionable.Store(actionable)
 	if data, err := json.Marshal(actionable); err == nil {
-		atomicWrite("/data/last-actionable.json", data)
+		atomicWrite(lastActionablePath, data)
 	}
 
 	// Record enumerated issues into the lifecycle timeline so the dashboard's
 	// lifecycle view has real data. Cheap and fully guarded: a nil dashboard or
 	// nil store is a no-op (timeline.Store.Record is nil-safe), the loop is
-	// bounded by maxTimelineEnumeratePerCycle so a huge backlog never floods the
-	// bounded ring in one cycle, and no I/O happens on this path.
+	// bounded by maxTimelineEnumeratePerCycle, and the store dedupes by
+	// (ref, kind) so this per-cycle sweep refreshes journeys instead of
+	// flooding them (#5656).
 	recordEnumeratedIssues(ctx, dashSrv, actionable)
 
-	escalatedPRs := runEscalationSweep(ctx, cfg, governorForge(cfg, ghClient, logger), actionable, notifier, logger)
+	escalatedPRs := runEscalationSweep(ctx, cfg, governorForge(cfg, ghClient, logger), actionable, notifier, dashSrv, logger)
 
 	intentVerdicts := writeIntentVerdicts(ctx, cfg, ghClient, actionable, beadStores, logger)
 	refreshReviewVerdicts(cfg, logger)
@@ -6218,6 +6476,22 @@ func runEvalCycle(
 	// only `agentsDue` earlier would still let a CEL match or a review kick fire
 	// into the same clipped key.
 	//
+	if len(messages) > 0 {
+		filtered := messages[:0]
+		for _, msg := range messages {
+			if remaining, class, line, ok := agentMgr.ProviderErrorBackoffRemaining(msg.Agent); ok {
+				logger.Warn("provider inference error: withholding agent kick during backoff",
+					"agent", msg.Agent,
+					"class", class,
+					"retry_in", remaining.Round(time.Second),
+					"error", line)
+				continue
+			}
+			filtered = append(filtered, msg)
+		}
+		messages = filtered
+	}
+
 	// Suppression is total rather than per-agent because the limit is on the
 	// KEY: no agent can succeed while it is clipped. It self-heals — the first
 	// inference call that succeeds after the provider's window resets clears the
@@ -6237,16 +6511,16 @@ func runEvalCycle(
 	// re-arms suppression immediately, so the cycles while the probe's run
 	// is still in flight withhold again rather than leaking more kicks.
 	kickGate := gateKickMessagesForProviderBudget(messages, suppressKicks, providerBudgetLatched)
+	releaseProviderBudgetProbe := kickGate.ReleaseProbe
 	if suppressKicks && len(messages) > 0 {
 		logger.Warn("provider spending limit: withholding agent kicks",
 			"withheld", kickGate.Withheld, "rebuffs", providerBudgetRebuffs, "since", providerBudgetSince,
 			"next_probe_in", (providerBudgetProbeInterval - time.Since(providerBudgetProbe.freshest(providerBudgetLastRebuff))).Truncate(time.Second))
-	} else if kickGate.ReleaseProbe {
+	} else if releaseProviderBudgetProbe {
 		if len(kickGate.Withheld) > 0 {
 			logger.Warn("provider spending limit: withholding all but the probe kick",
 				"withheld", kickGate.Withheld, "rebuffs", providerBudgetRebuffs, "since", providerBudgetSince)
 		}
-		providerBudgetProbe.markReleased(time.Now())
 		logger.Info("provider spending limit: releasing a single probe kick",
 			"probe_agent", kickGate.Kept[0].Agent, "rebuffs", providerBudgetRebuffs, "since", providerBudgetSince,
 			"last_rebuff", providerBudgetLastRebuff, "probe_interval", providerBudgetProbeInterval)
@@ -6259,6 +6533,14 @@ func runEvalCycle(
 	var deliveredReviewKicks []review.DispatchKick
 	if len(messages) > 0 {
 		for _, msg := range messages {
+			if remaining, class, line, ok := agentMgr.ProviderErrorBackoffRemaining(msg.Agent); ok {
+				logger.Warn("provider inference error: withholding agent kick during backoff",
+					"agent", msg.Agent,
+					"class", class,
+					"retry_in", remaining.Round(time.Second),
+					"error", line)
+				continue
+			}
 			agentCfg := cfg.Agents[msg.Agent]
 			_, kickSpan := tracing.StartSpan(ctx, "agent.kick", tracing.AgentKickAttributes(
 				msg.Agent,
@@ -6280,6 +6562,10 @@ func runEvalCycle(
 				persistReviewDispatchState(reviewPlan, deliveredReviewKicks, logger)
 			}
 			kickSpan.End()
+			if releaseProviderBudgetProbe {
+				providerBudgetProbe.markReleased(time.Now())
+				releaseProviderBudgetProbe = false
+			}
 			gov.RecordKick(msg.Agent)
 			dashSrv.AuditLog("governor", "kick", "trigger=governor-eval", msg.Agent)
 
@@ -6896,7 +7182,7 @@ func loginScanMatch(backend, paneText string, compiled []*regexp.Regexp) *regexp
 	// is on screen: that is not a login problem, and pausing the agent for it
 	// cancels the trust-prompt watcher that would answer it — the deadlock that
 	// kept copilot agents "sitting at login prompt" through every operator
-	// re-login (kubestellar/hive, 2026-08-22). The watcher answers the modal
+	// re-login (hivecommons/hive, 2026-08-22). The watcher answers the modal
 	// within seconds; if a REAL login prompt follows, the next detector tick
 	// sees it on a clean pane.
 	if agent.PaneShowsBlockingPrompt(backend, paneText) {
@@ -6964,7 +7250,7 @@ func scanForLoginRequired(
 	// reached deep into scrollback, where agent WORK OUTPUT that merely
 	// mentions a pattern phrase lives — quality's scan findings quoting
 	// "gh auth login" from auth documentation got the agent paused mid-kick
-	// (kubestellar/hive, 2026-08-22 08:27, on a fully-authenticated CLI).
+	// (hivecommons/hive, 2026-08-22 08:27, on a fully-authenticated CLI).
 	// Same discipline as the poller's tail-only match (#4577).
 	const paneLines = 12
 	statuses := agentMgr.AllStatuses()
@@ -7160,12 +7446,41 @@ func writeUpgradeMarker(path string, m upgradeMarker, logger *slog.Logger) {
 // recordUpgradeError annotates the existing marker with the cause of the failed
 // attempt so the NEXT boot can log why the previous one did not land — without
 // it the reason dies with the process and the failure is invisible.
+// upgradeFailureSummary renders what the hub shows an operator. An empty
+// LastError must never render as a dangling "attempts: " - a colon promising a
+// reason and delivering none is worse than saying the reason was not captured,
+// because it reads as truncation and sends the reader looking for the rest.
+func upgradeFailureSummary(attempts int, lastError string) string {
+	if strings.TrimSpace(lastError) == "" {
+		return fmt.Sprintf("self-upgrade failed after %d attempts (no error recorded; the image never changed - check that the deployment tracks a tag carrying the target SHA)", attempts)
+	}
+	return fmt.Sprintf("self-upgrade failed after %d attempts: %s", attempts, lastError)
+}
+
 func recordUpgradeError(path string, upgradeErr error, logger *slog.Logger) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+	if upgradeErr == nil {
 		return
 	}
-	m := parseUpgradeMarker(data)
+	// A marker that cannot be read is not a reason to drop the cause. The
+	// earlier version returned on ANY read error, which left LastError empty
+	// and produced the bare "self-upgrade failed after 5 attempts: " the hub
+	// relays to the dashboard - an alert naming a failure and nothing about
+	// it. Losing the attempt count is survivable; losing the reason is what
+	// makes the failure undiagnosable, so rebuild the marker around the error
+	// instead. An ABSENT marker is different: no attempt is in flight, and
+	// creating one here would later be mistaken for a real attempt, so the
+	// no-op stands for that case only.
+	var m upgradeMarker
+	data, err := os.ReadFile(path)
+	switch {
+	case os.IsNotExist(err):
+		return
+	case err != nil:
+		logger.Warn("upgrade marker unreadable; recording the error against a fresh marker",
+			"path", path, "error", err)
+	default:
+		m = parseUpgradeMarker(data)
+	}
 	m.LastError = upgradeErr.Error()
 	writeUpgradeMarker(path, m, logger)
 }
@@ -7279,22 +7594,54 @@ func turnLossToSnapshot(loss agent.TurnLoss) *snapshot.AgentTurnLoss {
 	return out
 }
 
+func restartEventsToSnapshot(events []agent.RestartEvent) []snapshot.AgentRestartEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	out := make([]snapshot.AgentRestartEvent, 0, len(events))
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, ev := range events {
+		if ev.At.IsZero() || ev.At.Before(cutoff) {
+			continue
+		}
+		out = append(out, snapshot.AgentRestartEvent{At: ev.At, Reason: ev.Reason})
+	}
+	return out
+}
+
+func restartEventsFromSnapshot(events []snapshot.AgentRestartEvent) []agent.RestartEvent {
+	if len(events) == 0 {
+		return nil
+	}
+	out := make([]agent.RestartEvent, 0, len(events))
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, ev := range events {
+		if ev.At.IsZero() || ev.At.Before(cutoff) {
+			continue
+		}
+		out = append(out, agent.RestartEvent{At: ev.At, Reason: ev.Reason})
+	}
+	return out
+}
+
 func persistState(agentMgr *agent.Manager, gov *governor.Governor, cfg *config.Config, path string, logger *slog.Logger, dashSrv *dashboard.Server, wd *watchdog.Reconciler) {
 	statuses := agentMgr.AllStatuses()
 	agents := make(map[string]snapshot.AgentState, len(statuses))
 	for name, proc := range statuses {
 		as := snapshot.AgentState{
-			Paused:          proc.Paused,
-			PinnedCLI:       proc.PinnedCLI,
-			PinnedModel:     proc.PinnedModel,
-			ModelOverride:   proc.ModelOverride,
-			BackendOverride: proc.BackendOverride,
-			RestartCount:    proc.RestartCount,
-			LastKick:        proc.LastKick,
-			PausedReason:    proc.PausedReason,
-			PausedTrigger:   proc.PausedTrigger,
-			PausedBy:        proc.PausedBy,
-			TurnLoss:        turnLossToSnapshot(proc.TurnLoss),
+			Paused:            proc.Paused,
+			PinnedCLI:         proc.PinnedCLI,
+			PinnedModel:       proc.PinnedModel,
+			ModelOverride:     proc.ModelOverride,
+			BackendOverride:   proc.BackendOverride,
+			RestartCount:      proc.RestartCount,
+			RestartEvents:     restartEventsToSnapshot(proc.RestartEvents),
+			LastRestartReason: proc.LastRestartReason,
+			LastKick:          proc.LastKick,
+			PausedReason:      proc.PausedReason,
+			PausedTrigger:     proc.PausedTrigger,
+			PausedBy:          proc.PausedBy,
+			TurnLoss:          turnLossToSnapshot(proc.TurnLoss),
 		}
 		if !proc.PausedAt.IsZero() {
 			t := proc.PausedAt
@@ -7676,12 +8023,16 @@ func reapStuckRedPRs(cfg *config.Config, actionable *github.ActionableResult, es
 // so the evidence lands on whichever forge the hive is actually configured for
 // (see governorForge in forgewire.go). On a GitHub hive the writer IS the
 // *github.Client this used to take, so nothing about that path changed.
+//
+// rec receives a KindBlocked lifecycle event for each newly-escalated PR
+// (#5656); a nil rec is a no-op, matching the other timeline producers.
 func runEscalationSweep(
 	ctx context.Context,
 	cfg *config.Config,
 	writer forge.IssueWriter,
 	actionable *github.ActionableResult,
 	notifier *notify.Notifier,
+	rec lifecycleRecorder,
 	logger *slog.Logger,
 ) map[string]bool {
 	escalated := map[string]bool{}
@@ -7746,6 +8097,11 @@ func runEscalationSweep(
 		} else {
 			escalationStore.MarkLabelApplied(o.Repo, o.Number)
 		}
+		// The escalation IS the real "blocked" lifecycle signal (#5656): a PR
+		// out of automated fix attempts, handed to a human. Record it on the
+		// item's journey so the panel's Blocked counter reflects reality, not
+		// just hook annotations.
+		recordBlocked(ctx, rec, cfg.Project.Org, o.Repo, o.Number, r.Attempts, meta[key].checks)
 		logger.Info("fix loop escalated to human",
 			"repo", o.Repo, "pr", o.Number, "attempts", r.Attempts,
 			"failing_checks", strings.Join(meta[key].checks, ","))
@@ -8039,8 +8395,10 @@ func mergeableJSON(m github.Mergeable) string {
 // failure) rather than at startup, so a missing or corrupt /data ledger can
 // never block the hive from booting.
 var (
-	claimLedgerOnce sync.Once
-	claimLedger     *github.ClaimLedger
+	claimLedgerOnce   sync.Once
+	claimLedger       *github.ClaimLedger
+	claimLedgerPath   = github.ClaimLedgerPath
+	claimLedgerLoader = github.LoadClaimLedger
 )
 
 // hiveIdentity determines which PR authors count as "this hive", so only our
@@ -8081,12 +8439,12 @@ func applyDuplicatePRGuard(
 // and the ledger itself is internally locked.
 func getClaimLedger(logger *slog.Logger) *github.ClaimLedger {
 	claimLedgerOnce.Do(func() {
-		ledger, err := github.LoadClaimLedger(github.ClaimLedgerPath, logger)
+		ledger, err := claimLedgerLoader(claimLedgerPath, logger)
 		if err != nil {
 			// LoadClaimLedger always returns a usable (possibly empty) ledger
 			// alongside the error, so we keep it and just report the problem.
 			logger.Warn("duplicate-PR guard: could not load persisted claim ledger, starting empty",
-				"path", github.ClaimLedgerPath, "error", err)
+				"path", claimLedgerPath, "error", err)
 		}
 		claimLedger = ledger
 	})
@@ -8888,6 +9246,10 @@ const (
 )
 
 func loadNousState(logger *slog.Logger) *dashboard.NousState {
+	return loadNousStateFromPaths(logger, nousGovernorDir, nousSnapshotDir)
+}
+
+func loadNousStateFromPaths(logger *slog.Logger, governorDir, snapshotDir string) *dashboard.NousState {
 	state := &dashboard.NousState{
 		Mode:   "observe",
 		Scope:  "governor",
@@ -8896,7 +9258,7 @@ func loadNousState(logger *slog.Logger) *dashboard.NousState {
 		Config: make(map[string]interface{}),
 	}
 
-	if ledgerData, err := os.ReadFile(nousGovernorDir + "/ledger.json"); err == nil {
+	if ledgerData, err := os.ReadFile(filepath.Join(governorDir, "ledger.json")); err == nil {
 		var ledger struct {
 			Iterations []map[string]interface{} `json:"iterations"`
 		}
@@ -8906,7 +9268,7 @@ func loadNousState(logger *slog.Logger) *dashboard.NousState {
 		}
 	}
 
-	if principlesData, err := os.ReadFile(nousGovernorDir + "/principles.json"); err == nil {
+	if principlesData, err := os.ReadFile(filepath.Join(governorDir, "principles.json")); err == nil {
 		var pFile struct {
 			Principles []json.RawMessage `json:"principles"`
 		}
@@ -8927,7 +9289,7 @@ func loadNousState(logger *slog.Logger) *dashboard.NousState {
 	}
 
 	snapshotCount := 0
-	if entries, err := os.ReadDir(nousSnapshotDir); err == nil {
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
 		snapshotCount = len(entries)
 	}
 
@@ -9041,6 +9403,22 @@ func initAgentConfigDrivenSystems(cfg *config.Config) {
 		}
 	}
 
+	// DETERMINISTIC LANE ORDER (#5856). classifyLane is first-match-wins over
+	// this slice, and the loop above built it by ranging over cfg.Agents — a Go
+	// MAP, whose iteration order is randomized per range. So an issue matching
+	// two lanes went to whichever of them happened to come out of the map
+	// first, and the winner could differ between two runs of the same binary on
+	// the same config. The reported example matched sec-check on its title
+	// ("security") and scanner on its label; which one it landed in was a coin
+	// flip that nothing recorded.
+	//
+	// Sorting by name is a STABLE order, not a meaningful precedence — it does
+	// not claim architect deserves an issue more than scanner does. What it buys
+	// is reproducibility: the same issue and the same config now classify the
+	// same way every time, so a misroute is a bug someone can chase instead of
+	// an intermittency. Choosing a deliberate precedence between colliding lanes
+	// is a separate call for whoever owns the lane table.
+	sort.Slice(lanes, func(i, j int) bool { return lanes[i].Name < lanes[j].Name })
 	if len(lanes) > 0 {
 		classify.SetLanes(lanes)
 	}
@@ -9131,7 +9509,7 @@ func runHub(logger *slog.Logger, configPath string) {
 	// endpoint reports 503 rather than serving fabricated data. The base
 	// branch is the hub's own running branch — the lineage its fleet runs.
 	if ghToken := os.Getenv("HIVE_GITHUB_TOKEN"); ghToken != "" {
-		reachGH := github.NewClient(ghToken, "kubestellar", []string{"hive"}, logger, "")
+		reachGH := github.NewClient(ghToken, "hivecommons", []string{"hive"}, logger, "")
 		hubSrv.SetReachPRSource(hub.NewGitHubPRSource(reachGH, gitBranch))
 	}
 	// Wire 2a's heartbeat-fed registry store into the /api/reach endpoint
@@ -9340,9 +9718,6 @@ func parseEndpointList(raw string) []string {
 		if p != "" {
 			out = append(out, p)
 		}
-	}
-	if len(out) == 0 {
-		return []string{raw}
 	}
 	return out
 }

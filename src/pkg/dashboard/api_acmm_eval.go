@@ -13,12 +13,18 @@ import (
 
 	gh "github.com/google/go-github/v72/github"
 
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/worksource"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/worksource"
 )
 
 const acmmEvalTTL = time.Hour
+
+// acmmRefreshDebounce is the floor under `?refresh=1` (#5877): an operator-
+// forced re-evaluation still returns the cached result when the cache is
+// younger than this, so holding the Re-evaluate button down cannot spend the
+// GitHub API budget (a full refresh is up to ~29 GetContents calls per repo).
+const acmmRefreshDebounce = time.Minute
 const acmmLevelThreshold = 0.70
 const acmmEvalTimeout = 30 * time.Second
 const acmmPerRepoTimeout = 20 * time.Second
@@ -59,6 +65,7 @@ type RepoEvaluation struct {
 	Repo            string            `json:"repo"`
 	CodebaseLevel   int               `json:"codebase_level"`
 	LevelName       string            `json:"level_name"`
+	BlockedAtLevel  int               `json:"blocked_at_level"`
 	CriteriaTotal   int               `json:"criteria_total"`
 	CriteriaPassed  int               `json:"criteria_passed"`
 	CriteriaUnknown int               `json:"criteria_unknown,omitempty"`
@@ -118,12 +125,22 @@ func (s *Server) handleACMMEvaluation(w http.ResponseWriter, r *http.Request) {
 		opsName = "Unknown"
 	}
 
+	// #5877: `?refresh=1` lets the operator bypass the hour-long TTL — the
+	// panel drives a fix-and-verify loop, and a fix could not be verified for
+	// up to an hour otherwise. It bypasses the TTL, not the cache machinery:
+	// the request is served from cache when the entry is younger than the
+	// debounce window, so a forced refresh is rate-limited server-side.
+	ttl := acmmEvalTTL
+	if r.URL.Query().Get("refresh") == "1" {
+		ttl = acmmRefreshDebounce
+	}
+
 	s.acmmEvalMu.RLock()
 	cached := s.acmmEvalCache
 	cacheAge := time.Since(s.acmmEvalCachedAt)
 	s.acmmEvalMu.RUnlock()
 
-	if cached != nil && cacheAge < acmmEvalTTL {
+	if cached != nil && cacheAge < ttl {
 		result := *cached
 		result.OperationalLevel = opsLevel
 		result.OperationalName = opsName
@@ -136,7 +153,7 @@ func (s *Server) handleACMMEvaluation(w http.ResponseWriter, r *http.Request) {
 	s.acmmEvalMu.Lock()
 	defer s.acmmEvalMu.Unlock()
 
-	if s.acmmEvalCache != nil && time.Since(s.acmmEvalCachedAt) < acmmEvalTTL {
+	if s.acmmEvalCache != nil && time.Since(s.acmmEvalCachedAt) < ttl {
 		result := *s.acmmEvalCache
 		result.OperationalLevel = opsLevel
 		result.OperationalName = opsName
@@ -513,11 +530,15 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 
 	for _, repo := range repos {
 		ctx, cancel := context.WithTimeout(context.Background(), acmmPerRepoTimeout)
-		dirCache := s.prefetchDirectories(ctx, owner, repo)
+		// governor.acmm.repo_roots: a repo whose module lives under src/ (or
+		// any subdirectory) is probed there too, so root-spelled criteria
+		// see it. Unlisted repos keep the root-only behavior.
+		root := s.deps.Config.Governor.ACMM.RepoRoot(repo)
+		dirCache := s.prefetchDirectoriesUnder(ctx, owner, repo, root)
 
 		var results []CriterionResult
 		for _, c := range universalCriteria {
-			passed, unknown := s.checkCriterion(ctx, owner, repo, c, dirCache)
+			passed, unknown := s.checkCriterionUnder(ctx, owner, repo, root, c, dirCache)
 			results = append(results, CriterionResult{
 				ID:       c.ID,
 				Name:     c.Name,
@@ -542,6 +563,7 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 			Repo:            repo,
 			CodebaseLevel:   scored.CodebaseLevel,
 			LevelName:       scored.CodebaseLevelName,
+			BlockedAtLevel:  acmmBlockedAtLevel(scored.Levels),
 			CriteriaTotal:   scored.CriteriaTotal,
 			CriteriaPassed:  scored.CriteriaPassed,
 			CriteriaUnknown: scored.CriteriaUnknown,
@@ -572,6 +594,13 @@ func (s *Server) evaluateAllRepos() ACMMEvaluation {
 // prefetchDirectories fetches directory listings for parent dirs that
 // many criteria share, reducing individual API calls.
 func (s *Server) prefetchDirectories(ctx context.Context, owner, repo string) map[string]map[string]bool {
+	return s.prefetchDirectoriesUnder(ctx, owner, repo, "")
+}
+
+// prefetchDirectoriesUnder is prefetchDirectories plus, when root is set, the
+// same directories under root, so the sub-root probes are answered from the
+// cache as often as the root ones.
+func (s *Server) prefetchDirectoriesUnder(ctx context.Context, owner, repo, root string) map[string]map[string]bool {
 	cache := make(map[string]map[string]bool)
 
 	dirs := []string{
@@ -584,6 +613,11 @@ func (s *Server) prefetchDirectories(ctx context.Context, owner, repo string) ma
 		".claude",
 		"docs",
 		"docs/security",
+	}
+	if root != "" {
+		for _, d := range append([]string(nil), dirs...) {
+			dirs = append(dirs, acmmUnderRoot(root, d))
+		}
 	}
 
 	// GoGitHub() is nil-receiver safe and returns nil, so the deref below would
@@ -632,15 +666,45 @@ const (
 // the repo. unknown is true when nothing was found AND at least one probe
 // got no answer, so the caller can tell "missing" from "could not tell".
 func (s *Server) checkCriterion(ctx context.Context, owner, repo string, c ACMMCriterion, dirCache map[string]map[string]bool) (passed, unknown bool) {
+	return s.checkCriterionUnder(ctx, owner, repo, "", c, dirCache)
+}
+
+// checkCriterionUnder is checkCriterion with an optional extra probe root
+// (governor.acmm.repo_roots): every pattern is tried at the repository root
+// and, when root is set, at root/<pattern>. Present anywhere passes; unknown
+// anywhere with no hit is unknown.
+func (s *Server) checkCriterionUnder(ctx context.Context, owner, repo, root string, c ACMMCriterion, dirCache map[string]map[string]bool) (passed, unknown bool) {
 	for _, pattern := range c.Patterns {
-		switch s.probePattern(ctx, owner, repo, pattern, dirCache) {
-		case probePresent:
-			return true, false
-		case probeUnknown:
-			unknown = true
+		for _, candidate := range acmmPatternVariants(root, pattern) {
+			switch s.probePattern(ctx, owner, repo, candidate, dirCache) {
+			case probePresent:
+				return true, false
+			case probeUnknown:
+				unknown = true
+			}
 		}
 	}
 	return false, unknown
+}
+
+// acmmPatternVariants lists the paths a criterion pattern is probed at: the
+// pattern itself, plus root/<pattern> when a repo root is configured. The
+// trailing "/" that marks a directory pattern is preserved.
+func acmmPatternVariants(root, pattern string) []string {
+	if root == "" {
+		return []string{pattern}
+	}
+	return []string{pattern, acmmUnderRoot(root, pattern)}
+}
+
+// acmmUnderRoot joins a configured root and a root-relative path without
+// losing a directory marker: ("src", "") is "src", ("src", "test/") is
+// "src/test/".
+func acmmUnderRoot(root, rel string) string {
+	if rel == "" {
+		return root
+	}
+	return root + "/" + rel
 }
 
 // patternExists is the boolean view of probePattern: true only for a
@@ -802,6 +866,15 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func acmmBlockedAtLevel(levels []ACMMLevelScore) int {
+	for _, level := range levels {
+		if !level.Passed {
+			return level.Level
+		}
+	}
+	return -1
 }
 
 // cachedCriterionVerdict returns the most recent per-repo result for one

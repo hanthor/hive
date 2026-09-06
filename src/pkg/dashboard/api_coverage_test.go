@@ -8,16 +8,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/agent"
-	"github.com/kubestellar/hive/pkg/config"
-	ghpkg "github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/governor"
-	"github.com/kubestellar/hive/pkg/knowledge"
-	"github.com/kubestellar/hive/pkg/tokens"
+	"github.com/hivecommons/hive/pkg/agent"
+	"github.com/hivecommons/hive/pkg/config"
+	ghpkg "github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/governor"
+	"github.com/hivecommons/hive/pkg/knowledge"
+	"github.com/hivecommons/hive/pkg/tokens"
 )
 
 // wikiTestServer creates a mock wiki HTTP server for knowledge API tests.
@@ -997,7 +998,7 @@ func TestSecurityHeaders_Authorized(t *testing.T) {
 	}
 }
 
-func TestSecurityHeaders_TokenQueryParam(t *testing.T) {
+func TestSecurityHeaders_TokenQueryParamRejected(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	s := NewServerWithAuth(0, "secret", logger)
 	deps := testDeps(t)
@@ -1006,8 +1007,8 @@ func TestSecurityHeaders_TokenQueryParam(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/config?token=secret", nil)
 	s.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200", rec.Code)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
 	}
 }
 
@@ -2615,7 +2616,7 @@ func ghMockServer() *httptest.Server {
 		})
 	})
 	// go-github uses /repos/:owner/:repo/git/ref/:ref (singular)
-	mux.HandleFunc("/repos/kubestellar/hive/git/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/repos/hivecommons/hive/git/", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"ref":    "refs/heads/v2",
 			"object": map[string]interface{}{"sha": "abc1234567890abcdef1234567890abcdef123456"},
@@ -3981,5 +3982,19 @@ func TestHandleGovernorBudget_EmptyPayloadPreservesAll(t *testing.T) {
 	b := deps.Config.Governor.Budget
 	if b.TotalTokens != 1000 || b.PeriodDays != budgetTestPeriodDays || b.CriticalPct != budgetTestCriticalPct {
 		t.Errorf("empty payload mutated config: %+v", b)
+	}
+}
+
+func TestSidebarDiskUsesInjectablePath(t *testing.T) {
+	old := sidebarFile
+	sidebarFile = filepath.Join(t.TempDir(), "sidebar.json")
+	t.Cleanup(func() { sidebarFile = old })
+	s, _ := apiServer(t)
+	want := map[string]interface{}{"items": []interface{}{"audit", "fleet"}}
+	s.saveSidebarToDisk(want)
+	s.sidebar = nil
+	s.loadSidebarFromDisk()
+	if s.sidebar == nil {
+		t.Fatal("sidebar was not loaded from injected path")
 	}
 }

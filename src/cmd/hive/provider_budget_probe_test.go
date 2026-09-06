@@ -1,12 +1,13 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/dashboard"
-	"github.com/kubestellar/hive/pkg/hub"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/dashboard"
+	"github.com/hivecommons/hive/pkg/hub"
 )
 
 // TestProviderBudgetSuppressionProbesRatherThanDeadlocks is the regression test
@@ -242,7 +243,7 @@ func TestProviderLimitHeartbeatFieldsFallsBackToAgentQuota(t *testing.T) {
 	dashboard.SetInferenceBudgetProvider(nil)
 	t.Cleanup(func() { dashboard.SetInferenceBudgetProvider(nil) })
 
-	reason, rebuffs := providerLimitHeartbeatFields([]hub.AgentSummary{
+	reason, rebuffs, hiveWide, names := providerLimitHeartbeatFields([]hub.AgentSummary{
 		{Name: "guide", State: "running", QuotaExhausted: true},
 		{Name: "scanner", State: "running", QuotaExhausted: true},
 		{Name: "paused", State: "paused", Paused: true, QuotaExhausted: true},
@@ -250,6 +251,12 @@ func TestProviderLimitHeartbeatFieldsFallsBackToAgentQuota(t *testing.T) {
 	})
 	if rebuffs != 0 {
 		t.Fatalf("rebuffs = %d, want 0 for pane-derived quota", rebuffs)
+	}
+	if hiveWide {
+		t.Fatal("pane-derived quota must not be marked hive-wide")
+	}
+	if got := strings.Join(names, ","); got != "guide,scanner" {
+		t.Fatalf("names = %q, want guide,scanner", got)
 	}
 	if reason != "2 agent(s) out of provider quota" {
 		t.Fatalf("reason = %q, want provider quota count", reason)

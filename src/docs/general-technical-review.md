@@ -2,7 +2,7 @@
 
 This document answers the CNCF [General Technical Review
 questions](https://github.com/cncf/toc/blob/main/toc_subprojects/project-reviews-subproject/general-technical-questions.md)
-(v1.0.1) for the `kubestellar/hive` project, following that template's exact
+(v1.0.1) for the `hivecommons/hive` project, following that template's exact
 question wording and section order. It is written from, and cited against,
 this repository at `v4` (`src/` prefix for source and most docs).
 
@@ -40,9 +40,9 @@ plainly in the relevant answers below rather than hidden behind a marker:
 
 # General Technical Review - Hive / Sandbox
 
-- **Project:** [kubestellar/hive](https://github.com/kubestellar/hive)
+- **Project:** [hivecommons/hive](https://github.com/hivecommons/hive)
 - **Project Version:** Continuously delivered from branch `v4` (`v4-latest` / `stable` / `candidate` / `edge` channel tags plus automated semver `vX.Y.Z` releases — see [Release processes](#describe-the-projects-release-processes-including-major-minor-and-patch-releases))
-- **Website:** [hive.kubestellar.io](https://hive.kubestellar.io)
+- **Website:** [hive.hivecommons.dev](https://hive.hivecommons.dev)
 - **Date Updated:** 2026-08-28
 - **Template Version:** v1.0.1
 - **Description:** Hive orchestrates fleets of AI coding agents (Claude, GitHub Copilot, Gemini, Goose, Bob, Agy) that autonomously maintain software projects — filing issues, opening pull requests, reviewing code, and, at the highest operator-selected autonomy level, merging on green CI — under deterministic, technically-enforced guardrails rather than prompted behavior. It runs as a single-container Kubernetes/Compose/Podman workload, with an optional hub coordinating many self-hosted "spoke" hives.
@@ -78,7 +78,7 @@ Intended adopter organization types: **software manufacturers**; **platform engi
 
 #### Please describe any completed end user research and link to any reports.
 
-No formal study or structured survey/interview program has been conducted. Real, informal adopter feedback exists in the form of issues filed by adopters running their own hives, and it is the closest thing the project has to end-user research today: [#4918](https://github.com/kubestellar/hive/issues/4918) is a contributor's incident report, with journal evidence, of the default unconfined agent-launch path reaching their host's bootloader; [#4928](https://github.com/kubestellar/hive/issues/4928) and [#4929](https://github.com/kubestellar/hive/issues/4929) were filed by `ahmedadan` from operating `projectbluefin/dakota`; and [#4971](https://github.com/kubestellar/hive/issues/4971) and [#4973](https://github.com/kubestellar/hive/issues/4973) were filed by `Danathar` from running a hive. The CNCF adopter interviews conducted as part of the Incubation application will be the first structured end-user research the project has done.
+No formal study or structured survey/interview program has been conducted. Real, informal adopter feedback exists in the form of issues filed by adopters running their own hives, and it is the closest thing the project has to end-user research today: [#4918](https://github.com/hivecommons/hive/issues/4918) is a contributor's incident report, with journal evidence, of the default unconfined agent-launch path reaching their host's bootloader; [#4928](https://github.com/hivecommons/hive/issues/4928) and [#4929](https://github.com/hivecommons/hive/issues/4929) were filed by `ahmedadan` from operating `projectbluefin/dakota`; and [#4971](https://github.com/hivecommons/hive/issues/4971) and [#4973](https://github.com/hivecommons/hive/issues/4973) were filed by `Danathar` from running a hive. The CNCF adopter interviews conducted as part of the Incubation application will be the first structured end-user research the project has done.
 
 ### Usability
 
@@ -153,7 +153,7 @@ REST + Server-Sent Events for the dashboard/hub surface — no GraphQL is expose
 
 ##### Describe the project defaults
 
-Selected defaults from `src/pkg/config/config.go` `applyDefaults()` (`config.go:4320-4602`) and `src/docs/operator-reference.md`: dashboard port `3002` (`defaultDashboardPort`); governor eval interval `300s` (`defaultEvalIntervalS`); per-agent `replicas` default `1`, `enabled` default `true`, `clear_on_kick` default `true`; `hub.url` defaults to `https://hive.kubestellar.io` with `hub.is_public: true` if unset; token-budget period `7` days at a `90%` critical threshold; auto-merge label default `"lgtm"`. Minimum required config for the process to start at all (enforced by `Config.Validate`): `project.org`, at least one repo, one GitHub credential (`github.token`, `github.app_id`, or `github.forge`), and at least one agent (`src/docs/operator-reference.md` "Minimum required configuration").
+Selected defaults from `src/pkg/config/config.go` `applyDefaults()` (`config.go:4320-4602`) and `src/docs/operator-reference.md`: dashboard port `3002` (`defaultDashboardPort`); governor eval interval `300s` (`defaultEvalIntervalS`); per-agent `replicas` default `1`, `enabled` default `true`, `clear_on_kick` default `true`; `hub.url` has a compiled legacy fallback of `https://hive.kubestellar.io` with `hub.is_public: true` if unset, but hosted-hub operators should explicitly set it to `https://hive.hivecommons.dev` during the cutover; token-budget period `7` days at a `90%` critical threshold; auto-merge label default `"lgtm"`. Minimum required config for the process to start at all (enforced by `Config.Validate`): `project.org`, at least one repo, one GitHub credential (`github.token`, `github.app_id`, or `github.forge`), and at least one agent (`src/docs/operator-reference.md` "Minimum required configuration").
 
 ##### Outline any additional configurations from default to make reasonable use of the project
 
@@ -307,7 +307,7 @@ Through `CHANGELOG.md`'s `## Unreleased` section, which explicitly asks for entr
 
 #### Explain how the project permits utilization of alpha and beta capabilities as part of a rollout.
 
-No formal alpha/beta feature-flag maturity system (like Kubernetes feature gates) exists. The closest analogs, both explicit and self-labeled: (1) **release channels** — `edge`/`candidate`/`stable`, all currently synced to the same `v4-latest` digest but designed as the promotion mechanism for future channel divergence (`src/docs/release-channels.md`); (2) **doc-level status labels** on features that are design-only, partly shipped, or shipped-but-unwired — e.g. the skill registry carried "loaded and counted on the dashboard, but not yet delivered to agents" until delivery shipped and the label was retired (`src/docs/README.md` skills.md entry), `AGENTS.md` parsing was labeled "parsed and tested, but not wired into kicks" until its checkout root was threaded in [#5227](https://github.com/kubestellar/hive/issues/5227), and the `design/` directory indexes longer-form records each carrying a status of shipped/partly-shipped/design-only/historical specifically so a proposal is never mistaken for current behavior (`src/docs/README.md` "Historical/design notes"). The agent self-healing watchdog is a concrete example of graduated rollout via an explicit mode ladder: it ships in `observe` mode (classifies and would-have-acted, but takes no action) and only promotes to `heal` (acts) on operator decision, with `HIVE_WATCHDOG_PAUSE=true` as a fleet-wide downgrade switch (`src/docs/agent-watchdog.md`).
+No formal alpha/beta feature-flag maturity system (like Kubernetes feature gates) exists. The closest analogs, both explicit and self-labeled: (1) **release channels** — `edge`/`candidate`/`stable`, all currently synced to the same `v4-latest` digest but designed as the promotion mechanism for future channel divergence (`src/docs/release-channels.md`); (2) **doc-level status labels** on features that are design-only, partly shipped, or shipped-but-unwired — e.g. the skill registry carried "loaded and counted on the dashboard, but not yet delivered to agents" until delivery shipped and the label was retired (`src/docs/README.md` skills.md entry), `AGENTS.md` parsing was labeled "parsed and tested, but not wired into kicks" until its checkout root was threaded in [#5227](https://github.com/hivecommons/hive/issues/5227), and the `design/` directory indexes longer-form records each carrying a status of shipped/partly-shipped/design-only/historical specifically so a proposal is never mistaken for current behavior (`src/docs/README.md` "Historical/design notes"). The agent self-healing watchdog is a concrete example of graduated rollout via an explicit mode ladder: it ships in `observe` mode (classifies and would-have-acted, but takes no action) and only promotes to `heal` (acts) on operator decision, with `HIVE_WATCHDOG_PAUSE=true` as a fleet-wide downgrade switch (`src/docs/agent-watchdog.md`).
 
 ## Day 2 - Day-to-Day Operations Phase
 

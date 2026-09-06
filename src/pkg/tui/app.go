@@ -54,9 +54,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/kubestellar/hive/pkg/tui/client"
-	"github.com/kubestellar/hive/pkg/tui/panes"
-	"github.com/kubestellar/hive/pkg/tui/theme"
+	"github.com/hivecommons/hive/pkg/tui/client"
+	"github.com/hivecommons/hive/pkg/tui/panes"
+	"github.com/hivecommons/hive/pkg/tui/theme"
 )
 
 // splash is drawn only before the first tea.WindowSizeMsg arrives. It names
@@ -618,8 +618,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case attachReadyMsg:
 		if msg.err != nil {
 			m.attachPending = false
-			m.footerStatus = "Attach failed: " + msg.err.Error()
+			m.footerStatus = attachFailureStatus(msg.err)
 			return m, nil
+		}
+		if msg.remote != nil {
+			// tea.Exec, not ExecProcess: the remote bridge is an in-process
+			// tea.ExecCommand, but the suspend/resume contract is identical —
+			// the terminal is released for the duration and attachDoneMsg
+			// arrives once it is restored.
+			return m, tea.Exec(msg.remote, func(err error) tea.Msg {
+				return attachDoneMsg{err: err}
+			})
 		}
 		return m, tea.ExecProcess(msg.cmd, func(err error) tea.Msg {
 			return attachDoneMsg{err: err}
@@ -627,7 +636,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case attachDoneMsg:
 		m.attachPending = false
 		if msg.err != nil {
-			m.footerStatus = "Attach failed: " + msg.err.Error()
+			m.footerStatus = attachFailureStatus(msg.err)
 		} else {
 			m.footerStatus = ""
 		}
@@ -759,7 +768,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.attachPending = true
 			m.footerStatus = ""
-			return m, prepareAttach(name)
+			return m, prepareAttach(name, m.api)
 		}
 		// Any other key belongs to the focused pane. The T3 stubs ignore
 		// everything, but routing through this seam now is what lets a pane
@@ -1868,8 +1877,18 @@ func Run() error {
 // the operator's scrollback on exit, so `hivectl tui` leaves the terminal the
 // way it found it.
 func run(in io.Reader, out io.Writer) error {
+	m := newModel()
+
+	// Ask once, before the alt screen, whether this hive will talk to us at
+	// all. The model's own client is reused rather than a second one built
+	// here: a probe that authenticated differently from the polls could pass
+	// while every pane went on to fail, which is worse than not probing.
+	if err := preflight(context.Background(), m.api); err != nil {
+		return err
+	}
+
 	_, err := tea.NewProgram(
-		newModel(),
+		m,
 		tea.WithAltScreen(),
 		tea.WithInput(in),
 		tea.WithOutput(out),

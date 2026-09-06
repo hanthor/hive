@@ -1,0 +1,3 @@
+Read AGENTS.md at the repository root before editing. Go module is in src/;
+run go build ./... and go test ./... from there. Commits need a DCO sign-off
+(git commit -s). PRs target v4.

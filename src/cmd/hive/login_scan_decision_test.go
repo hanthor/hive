@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
 )
 
 // The shipping default patterns, resolved the way a real hive resolves them
@@ -18,7 +18,7 @@ import (
 func defaultLoginRegexps(t *testing.T) []*regexp.Regexp {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "hive.yaml")
-	minimal := "project:\n  name: login-scan-test\n  org: kubestellar\n" +
+	minimal := "project:\n  name: login-scan-test\n  org: hivecommons\n" +
 		"github:\n  token: t-not-a-real-token\n" +
 		"agents:\n  supervisor:\n    backend: claude\n"
 	if err := os.WriteFile(path, []byte(minimal), 0o644); err != nil {
@@ -103,7 +103,7 @@ func TestLoginScanDecision_StreakDefersTheFirstSighting(t *testing.T) {
 func TestLoginScanDecision_UnrelatedPaneIsIgnored(t *testing.T) {
 	compiled := defaultLoginRegexps(t)
 	working := strings.Join([]string{
-		"● Opened https://github.com/kubestellar/hive/pull/1234",
+		"● Opened https://github.com/hivecommons/hive/pull/1234",
 		"",
 		"✻ Cogitated for 2m 10s",
 		"",

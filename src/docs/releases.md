@@ -30,7 +30,13 @@ with no digest behind it, and it is a no-op whenever `## Unreleased` is empty
 — which on a healthy repository is almost always. Deferrals are logged as
 warnings so a skipped opportunity is visible rather than silent.
 
-`src/scripts/derive-release-version.sh` then decides two things by reading
+Before anything is decided, `src/scripts/compile-changelog.sh` folds any
+[`changelog.d/`](../../changelog.d/README.md) fragment files — the per-PR
+entry files that replaced direct `## Unreleased` appends
+([#5675](https://github.com/hivecommons/hive/issues/5675)) — into the
+`## Unreleased` section of the working tree, grouped under the `###`
+subsection their filename prefix names. `src/scripts/derive-release-version.sh`
+then decides two things by reading
 [`CHANGELOG.md`](../../CHANGELOG.md)'s `## Unreleased` section — nothing else,
 no commit-message parsing:
 
@@ -64,15 +70,21 @@ script's own header comment for the full reasoning.
 This is the one thing a contributor needs to know to cause a release, and it
 is nothing new — it is the existing changelog convention, now load-bearing:
 
-- Add an entry under `## Unreleased` in your PR (as `CONTRIBUTING.md` already
-  asks, nudged by the changelog-reminder check) if your change is
-  user-visible.
-- Put it under `### Added` for a minor-worthy feature, `### Security` for a
-  major-worthy security change, or `### Fixed`/`### Changed`/`### Deprecated`
-  for a patch-worthy fix or tweak.
-- If your PR does **not** touch `CHANGELOG.md`, it contributes to whatever
-  release fires next but does not by itself trigger one — and if `Unreleased`
-  is otherwise empty, no release fires until someone's entry lands.
+- Add a `changelog.d/<category>-<pr-or-slug>.md` fragment in your PR (as
+  `CONTRIBUTING.md` asks, nudged by the changelog-reminder and
+  changelog-fragment-guard checks) if your change is user-visible. The file's
+  content is exactly your entry — one `- ` bullet; see
+  `changelog.d/README.md`.
+- The filename's category prefix picks the subsection your entry is compiled
+  into (`added-` → `### Added`, and so on for `changed`/`deprecated`/`fixed`/
+  `security`), and the subsections drive the bump exactly as they always
+  have. Direct `## Unreleased` edits still compose with fragments during the
+  transition (#5675), but every PR editing that one shared heading is what
+  made unrelated PRs conflict, so prefer fragments.
+- If your PR carries **no** fragment (and no `CHANGELOG.md` edit), it
+  contributes to whatever release fires next but does not by itself trigger
+  one — and if `Unreleased` and `changelog.d/` are otherwise empty, no
+  release fires until someone's entry lands.
 
 You do not choose a version number. You choose a changelog section, and the
 version follows from semver rules applied to whatever is sitting in
@@ -135,10 +147,13 @@ Concretely, per release:
    should never trigger in the normal path; see below).
 3. `docker buildx imagetools create` retags `hive`, `hive-contributor`, and
    `hive-hub` at `:<7-hex-sha>` as `:v<version>`.
-4. `CHANGELOG.md`'s `## Unreleased` section is moved into a dated
-   `## YYYY-MM-DD (v<version>)` section (the file's own documented
-   convention — see its "How we maintain this file"), and a new empty
-   `## Unreleased` is left above it.
+4. `changelog.d/` fragments are compiled into `## Unreleased`
+   (`src/scripts/compile-changelog.sh` — the same compile the decide job ran
+   working-tree-only, now on the release job's fresh checkout), then the
+   whole section is moved into a dated `## YYYY-MM-DD (v<version>)` section
+   (the file's own documented convention — see its "How we maintain this
+   file"), a new empty `## Unreleased` is left above it, and the consumed
+   fragment files are deleted.
 4a. Syft generates an SPDX JSON SBOM for each of the three retagged images
    (see "Software bill of materials (SBOM)" below) — this happens before the
    changelog commit, using the version tag written in step 3.
@@ -162,7 +177,7 @@ Concretely, per release:
 `v4`'s only required context is `gate` (`docker.yml`). The release commit is
 created inside `tagged-release.yml`, so it has no check when it first exists;
 a direct push to `v4` is rejected (`GH006: Required status check "gate" is
-expected`, [#5026](https://github.com/kubestellar/hive/issues/5026)). Retrying
+expected`, [#5026](https://github.com/hivecommons/hive/issues/5026)). Retrying
 does not create the missing evidence, so every attempt fails identically.
 
 The workflow first pushes the commit to `release-gate/v<version>`, dispatches
@@ -171,7 +186,7 @@ That verifies the same code path as an ordinary PR gate, but a
 `workflow_dispatch` check-run has no pull-request association: its
 `pull_requests` list remains empty even if it is dispatched after the release
 PR exists. Consequently GitHub's protected-PR rollup omits it and the merge
-API still reports `gate` as expected ([#5356](https://github.com/kubestellar/hive/issues/5356)).
+API still reports `gate` as expected ([#5356](https://github.com/hivecommons/hive/issues/5356)).
 
 After the check-run succeeds, the workflow posts a `gate: success` commit
 status on the same SHA using its `GITHUB_TOKEN` and `statuses: write`
@@ -247,7 +262,7 @@ multi-arch coverage.
 `docker/build-push-action` step, on purpose, and
 `.github/workflows/image-attestation-guard.yml` +
 `src/scripts/check-no-image-attestations.sh` guard those four sites in CI so
-a well-meaning revert fails loudly instead of shipping. The reason ([#3760](https://github.com/kubestellar/hive/issues/3760),
+a well-meaning revert fails loudly instead of shipping. The reason ([#3760](https://github.com/hivecommons/hive/issues/3760),
 documented at length directly above each flag in `docker.yml`): `build-push-action`
 attaches provenance/SBOM attestations by *default*, and an attestation can
 only be carried by an OCI image **index** — so turning it on changes the
@@ -378,7 +393,7 @@ end-to-end:
 - **The running binary's `--version` output does not yet say `v1.2.3` for a
   release build.** Because `tagged-release.yml` retags rather than rebuilds (by
   design — see "How a release is actually built"), the image GHCR now calls
-  `ghcr.io/kubestellar/hive:v1.2.3` still reports whatever `main.version`
+  `ghcr.io/hivecommons/hive:v1.2.3` still reports whatever `main.version`
   the original `docker.yml` build embedded, which today is always the
   `0.0.0-dev` fallback since `docker.yml` never passes `VERSION`. Closing
   this cleanly means either (a) teaching `docker.yml` to pass a
