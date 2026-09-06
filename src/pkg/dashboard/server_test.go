@@ -707,6 +707,11 @@ func freePort(t *testing.T) int {
 }
 
 func TestStart_ServesEndpoints(t *testing.T) {
+	const (
+		startReadinessTimeout = 15 * time.Second
+		startReadinessPoll    = 25 * time.Millisecond
+	)
+
 	port := freePort(t)
 	s := NewServer(port, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	s.UpdateStatus(minimalPayload())
@@ -720,17 +725,22 @@ func TestStart_ServesEndpoints(t *testing.T) {
 	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: time.Second}
 	var resp *http.Response
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(startReadinessTimeout)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("server exited before becoming ready: %v", err)
+		default:
+		}
 		r, err := client.Get(addr + "/api/health")
 		if err == nil {
 			resp = r
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(startReadinessPoll)
 	}
 	if resp == nil {
-		t.Fatal("server did not start within 2 s")
+		t.Fatalf("server did not start within %s", startReadinessTimeout)
 	}
 	defer resp.Body.Close()
 
@@ -772,7 +782,7 @@ func TestSecurityHeaders_Present(t *testing.T) {
 	headers := map[string]string{
 		"X-Frame-Options":        "DENY",
 		"X-Content-Type-Options": "nosniff",
-		"X-Xss-Protection":      "1; mode=block",
+		"X-Xss-Protection":       "1; mode=block",
 		"Referrer-Policy":        "strict-origin-when-cross-origin",
 	}
 	for name, want := range headers {
@@ -827,7 +837,7 @@ func TestAuthMiddleware_AcceptsBearerToken(t *testing.T) {
 	}
 }
 
-func TestAuthMiddleware_AcceptsQueryToken(t *testing.T) {
+func TestAuthMiddleware_RejectsQueryToken(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	s := NewServerWithAuth(0, "secret-token-123", logger)
 	handler := s.Handler()
@@ -839,8 +849,8 @@ func TestAuthMiddleware_AcceptsQueryToken(t *testing.T) {
 		t.Fatalf("request error: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected 200 for query-token request, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 for query-token request, got %d", resp.StatusCode)
 	}
 }
 

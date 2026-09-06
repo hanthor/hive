@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	ghpkg "github.com/kubestellar/hive/pkg/github"
+	ghpkg "github.com/hivecommons/hive/pkg/github"
 )
 
 // acmmEvalTestLogger returns a quiet logger for these tests.
@@ -331,7 +331,7 @@ func TestCheckCriterion_AnyPatternMatches(t *testing.T) {
 		Level:    0,
 		Patterns: []string{"does-not-exist.yml", "go.mod", "also-missing.txt"},
 	}
-	if !s.checkCriterion(context.TODO(), "o", "r", c, cache) {
+	if passed, _ := s.checkCriterion(context.TODO(), "o", "r", c, cache); !passed {
 		t.Fatal("expected checkCriterion to pass when any pattern matches")
 	}
 }
@@ -347,7 +347,7 @@ func TestCheckCriterion_NoPatternMatches(t *testing.T) {
 		Level:    0,
 		Patterns: []string{"missing-a.yml", "missing-b.yml"},
 	}
-	if s.checkCriterion(context.TODO(), "o", "r", c, cache) {
+	if passed, _ := s.checkCriterion(context.TODO(), "o", "r", c, cache); passed {
 		t.Fatal("expected checkCriterion to fail when no pattern matches")
 	}
 }
@@ -566,6 +566,75 @@ func TestHandleACMMEvaluation_ExpiredCacheReEvaluates(t *testing.T) {
 	}
 }
 
+// TestHandleACMMEvaluation_ForcedRefreshBypassesTTL pins #5877: `?refresh=1`
+// re-evaluates a cache entry that is still comfortably inside the hour TTL —
+// provided it is older than the debounce window.
+func TestHandleACMMEvaluation_ForcedRefreshBypassesTTL(t *testing.T) {
+	ts := acmmEvalGitHubMux(t)
+	s := NewServer(0, acmmEvalTestLogger())
+	deps := testDeps(t)
+	deps.GHClient = ghpkg.NewClientForTest(ts.URL, "myorg", []string{"repo1"}, acmmEvalTestLogger())
+	s.RegisterAPI(deps)
+
+	fresh := &ACMMEvaluation{
+		CodebaseLevel: 6,
+		RepoResults:   []RepoEvaluation{{Repo: "cached-repo"}},
+	}
+	s.acmmEvalMu.Lock()
+	s.acmmEvalCache = fresh
+	// Well inside the TTL (would be a cache hit without refresh=1), but past
+	// the debounce window, so the forced refresh must actually re-evaluate.
+	s.acmmEvalCachedAt = time.Now().Add(-2 * acmmRefreshDebounce)
+	s.acmmEvalMu.Unlock()
+
+	rec := doGet(s, "/api/acmm/evaluation?refresh=1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var eval ACMMEvaluation
+	if err := json.Unmarshal(rec.Body.Bytes(), &eval); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(eval.RepoResults) != 1 || eval.RepoResults[0].Repo != "repo1" {
+		t.Fatalf("expected refresh=1 to re-evaluate against repo1, got %+v", eval.RepoResults)
+	}
+	if eval.CodebaseLevel == 6 {
+		t.Fatal("expected refresh=1 to recompute CodebaseLevel, not serve the cached 6")
+	}
+}
+
+// TestHandleACMMEvaluation_ForcedRefreshDebounced pins the other half of
+// #5877's contract: a forced refresh within the debounce window is served
+// from cache — holding the button down cannot spend the API budget.
+func TestHandleACMMEvaluation_ForcedRefreshDebounced(t *testing.T) {
+	s := NewServer(0, acmmEvalTestLogger())
+	deps := testDeps(t)
+	// No GHClient: a mistaken re-evaluation would go down the "GitHub client
+	// not available" error path and lose the primed RepoResults.
+	s.RegisterAPI(deps)
+
+	primed := &ACMMEvaluation{
+		CodebaseLevel: 3,
+		RepoResults:   []RepoEvaluation{{Repo: "primed-repo"}},
+	}
+	s.acmmEvalMu.Lock()
+	s.acmmEvalCache = primed
+	s.acmmEvalCachedAt = time.Now() // just evaluated
+	s.acmmEvalMu.Unlock()
+
+	rec := doGet(s, "/api/acmm/evaluation?refresh=1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var eval ACMMEvaluation
+	if err := json.Unmarshal(rec.Body.Bytes(), &eval); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(eval.RepoResults) != 1 || eval.RepoResults[0].Repo != "primed-repo" {
+		t.Fatalf("expected debounced refresh to serve the cached result, got %+v", eval.RepoResults)
+	}
+}
+
 // ---------- evaluateAllRepos ----------
 
 func TestEvaluateAllRepos_NilDepsOrConfig(t *testing.T) {
@@ -599,7 +668,17 @@ func TestEvaluateAllRepos_AggregatesAcrossRepos(t *testing.T) {
 	for _, rr := range eval.RepoResults {
 		if rr.Repo == "repo-b" {
 			repoBPassed = rr.CriteriaPassed
+			if rr.BlockedAtLevel != 0 {
+				t.Fatalf("repo-b BlockedAtLevel = %d, want 0", rr.BlockedAtLevel)
+			}
 		}
+	}
+	raw, err := json.Marshal(eval)
+	if err != nil {
+		t.Fatalf("marshal eval: %v", err)
+	}
+	if !strings.Contains(string(raw), `"blocked_at_level"`) {
+		t.Fatalf("serialized eval missing blocked_at_level: %s", raw)
 	}
 	aggPassed = eval.CriteriaPassed
 	if aggPassed < repoBPassed {

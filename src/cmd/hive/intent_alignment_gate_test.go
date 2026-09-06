@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/kubestellar/hive/pkg/github"
-	"github.com/kubestellar/hive/pkg/intent"
+	"github.com/hivecommons/hive/pkg/github"
+	"github.com/hivecommons/hive/pkg/intent"
 )
 
 func TestWriteMergeEligibleExcludesMisalignedWhenIntentEnforced(t *testing.T) {
@@ -23,12 +23,12 @@ func TestWriteMergeEligibleExcludesMisalignedWhenIntentEnforced(t *testing.T) {
 	})
 
 	actionable := &github.ActionableResult{PRs: github.PRResult{Items: []github.PullRequest{
-		{Repo: "kubestellar/hive", Number: 1, Title: "ok", Author: "agent", CIStatus: "success", Mergeable: github.MergeableYes},
-		{Repo: "kubestellar/hive", Number: 2, Title: "drift", Author: "agent", CIStatus: "success", Mergeable: github.MergeableYes},
+		{Repo: "hivecommons/hive", Number: 1, Title: "ok", Author: "agent", CIStatus: "success", Mergeable: github.MergeableYes},
+		{Repo: "hivecommons/hive", Number: 2, Title: "drift", Author: "agent", CIStatus: "success", Mergeable: github.MergeableYes},
 	}}}
 	verdicts := map[string]intent.Verdict{
-		"kubestellar/hive/1": {AgentPR: true, Authorized: true},
-		"kubestellar/hive/2": {
+		"hivecommons/hive/1": {AgentPR: true, Authorized: true},
+		"hivecommons/hive/2": {
 			AgentPR:    true,
 			Authorized: true,
 			Alignment:  &intent.AlignmentVerdict{Status: intent.AlignmentStatusMisaligned, Rationale: "docs intent touched proxy"},

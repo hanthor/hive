@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kubestellar/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/config"
 )
 
 // handleAgentFullLog serves the full retained tmux scrollback of an agent's
@@ -36,7 +36,11 @@ func (s *Server) handleAgentFullLog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name := s.resolveAgentParam(r.PathValue("name"))
-	log, err := s.deps.AgentMgr.CaptureFullLog(name)
+	captureFullLog := s.deps.AgentMgr.CaptureFullLog
+	if s.captureFullLogFn != nil {
+		captureFullLog = s.captureFullLogFn
+	}
+	log, err := captureFullLog(name)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return

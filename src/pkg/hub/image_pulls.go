@@ -24,7 +24,7 @@ import (
 // GitHub exposes exactly ONE adoption number for a container package: a single
 // CUMULATIVE "Total downloads" counter, rendered on the public package page
 //
-//	https://github.com/kubestellar/hive/pkgs/container/hive
+//	https://github.com/hivecommons/hive/pkgs/container/hive
 //
 // as `<h3 title="127576">128K</h3>` under a "Total downloads" label. There is
 // NO public per-day metric and NO unique-IP / unique-puller metric anywhere in
@@ -331,7 +331,7 @@ func (s *HubServer) maybeSnapshotImagePulls(ctx context.Context, now time.Time) 
 //
 //  1. The branch the "stable" release channel currently resolves to. That is
 //     the runtime source of truth aligned with src/deploy/standalone-images.sh,
-//     which pins standalone deployments to ghcr.io/kubestellar/hive:stable —
+//     which pins standalone deployments to ghcr.io/hivecommons/hive:stable —
 //     when CI promotes v5 to stable, the widget follows with no code change.
 //  2. Fallback (stable unresolved — GHCR blip, or the channel pinned off any
 //     tracked branch): the highest-numbered v<N> line that has a resolved SHA.

@@ -1,9 +1,9 @@
 package dashboard
 
 import (
-	"github.com/kubestellar/hive/pkg/config"
-	"github.com/kubestellar/hive/pkg/convergence"
-	"github.com/kubestellar/hive/pkg/worksource"
+	"github.com/hivecommons/hive/pkg/config"
+	"github.com/hivecommons/hive/pkg/convergence"
+	"github.com/hivecommons/hive/pkg/worksource"
 )
 
 // ── #4246: blocked / unknown / partial admission diagnostics ──────────────────
@@ -85,7 +85,7 @@ type AdmissionCoverage struct {
 // stated verbatim on every snapshot: candidates whose record WAS readable stay
 // fully gated, while unmapped lookup misses remain admitted — a miss under
 // reduced coverage is never presented as authoritative proof of absence.
-const admissionCoveragePolicy = "readable blocked records are gated; unmapped lookup misses are admitted (kubestellar/hive#3904)"
+const admissionCoveragePolicy = "readable blocked records are gated; unmapped lookup misses are admitted (hivecommons/hive#3904)"
 
 // queueAdmissionSnapshot is ONE read-only, ephemeral admission pass: the
 // offerable queue, the withheld diagnostics for convergence-blocked/unknown
