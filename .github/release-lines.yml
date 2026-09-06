@@ -81,6 +81,11 @@ pinned:
   # not merge the sync branch, and do not "fix" it by widening this entry.
   # See src/docs/release-line-guard.md, "The infra workflow sync".
   scorecard.yml: [main, -v2]
+  # Simplified Technical English lint (#36). v4 only, same reasoning as
+  # docs-link-check.yml and changelog-fragment-guard.yml above: the shared
+  # linter and .ste-budget ratchet were adopted against the current mainline,
+  # and v2 is sunset.
+  ste.yml: [-v2]
   suid-contract.yml: []
   # PR-level guard for src/internal/testutil (#5603). Pinned to the release
   # lines and nothing else: it is a pull_request-only path-gated check, and a
