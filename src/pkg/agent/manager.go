@@ -10681,6 +10681,40 @@ func backendLaunchCmd(binary, model, backend string, isInference bool) string {
 		if model != "" {
 			launchCmd = fmt.Sprintf("%s --model %s --effort %s", launchCmd, model, agyDefaultEffort)
 		}
+	case "muse":
+		// Muse Code. Without an explicit case muse fell through to `default`
+		// and launched BARE, which hangs the pane on an interactive prompt no
+		// one is attached to answer:
+		//
+		//   Do you trust this workspace?  Workspace: /data/agents/<agent>
+		//   Trusting allows project-local skills, rules, hooks, and plugin
+		//   config to load before the model runs.
+		//
+		// The watchdog then kills the pane and restarts it, forever. Observed
+		// live on a spoke whose agents had just been rotated onto muse: every
+		// launch reached that prompt and no agent ever ran, while /api/status
+		// reported state=running / busy=working throughout.
+		//
+		// --trust-workspace answers it for this run (muse reports "workspace
+		// trust: trusted source=run-flag"). It does NOT persist trust, so it
+		// must be passed on every launch. The workspace here is the agent's
+		// own hive-managed directory, not a checkout of a third-party repo, so
+		// this grants nothing the agent did not already own.
+		//
+		// --approval-mode never is the unattended tool-approval policy, and is
+		// deliberately NOT --yolo: muse documents --yolo as disabling approval
+		// AND its sandbox, whereas this keeps the sandbox (bubblewrap/seccomp
+		// on Linux) intact. --user-input-auto-resolve auto-cancels any
+		// remaining prompt rather than blocking on it.
+		//
+		// An unrecognised --model is not reliably rejected by muse — a trivial
+		// prompt can succeed while a real one fails — and muse's catalog is
+		// caller-dependent, so the configured id must be one this pod's
+		// catalog actually serves. See docs/backend-setup.md.
+		launchCmd = fmt.Sprintf("%s --approval-mode never --user-input-auto-resolve --trust-workspace", binary)
+		if model != "" {
+			launchCmd = fmt.Sprintf("%s --model %s", launchCmd, model)
+		}
 	case "pi":
 		// pi takes the model as a CLI flag, not a subcommand. Without
 		// this case the launch command never receives the configured
