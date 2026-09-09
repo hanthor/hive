@@ -488,19 +488,40 @@ func (p DeepSeekProber) Probe(ctx context.Context) Headroom {
 	return Headroom{Provider: p.Provider(), Available: available, PctRemaining: pct}
 }
 
-// CopilotProber probes GitHub Copilot subscription/quota usage via the Copilot token API.
+// CopilotProber probes GitHub Copilot headroom for the `copilot` backend.
 //
-// `copilot` authenticates headlessly via COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN,
-// or persisted device-flow credentials (/data/copilot-user-token). The probe queries
-// the Copilot token exchange endpoint:
+// `copilot` authenticates headlessly via COPILOT_GITHUB_TOKEN, GH_TOKEN,
+// GITHUB_TOKEN, or persisted device-flow credentials
+// (/data/copilot-user-token, /data/copilot-token-pat, ~/.copilot/config.json).
+// The probe exchanges that GitHub token for a short-lived Copilot session token:
 //
 //	GET https://api.github.com/copilot_internal/v2/token
 //	Authorization: Bearer <token>
 //	Editor-Version: vscode/1.99.0
 //
-// A 200 response confirms available headroom.
-// A 429 Too Many Requests response indicates positive quota exhaustion (Available=false, ProbeErr=nil).
-// Any probe failure (401/403/timeout/network) is fail-open (Available=true, ProbeErr!=nil) per RFC #3958 invariant 7.
+// UNDOCUMENTED ENDPOINT. /copilot_internal/v2/token is the private token
+// exchange the VS Code and CLI Copilot clients use; GitHub publishes no API
+// contract for it and may change its path, status codes, headers, or auth
+// requirements at any time. GitHub exposes no public Copilot quota API, so
+// this is the only signal available.
+//
+// Because of that, the probe is deliberately fail-open on everything except a
+// 429 (RFC #3958 invariant 7):
+//
+//   - 429 Too Many Requests is the ONLY positive exhaustion signal
+//     (Available=false, ProbeErr=nil, ResetAt from X-RateLimit-Reset when
+//     present). This is what makes rotation move an agent off `copilot`.
+//   - 200 confirms available headroom. When the response carries the REST
+//     X-RateLimit-Limit/-Remaining headers they are turned into PctRemaining
+//     and compared against ThresholdPct; otherwise PctRemaining is reported
+//     as full. Note these headers describe the api.github.com request rate
+//     limit, not the Copilot premium-request allowance.
+//   - Anything else — missing token, 401/403, 404 (endpoint moved), 5xx,
+//     timeout, network error, unparseable body — is fail-open
+//     (Available=true, ProbeErr!=nil). The manager never rotates on a probe
+//     error, so if GitHub changes or removes the endpoint the effect is that
+//     Copilot degrades to "no rotation signal" (never rotated away from), not
+//     a spurious rotation or a startup failure.
 type CopilotProber struct {
 	ThresholdPct    int
 	BaseURL         string

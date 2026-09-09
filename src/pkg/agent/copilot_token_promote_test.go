@@ -330,4 +330,3 @@ func TestCopilotToken_EnvFallbacks(t *testing.T) {
 		}
 	})
 }
-

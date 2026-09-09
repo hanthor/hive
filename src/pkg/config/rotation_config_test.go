@@ -174,4 +174,3 @@ func TestConfig_ValidatePackAgentsHaveRotationRung(t *testing.T) {
 		t.Error("cfgBad.validate() = nil, want error when pack agents have no rotation tier rung")
 	}
 }
-

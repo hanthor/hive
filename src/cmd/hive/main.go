@@ -2755,7 +2755,7 @@ func main() {
 		rotationMgr.Start(ctx)
 		logger.Info("provider rotation enabled",
 			"threshold_pct", cfg.Governor.Rotation.EffectiveThreshold(),
-			"providers", len(cfg.Governor.Rotation.Providers))
+			"providers", len(cfg.Governor.Rotation.EffectiveProviders()))
 	}
 
 	// Agent self-healing watchdog (RFC #4665): liveness/readiness

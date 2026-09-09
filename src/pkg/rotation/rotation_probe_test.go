@@ -685,4 +685,3 @@ func TestCopilotProber_TokenFromCredentialsFile(t *testing.T) {
 		t.Fatalf("Probe failed with credentials file: %v, available=%v", h.ProbeErr, h.Available)
 	}
 }
-
