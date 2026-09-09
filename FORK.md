@@ -85,6 +85,11 @@ to rebase. Read them as upstream's, and scope them with this page:
 - `CONTRIBUTING.md` and `CODE_OF_CONDUCT.md` — upstream's, and they apply to
   contributions sent upstream.
 
+## Where the fleet runs
+
+The README's [Tuna OS deployment](README.md#tuna-os-deployment) section lists
+the live hosts and the health check that shows each one is up.
+
 ## Ownership
 
 The fork is maintained by the Tuna OS organization. Decisions about the fork —
