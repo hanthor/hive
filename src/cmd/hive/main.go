@@ -2755,7 +2755,7 @@ func main() {
 		rotationMgr.Start(ctx)
 		logger.Info("provider rotation enabled",
 			"threshold_pct", cfg.Governor.Rotation.EffectiveThreshold(),
-			"providers", len(cfg.Governor.Rotation.Providers))
+			"providers", len(cfg.Governor.Rotation.EffectiveProviders()))
 	}
 
 	// Agent self-healing watchdog (RFC #4665): liveness/readiness
@@ -7551,6 +7551,7 @@ func watchdogAuthProbes(cfg *config.Config) map[string]watchdog.AuthProbe {
 		rotation.CodexProber{ThresholdPct: threshold},
 		rotation.AgyProber{ThresholdPct: threshold},
 		rotation.DeepSeekProber{},
+		rotation.CopilotProber{ThresholdPct: threshold},
 	}
 	out := make(map[string]watchdog.AuthProbe, len(probers))
 	for _, p := range probers {

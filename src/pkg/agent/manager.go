@@ -749,7 +749,32 @@ func (m *Manager) SetCopilotToken(token string) {
 func (m *Manager) CopilotToken() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.copilotAuthToken
+	return m.copilotTokenLocked()
+}
+
+// copilotTokenLocked is CopilotToken's resolution logic without taking m.mu
+// itself, for callers that already hold m.mu — such as agentEnvPairs, which
+// launchInTmux calls while Start holds m.mu.Lock() for the whole of Phase 3
+// (see the PHASE 3 comment above). Calling the locking CopilotToken() from
+// there RLocks a sync.RWMutex the same goroutine already holds for writing;
+// RWMutex is not reentrant, so that self-deadlocks (observed as
+// TestLaunchInTmux_CopilotDefaultMode hanging in Manager.CopilotToken's
+// RLock until the 10-minute test timeout). Callers must already hold m.mu
+// (Lock or RLock) before calling this.
+func (m *Manager) copilotTokenLocked() string {
+	if m.copilotAuthToken != "" {
+		return m.copilotAuthToken
+	}
+	if tok := os.Getenv("COPILOT_GITHUB_TOKEN"); tok != "" {
+		return tok
+	}
+	if tok := os.Getenv("GH_TOKEN"); tok != "" {
+		return tok
+	}
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		return tok
+	}
+	return ""
 }
 
 // BackendAuthAvailable reports whether shared credentials exist for a CLI
@@ -767,6 +792,9 @@ func (m *Manager) BackendAuthAvailable(backend string) (available, known bool) {
 		tok := m.copilotAuthToken
 		m.mu.RUnlock()
 		if tok != "" {
+			return true, true
+		}
+		if os.Getenv("COPILOT_GITHUB_TOKEN") != "" || os.Getenv("GH_TOKEN") != "" || os.Getenv("GITHUB_TOKEN") != "" {
 			return true, true
 		}
 		return configHasTokens(), true
@@ -1719,8 +1747,19 @@ func NewManager(agents map[string]config.AgentConfig, logger *slog.Logger, proje
 	// completions; write access is gated by --enable-all-github-mcp-tools flag.
 	copilotToken := os.Getenv("COPILOT_GITHUB_TOKEN")
 	if copilotToken == "" {
+		copilotToken = os.Getenv("GH_TOKEN")
+	}
+	if copilotToken == "" {
+		copilotToken = os.Getenv("GITHUB_TOKEN")
+	}
+	if copilotToken == "" {
 		// Fall back to the token persisted by the dashboard's device-flow login.
 		if data, err := os.ReadFile(CopilotUserTokenPath); err == nil {
+			copilotToken = strings.TrimSpace(string(data))
+		}
+	}
+	if copilotToken == "" {
+		if data, err := os.ReadFile("/data/copilot-token-pat"); err == nil {
 			copilotToken = strings.TrimSpace(string(data))
 		}
 	}
@@ -9254,8 +9293,8 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 			vars = append(vars, agentEnvPair{v, "1", false})
 		}
 	}
-	if m.copilotAuthToken != "" {
-		vars = append(vars, agentEnvPair{"COPILOT_GITHUB_TOKEN", m.copilotAuthToken, true})
+	if tok := m.copilotTokenLocked(); tok != "" {
+		vars = append(vars, agentEnvPair{"COPILOT_GITHUB_TOKEN", tok, true})
 	}
 	// Point the GitHub MCP server at the App installation token so PRs, issue
 	// comments, and merges are authored by the App bot ("<slug>[bot]") — NOT by

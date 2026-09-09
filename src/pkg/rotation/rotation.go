@@ -488,6 +488,240 @@ func (p DeepSeekProber) Probe(ctx context.Context) Headroom {
 	return Headroom{Provider: p.Provider(), Available: available, PctRemaining: pct}
 }
 
+// CopilotProber probes GitHub Copilot headroom for the `copilot` backend.
+//
+// `copilot` authenticates headlessly via COPILOT_GITHUB_TOKEN, GH_TOKEN,
+// GITHUB_TOKEN, or persisted device-flow credentials
+// (/data/copilot-user-token, /data/copilot-token-pat, ~/.copilot/config.json).
+// The probe exchanges that GitHub token for a short-lived Copilot session token:
+//
+//	GET https://api.github.com/copilot_internal/v2/token
+//	Authorization: Bearer <token>
+//	Editor-Version: vscode/1.99.0
+//
+// UNDOCUMENTED ENDPOINT. /copilot_internal/v2/token is the private token
+// exchange the VS Code and CLI Copilot clients use; GitHub publishes no API
+// contract for it and may change its path, status codes, headers, or auth
+// requirements at any time. GitHub exposes no public Copilot quota API, so
+// this is the only signal available.
+//
+// Because of that, the probe is deliberately fail-open on everything except a
+// 429 (RFC #3958 invariant 7):
+//
+//   - 429 Too Many Requests is the ONLY positive exhaustion signal
+//     (Available=false, ProbeErr=nil, ResetAt from X-RateLimit-Reset when
+//     present). This is what makes rotation move an agent off `copilot`.
+//   - 200 confirms available headroom. When the response carries the REST
+//     X-RateLimit-Limit/-Remaining headers they are turned into PctRemaining
+//     and compared against ThresholdPct; otherwise PctRemaining is reported
+//     as full. Note these headers describe the api.github.com request rate
+//     limit, not the Copilot premium-request allowance.
+//   - Anything else — missing token, 401/403, 404 (endpoint moved), 5xx,
+//     timeout, network error, unparseable body — is fail-open
+//     (Available=true, ProbeErr!=nil). The manager never rotates on a probe
+//     error, so if GitHub changes or removes the endpoint the effect is that
+//     Copilot degrades to "no rotation signal" (never rotated away from), not
+//     a spurious rotation or a startup failure.
+type CopilotProber struct {
+	ThresholdPct    int
+	BaseURL         string
+	Client          *http.Client
+	Token           string
+	CredentialsPath string
+}
+
+const copilotUsageBaseURL = "https://api.github.com"
+
+func (p CopilotProber) Provider() string { return "github" }
+
+func extractCopilotConfigToken(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var cleaned []byte
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		cleaned = append(cleaned, []byte(line+"\n")...)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(cleaned, &cfg); err != nil {
+		return ""
+	}
+	if tokens, ok := cfg["copilotTokens"].(map[string]interface{}); ok {
+		for _, v := range tokens {
+			switch t := v.(type) {
+			case string:
+				t = strings.TrimSpace(t)
+				if t != "" && !strings.Contains(t, "***") {
+					return t
+				}
+			case map[string]interface{}:
+				if s, ok := t["token"].(string); ok {
+					s = strings.TrimSpace(s)
+					if s != "" && !strings.Contains(s, "***") {
+						return s
+					}
+				}
+			}
+		}
+	}
+	for _, v := range cfg {
+		if m, ok := v.(map[string]interface{}); ok {
+			if s, ok := m["oauth_token"].(string); ok {
+				s = strings.TrimSpace(s)
+				if s != "" && !strings.Contains(s, "***") {
+					return s
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func (p CopilotProber) resolveToken() string {
+	if p.Token != "" {
+		return p.Token
+	}
+	credPath := p.CredentialsPath
+	if credPath != "" {
+		if strings.HasSuffix(credPath, ".json") {
+			if tok := extractCopilotConfigToken(credPath); tok != "" {
+				return tok
+			}
+		}
+		if data, err := os.ReadFile(credPath); err == nil {
+			if s := strings.TrimSpace(string(data)); s != "" {
+				return s
+			}
+		}
+		return ""
+	}
+	if tok := os.Getenv("COPILOT_GITHUB_TOKEN"); tok != "" {
+		return tok
+	}
+	if tok := os.Getenv("GH_TOKEN"); tok != "" {
+		return tok
+	}
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		return tok
+	}
+	for _, path := range []string{"/data/copilot-user-token", "/data/copilot-token-pat"} {
+		if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+			return strings.TrimSpace(string(data))
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if tok := extractCopilotConfigToken(filepath.Join(home, ".copilot", "config.json")); tok != "" {
+			return tok
+		}
+		if tok := extractCopilotConfigToken(filepath.Join(home, ".config", "github-copilot", "hosts.json")); tok != "" {
+			return tok
+		}
+		if tok := extractCopilotConfigToken(filepath.Join(home, ".config", "github-copilot", "apps.json")); tok != "" {
+			return tok
+		}
+	}
+	if tok := extractCopilotConfigToken(filepath.Join(sharedCLIHome, ".copilot", "config.json")); tok != "" {
+		return tok
+	}
+	return ""
+}
+
+func (p CopilotProber) Probe(ctx context.Context) Headroom {
+	token := p.resolveToken()
+	if token == "" {
+		return failOpen(p.Provider(), errors.New("copilot credentials: empty token"))
+	}
+	base := p.BaseURL
+	if base == "" {
+		base = copilotUsageBaseURL
+	}
+	client := p.Client
+	if client == nil {
+		client = &http.Client{Timeout: probeTimeout}
+	}
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/copilot_internal/v2/token", nil)
+	if err != nil {
+		return failOpen(p.Provider(), err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Editor-Version", "vscode/1.99.0")
+	req.Header.Set("Editor-Plugin-Version", "copilot-chat/0.24.0")
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return failOpen(p.Provider(), err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		var resetAt time.Time
+		if resetHeader := resp.Header.Get("X-RateLimit-Reset"); resetHeader != "" {
+			if sec, err := strconv.ParseInt(resetHeader, 10, 64); err == nil {
+				resetAt = time.Unix(sec, 0).UTC()
+			}
+		}
+		return Headroom{
+			Provider:     p.Provider(),
+			Available:    false,
+			PctRemaining: 0,
+			ResetAt:      resetAt,
+		}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return failOpen(p.Provider(), fmt.Errorf("copilot token HTTP %d", resp.StatusCode))
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return failOpen(p.Provider(), err)
+	}
+	var parsed struct {
+		Token     string `json:"token"`
+		ExpiresAt int64  `json:"expires_at"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return failOpen(p.Provider(), fmt.Errorf("copilot token parse: %w", err))
+	}
+	var resetAt time.Time
+	if parsed.ExpiresAt > 0 {
+		resetAt = time.Unix(parsed.ExpiresAt, 0).UTC()
+	}
+	used := 0
+	pctRemaining := fullPct
+	threshold := p.ThresholdPct
+	if threshold <= 0 {
+		threshold = 85
+	}
+	available := true
+	if limitHeader := resp.Header.Get("X-RateLimit-Limit"); limitHeader != "" {
+		if limit, err := strconv.Atoi(limitHeader); err == nil && limit > 0 {
+			if remHeader := resp.Header.Get("X-RateLimit-Remaining"); remHeader != "" {
+				if rem, err := strconv.Atoi(remHeader); err == nil {
+					used = (limit - rem) * 100 / limit
+					pctRemaining = rem * 100 / limit
+					available = used < threshold
+				}
+			}
+		}
+	}
+	if resetHeader := resp.Header.Get("X-RateLimit-Reset"); resetHeader != "" {
+		if sec, err := strconv.ParseInt(resetHeader, 10, 64); err == nil {
+			resetAt = time.Unix(sec, 0).UTC()
+		}
+	}
+	return Headroom{
+		Provider:     p.Provider(),
+		Available:    available,
+		PctRemaining: pctRemaining,
+		ResetAt:      resetAt,
+	}
+}
+
 // Manager runs the rotation loop: it polls provider headroom and answers
 // "should this agent rotate, and where to?".
 type Manager struct {
@@ -499,7 +733,7 @@ type Manager struct {
 }
 
 // NewManager builds a Manager with the default prober set for every provider
-// named in cfg.Providers. Unknown provider names get no prober (their
+// named in cfg.EffectiveProviders(). Unknown provider names get no prober (their
 // headroom stays unknown, which fails open).
 func NewManager(cfg config.RotationConfig) *Manager {
 	m := &Manager{
@@ -507,7 +741,7 @@ func NewManager(cfg config.RotationConfig) *Manager {
 		headroom: make(map[string]Headroom),
 	}
 	threshold := cfg.EffectiveThreshold()
-	for name := range cfg.Providers {
+	for name := range cfg.EffectiveProviders() {
 		switch name {
 		case "anthropic":
 			m.probers = append(m.probers, ClaudeProber{ThresholdPct: threshold})
@@ -517,6 +751,8 @@ func NewManager(cfg config.RotationConfig) *Manager {
 			m.probers = append(m.probers, AgyProber{ThresholdPct: threshold})
 		case "deepseek":
 			m.probers = append(m.probers, DeepSeekProber{})
+		case "github":
+			m.probers = append(m.probers, CopilotProber{ThresholdPct: threshold})
 		}
 	}
 	return m
@@ -575,7 +811,7 @@ func (m *Manager) HeadroomFor(provider string) Headroom {
 // providerForBackend maps a hive backend name to its rotation provider, ""
 // when the backend is not covered by any configured provider.
 func (m *Manager) providerForBackend(backend string) string {
-	for name, pc := range m.cfg.Providers {
+	for name, pc := range m.cfg.EffectiveProviders() {
 		for _, b := range pc.Backends {
 			if b == backend {
 				return name
@@ -639,6 +875,7 @@ func (m *Manager) NextBackendForCadence(agentName, currentBackend string, cadenc
 func (m *Manager) nextBackend(agentName, currentBackend string, cadenceS int) string {
 	currentProvider := m.providerForBackend(currentBackend)
 	highVolume := cadenceS > 0 && cadenceS <= m.cfg.EffectiveHighVolumeCadenceS()
+	providers := m.cfg.EffectiveProviders()
 
 	// A high-cadence agent normally must not consume a subscription pool: it
 	// can exhaust a weekly allowance and take the operator's own CLI down with
@@ -648,7 +885,7 @@ func (m *Manager) nextBackend(agentName, currentBackend string, cadenceS int) st
 	// metered current provider, successful probe, and unavailable headroom.
 	// Probe errors remain fail-open and never trigger a rotation.
 	allowSubscriptionFailover := false
-	if current, ok := m.cfg.Providers[currentProvider]; ok && current.Class == ClassMetered {
+	if current, ok := providers[currentProvider]; ok && current.Class == ClassMetered {
 		h := m.HeadroomFor(currentProvider)
 		allowSubscriptionFailover = h.ProbeErr == nil && !h.Available
 	}
@@ -659,8 +896,8 @@ func (m *Manager) nextBackend(agentName, currentBackend string, cadenceS int) st
 		pct      int
 	}
 	var candidates []candidate
-	names := make([]string, 0, len(m.cfg.Providers))
-	for name := range m.cfg.Providers {
+	names := make([]string, 0, len(providers))
+	for name := range providers {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -668,7 +905,7 @@ func (m *Manager) nextBackend(agentName, currentBackend string, cadenceS int) st
 		if name == currentProvider {
 			continue
 		}
-		pc := m.cfg.Providers[name]
+		pc := providers[name]
 		if len(pc.Backends) == 0 {
 			continue
 		}
