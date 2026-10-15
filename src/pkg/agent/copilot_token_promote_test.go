@@ -289,3 +289,44 @@ func TestRestoreCopilotTokens_IdentityShape(t *testing.T) {
 		t.Errorf("no-identity token = %q, want gho_plain under github.com object shape; tokens=%v", got, toks)
 	}
 }
+
+func TestCopilotToken_EnvFallbacks(t *testing.T) {
+	t.Run("COPILOT_GITHUB_TOKEN takes precedence", func(t *testing.T) {
+		t.Setenv("COPILOT_GITHUB_TOKEN", "token-copilot")
+		t.Setenv("GH_TOKEN", "token-gh")
+		t.Setenv("GITHUB_TOKEN", "token-github")
+		m := NewManager(nil, discardLogger(), ProjectContext{})
+		if got := m.CopilotToken(); got != "token-copilot" {
+			t.Errorf("CopilotToken() = %q, want token-copilot", got)
+		}
+		if ok, known := m.BackendAuthAvailable("copilot"); !ok || !known {
+			t.Errorf("BackendAuthAvailable(copilot) = (%v, %v), want (true, true)", ok, known)
+		}
+	})
+
+	t.Run("GH_TOKEN used when COPILOT_GITHUB_TOKEN is unset", func(t *testing.T) {
+		t.Setenv("COPILOT_GITHUB_TOKEN", "")
+		t.Setenv("GH_TOKEN", "token-gh")
+		t.Setenv("GITHUB_TOKEN", "token-github")
+		m := NewManager(nil, discardLogger(), ProjectContext{})
+		if got := m.CopilotToken(); got != "token-gh" {
+			t.Errorf("CopilotToken() = %q, want token-gh", got)
+		}
+		if ok, known := m.BackendAuthAvailable("copilot"); !ok || !known {
+			t.Errorf("BackendAuthAvailable(copilot) = (%v, %v), want (true, true)", ok, known)
+		}
+	})
+
+	t.Run("GITHUB_TOKEN used when COPILOT_GITHUB_TOKEN and GH_TOKEN unset", func(t *testing.T) {
+		t.Setenv("COPILOT_GITHUB_TOKEN", "")
+		t.Setenv("GH_TOKEN", "")
+		t.Setenv("GITHUB_TOKEN", "token-github")
+		m := NewManager(nil, discardLogger(), ProjectContext{})
+		if got := m.CopilotToken(); got != "token-github" {
+			t.Errorf("CopilotToken() = %q, want token-github", got)
+		}
+		if ok, known := m.BackendAuthAvailable("copilot"); !ok || !known {
+			t.Errorf("BackendAuthAvailable(copilot) = (%v, %v), want (true, true)", ok, known)
+		}
+	})
+}

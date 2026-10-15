@@ -1,5 +1,7 @@
 # Hive
 
+[![Deployment](https://img.shields.io/badge/deployment-hub.tunaos.org-6366f1?style=flat-square)](https://hub.tunaos.org)
+[![Tuna OS](https://img.shields.io/badge/website-tunaos.org-3b82f6?style=flat-square)](https://tunaos.org)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14261/badge)](https://www.bestpractices.dev/projects/14261)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -502,7 +504,7 @@ Hive uses an **AI-native Capability Maturity Model** (ACMM) with six levels that
 
 Each level defines per-agent **policy modes**: advisory (observe only), measured (file issues), holdgated (PRs with hold label), or full (auto-merge). See `src/docs/acmm-policy-matrix.md` for the full matrix. Browse the [documentation index](src/docs/README.md) for operations, contributor relay, snapshots, health checks, and design guides.
 
-Operational references from the repository root include [hub disaster recovery](docs/HUB_DISASTER_RECOVERY.md), [federation design](docs/federation-design.md), [outreach antispam policy](docs/outreach-antispam.md), [macOS deployment notes](docs/macos.md), and [backend setup](docs/backend-setup.md). Worked examples live under [examples/](examples/README.md), including [KubeStellar skill and campaign configs](examples/kubestellar/README.md), [SQLite state backend notes](examples/sqlite-state.md), and [ACMM runtime fragments](examples/acmm/README.md).
+Operational references from the repository root include [hub disaster recovery](docs/HUB_DISASTER_RECOVERY.md), [federation design](docs/federation-design.md), [outreach antispam policy](docs/outreach-antispam.md), [macOS deployment notes](docs/macos.md), [backend setup](docs/backend-setup.md), and [observability guidelines](docs/OBSERVABILITY.md). Worked examples live under [examples/](examples/README.md), including [KubeStellar skill and campaign configs](examples/kubestellar/README.md), [SQLite state backend notes](examples/sqlite-state.md), and [ACMM runtime fragments](examples/acmm/README.md).
 
 ## Architecture
 
@@ -547,6 +549,25 @@ See [`hivectl tui` in the command reference](src/docs/hivectl.md#tui--live-termi
 for keybindings, pane cadence, and v1 boundaries, and
 [the design record](src/docs/design/tui.md) for the reasoning behind it.
 
+## Tuna OS deployment
+
+Tuna OS runs this fork as a fleet of hives behind one hub. Each host below
+answered `curl` on 2026-09-10:
+
+| Host | Role | Check |
+| --- | --- | --- |
+| [hub.tunaos.org](https://hub.tunaos.org) | Hub. Its index page lists the hives. | `GET /` returns `200` |
+| [reef.tunaos.org](https://reef.tunaos.org) | Hive | `GET /api/health` returns `{"status":"ok"}` |
+| [school.tunaos.org](https://school.tunaos.org) | Hive | `GET /api/health` returns `{"status":"ok"}` |
+| [hive.tunaos.org](https://hive.tunaos.org) | Hive; the hub index does not list it | `GET /api/health` returns `{"status":"ok"}` |
+
+A hive answers `401` on `/` until you supply the dashboard token from the Quick
+Start, so use `/api/health` to see whether a hive is up.
+
+- Website: [tunaos.org](https://tunaos.org)
+- Organization: [github.com/tuna-os](https://github.com/tuna-os)
+- Fork scope and upstream: [FORK.md](FORK.md)
+
 ## Contribute to a Hive
 
 Community members can contribute compute to any hive through **ClankeR**, the
@@ -581,3 +602,11 @@ Please see [SECURITY.md](SECURITY.md) for the vulnerability disclosure process. 
 ---
 
 Apache 2.0
+
+<!-- hive-contribute-plea: donated-compute appeal, keep in sync across repos -->
+## Contribute compute — no code needed
+
+No time to write code? You can still push this project's backlog forward. TunaOS AI-agent hives work on this repository. Lend a hive your AI subscription or API tokens, and your machine runs contributor tasks from this project's backlog.
+
+- 🪸 [Contribute compute to the reef hive](https://reef.tunaos.org/contribute)
+- 🏫 [Contribute compute to the school hive](https://school.tunaos.org/contribute)

@@ -14,7 +14,7 @@ import (
 func TestWatchdogAuthProbesCoversAllProviders(t *testing.T) {
 	probes := watchdogAuthProbes(&config.Config{})
 
-	wantProviders := []string{"anthropic", "openai", "google", "deepseek"}
+	wantProviders := []string{"anthropic", "openai", "google", "deepseek", "github"}
 	if len(probes) != len(wantProviders) {
 		t.Fatalf("got %d probes, want %d (%v)", len(probes), len(wantProviders), wantProviders)
 	}

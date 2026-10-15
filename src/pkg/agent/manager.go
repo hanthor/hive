@@ -749,7 +749,32 @@ func (m *Manager) SetCopilotToken(token string) {
 func (m *Manager) CopilotToken() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.copilotAuthToken
+	return m.copilotTokenLocked()
+}
+
+// copilotTokenLocked is CopilotToken's resolution logic without taking m.mu
+// itself, for callers that already hold m.mu — such as agentEnvPairs, which
+// launchInTmux calls while Start holds m.mu.Lock() for the whole of Phase 3
+// (see the PHASE 3 comment above). Calling the locking CopilotToken() from
+// there RLocks a sync.RWMutex the same goroutine already holds for writing;
+// RWMutex is not reentrant, so that self-deadlocks (observed as
+// TestLaunchInTmux_CopilotDefaultMode hanging in Manager.CopilotToken's
+// RLock until the 10-minute test timeout). Callers must already hold m.mu
+// (Lock or RLock) before calling this.
+func (m *Manager) copilotTokenLocked() string {
+	if m.copilotAuthToken != "" {
+		return m.copilotAuthToken
+	}
+	if tok := os.Getenv("COPILOT_GITHUB_TOKEN"); tok != "" {
+		return tok
+	}
+	if tok := os.Getenv("GH_TOKEN"); tok != "" {
+		return tok
+	}
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		return tok
+	}
+	return ""
 }
 
 // BackendAuthAvailable reports whether shared credentials exist for a CLI
@@ -767,6 +792,9 @@ func (m *Manager) BackendAuthAvailable(backend string) (available, known bool) {
 		tok := m.copilotAuthToken
 		m.mu.RUnlock()
 		if tok != "" {
+			return true, true
+		}
+		if os.Getenv("COPILOT_GITHUB_TOKEN") != "" || os.Getenv("GH_TOKEN") != "" || os.Getenv("GITHUB_TOKEN") != "" {
 			return true, true
 		}
 		return configHasTokens(), true
@@ -1719,8 +1747,19 @@ func NewManager(agents map[string]config.AgentConfig, logger *slog.Logger, proje
 	// completions; write access is gated by --enable-all-github-mcp-tools flag.
 	copilotToken := os.Getenv("COPILOT_GITHUB_TOKEN")
 	if copilotToken == "" {
+		copilotToken = os.Getenv("GH_TOKEN")
+	}
+	if copilotToken == "" {
+		copilotToken = os.Getenv("GITHUB_TOKEN")
+	}
+	if copilotToken == "" {
 		// Fall back to the token persisted by the dashboard's device-flow login.
 		if data, err := os.ReadFile(CopilotUserTokenPath); err == nil {
+			copilotToken = strings.TrimSpace(string(data))
+		}
+	}
+	if copilotToken == "" {
+		if data, err := os.ReadFile("/data/copilot-token-pat"); err == nil {
 			copilotToken = strings.TrimSpace(string(data))
 		}
 	}
@@ -9254,8 +9293,8 @@ func (m *Manager) agentEnvPairs(agent *AgentProcess) []agentEnvPair {
 			vars = append(vars, agentEnvPair{v, "1", false})
 		}
 	}
-	if m.copilotAuthToken != "" {
-		vars = append(vars, agentEnvPair{"COPILOT_GITHUB_TOKEN", m.copilotAuthToken, true})
+	if tok := m.copilotTokenLocked(); tok != "" {
+		vars = append(vars, agentEnvPair{"COPILOT_GITHUB_TOKEN", tok, true})
 	}
 	// Point the GitHub MCP server at the App installation token so PRs, issue
 	// comments, and merges are authored by the App bot ("<slug>[bot]") — NOT by
@@ -10680,6 +10719,40 @@ func backendLaunchCmd(binary, model, backend string, isInference bool) string {
 		launchCmd = fmt.Sprintf("%s --dangerously-skip-permissions", binary)
 		if model != "" {
 			launchCmd = fmt.Sprintf("%s --model %s --effort %s", launchCmd, model, agyDefaultEffort)
+		}
+	case "muse":
+		// Muse Code. Without an explicit case muse fell through to `default`
+		// and launched BARE, which hangs the pane on an interactive prompt no
+		// one is attached to answer:
+		//
+		//   Do you trust this workspace?  Workspace: /data/agents/<agent>
+		//   Trusting allows project-local skills, rules, hooks, and plugin
+		//   config to load before the model runs.
+		//
+		// The watchdog then kills the pane and restarts it, forever. Observed
+		// live on a spoke whose agents had just been rotated onto muse: every
+		// launch reached that prompt and no agent ever ran, while /api/status
+		// reported state=running / busy=working throughout.
+		//
+		// --trust-workspace answers it for this run (muse reports "workspace
+		// trust: trusted source=run-flag"). It does NOT persist trust, so it
+		// must be passed on every launch. The workspace here is the agent's
+		// own hive-managed directory, not a checkout of a third-party repo, so
+		// this grants nothing the agent did not already own.
+		//
+		// --approval-mode never is the unattended tool-approval policy, and is
+		// deliberately NOT --yolo: muse documents --yolo as disabling approval
+		// AND its sandbox, whereas this keeps the sandbox (bubblewrap/seccomp
+		// on Linux) intact. --user-input-auto-resolve auto-cancels any
+		// remaining prompt rather than blocking on it.
+		//
+		// An unrecognised --model is not reliably rejected by muse — a trivial
+		// prompt can succeed while a real one fails — and muse's catalog is
+		// caller-dependent, so the configured id must be one this pod's
+		// catalog actually serves. See docs/backend-setup.md.
+		launchCmd = fmt.Sprintf("%s --approval-mode never --user-input-auto-resolve --trust-workspace", binary)
+		if model != "" {
+			launchCmd = fmt.Sprintf("%s --model %s", launchCmd, model)
 		}
 	case "pi":
 		// pi takes the model as a CLI flag, not a subcommand. Without

@@ -329,19 +329,20 @@ func TestNewManager_DefaultProbers(t *testing.T) {
 			"anthropic": {Class: ClassSubscription, Backends: []string{"claude"}},
 			"openai":    {Class: ClassSubscription, Backends: []string{"codex"}},
 			"google":    {Class: ClassSubscription, Backends: []string{"agy"}},
+			"github":    {Class: ClassSubscription, Backends: []string{"copilot"}},
 			"deepseek":  {Class: ClassMetered, Backends: []string{"litellm"}},
 			"unknown":   {Class: ClassMetered, Backends: []string{"other"}},
 		},
 	}
 	m := NewManager(cfg)
-	if len(m.probers) != 4 {
-		t.Fatalf("len(probers) = %d, want 4 (unknown provider gets none)", len(m.probers))
+	if len(m.probers) != 5 {
+		t.Fatalf("len(probers) = %d, want 5 (unknown provider gets none)", len(m.probers))
 	}
 	got := map[string]bool{}
 	for _, p := range m.probers {
 		got[p.Provider()] = true
 	}
-	for _, want := range []string{"anthropic", "openai", "google", "deepseek"} {
+	for _, want := range []string{"anthropic", "openai", "google", "github", "deepseek"} {
 		if !got[want] {
 			t.Errorf("missing default prober for %q", want)
 		}
@@ -558,5 +559,129 @@ func TestCodexProber_AppServerError(t *testing.T) {
 func TestParseCodexRateLimits_Invalid(t *testing.T) {
 	if _, _, err := parseCodexRateLimits([]byte("not-json")); err == nil {
 		t.Error("err = nil, want parse error")
+	}
+}
+
+func copilotTokenServer(t *testing.T, status int, body string, limit, remaining int, resetSec int64) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/copilot_internal/v2/token" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-copilot-token" {
+			t.Errorf("Authorization = %q, want Bearer test-copilot-token", got)
+		}
+		if got := r.Header.Get("Editor-Version"); got != "vscode/1.99.0" {
+			t.Errorf("Editor-Version = %q, want vscode/1.99.0", got)
+		}
+		if limit > 0 {
+			w.Header().Set("X-RateLimit-Limit", fmt.Sprintf("%d", limit))
+			w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
+		}
+		if resetSec > 0 {
+			w.Header().Set("X-RateLimit-Reset", fmt.Sprintf("%d", resetSec))
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestCopilotProber_Available(t *testing.T) {
+	srv := copilotTokenServer(t, http.StatusOK, `{"token":"tid=123","expires_at":1787968245}`, 5000, 4000, 1787968245)
+	p := CopilotProber{ThresholdPct: 80, BaseURL: srv.URL, Token: "test-copilot-token"}
+	if p.Provider() != "github" {
+		t.Errorf("Provider = %q, want github", p.Provider())
+	}
+	h := p.Probe(context.Background())
+	if h.ProbeErr != nil {
+		t.Fatalf("ProbeErr = %v", h.ProbeErr)
+	}
+	if !h.Available {
+		t.Error("Available = false, want true (20% used < 80% threshold)")
+	}
+	if h.PctRemaining != 80 {
+		t.Errorf("PctRemaining = %d, want 80", h.PctRemaining)
+	}
+	if h.ResetAt.IsZero() {
+		t.Error("ResetAt unset, want valid timestamp")
+	}
+}
+
+func TestCopilotProber_ExhaustedRateLimit(t *testing.T) {
+	srv := copilotTokenServer(t, http.StatusOK, `{"token":"tid=123","expires_at":1787968245}`, 5000, 500, 1787968245)
+	p := CopilotProber{ThresholdPct: 80, BaseURL: srv.URL, Token: "test-copilot-token"}
+	h := p.Probe(context.Background())
+	if h.ProbeErr != nil {
+		t.Fatalf("ProbeErr = %v", h.ProbeErr)
+	}
+	if h.Available {
+		t.Error("Available = true, want false (90% used >= 80% threshold)")
+	}
+	if h.PctRemaining != 10 {
+		t.Errorf("PctRemaining = %d, want 10", h.PctRemaining)
+	}
+}
+
+func TestCopilotProber_Exhausted429(t *testing.T) {
+	srv := copilotTokenServer(t, http.StatusTooManyRequests, `{"message":"rate limit exceeded"}`, 0, 0, 1787968245)
+	p := CopilotProber{ThresholdPct: 80, BaseURL: srv.URL, Token: "test-copilot-token"}
+	h := p.Probe(context.Background())
+	if h.ProbeErr != nil {
+		t.Fatalf("ProbeErr = %v, want nil on positive 429 exhaustion", h.ProbeErr)
+	}
+	if h.Available {
+		t.Error("Available = true, want false on 429")
+	}
+	if h.PctRemaining != 0 {
+		t.Errorf("PctRemaining = %d, want 0 on 429", h.PctRemaining)
+	}
+	if h.ResetAt.IsZero() {
+		t.Error("ResetAt unset, want timestamp from reset header")
+	}
+}
+
+func TestCopilotProber_EmptyToken(t *testing.T) {
+	t.Setenv("COPILOT_GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	p := CopilotProber{ThresholdPct: 80, CredentialsPath: filepath.Join(t.TempDir(), "nonexistent.json")}
+	h := p.Probe(context.Background())
+	if h.ProbeErr == nil || !h.Available {
+		t.Error("want fail-open with error when no token is present")
+	}
+}
+
+func TestCopilotProber_HTTPError(t *testing.T) {
+	srv := copilotTokenServer(t, http.StatusInternalServerError, `{"error":"internal"}`, 0, 0, 0)
+	p := CopilotProber{ThresholdPct: 80, BaseURL: srv.URL, Token: "test-copilot-token"}
+	h := p.Probe(context.Background())
+	if h.ProbeErr == nil || !h.Available {
+		t.Error("want fail-open with error on 500 error")
+	}
+}
+
+func TestCopilotProber_TokenFromEnv(t *testing.T) {
+	srv := copilotTokenServer(t, http.StatusOK, `{"token":"tid=123","expires_at":1787968245}`, 5000, 4500, 1787968245)
+	t.Setenv("COPILOT_GITHUB_TOKEN", "test-copilot-token")
+	p := CopilotProber{ThresholdPct: 80, BaseURL: srv.URL}
+	h := p.Probe(context.Background())
+	if h.ProbeErr != nil || !h.Available {
+		t.Fatalf("Probe failed with env token: %v, available=%v", h.ProbeErr, h.Available)
+	}
+}
+
+func TestCopilotProber_TokenFromCredentialsFile(t *testing.T) {
+	srv := copilotTokenServer(t, http.StatusOK, `{"token":"tid=123","expires_at":1787968245}`, 5000, 4500, 1787968245)
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(credPath, []byte(`{"copilotTokens":{"github.com":"test-copilot-token"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := CopilotProber{ThresholdPct: 80, BaseURL: srv.URL, CredentialsPath: credPath}
+	h := p.Probe(context.Background())
+	if h.ProbeErr != nil || !h.Available {
+		t.Fatalf("Probe failed with credentials file: %v, available=%v", h.ProbeErr, h.Available)
 	}
 }
