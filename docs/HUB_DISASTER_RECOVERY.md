@@ -33,13 +33,15 @@ There is no KMS, no escrow, no second copy anywhere.
 ciphertext.** Every user must authorize again through OAuth. No restore
 procedure can recover the key. This backup prevents that outcome.
 
-### 3. The authoritative spoke config is the PVC overlay — usually NOT `hive.yaml.runtime`
+### 3. A spoke boots from `hive.yaml.runtime` — the overlay is merged only when there is none
 
-> **Corrected.** Before this section, it said that `copy-config` restores from
-> `/data/hive.yaml.runtime` and that this file brings a spoke back. **That is
-> true for only 3 of 51 live hives.** On the other 48, this method creates a
-> spoke with different configuration and no error. The failure appears only
-> during an emergency.
+> **Corrected twice.** This section first said that `copy-config` restores
+> `/data/hive.yaml.runtime` and that this one file brings a spoke back. The
+> init container does that on only 3 of 51 live hives. It then said the
+> dashboard overlay is the layer that wins on every boot. The main container
+> contradicts that: it boots from `/data/hive.yaml.runtime` whenever the PVC
+> holds one, and merges the overlay only when it does not. Restore both files,
+> from the same backup. See "What the hive boots from" below.
 
 The fleet runs **two different `copy-config` variants**, baked into each
 spoke's Deployment at provision time and never migrated.
@@ -79,33 +81,55 @@ kubectl -n hive-hosted-<id> get deploy -o jsonpath\
 ='{.items[*].spec.template.spec.initContainers[?(@.name=="copy-config")].command}'
 ```
 
-#### What actually holds the running config
+#### What the hive boots from
 
-Every hive uses the PVC overlay as its effective config. The entrypoint merges
-`/data/hive.yaml.dashboard` over the seed at boot. In sampled hives, the
-ConfigMap seed provides 4–11% of the effective config and lacks top-level blocks
-(`policies`, `data`, `knowledge`, `notifications`, `hive_id`).
+The `copy-config` init container is not the whole story. The main container
+decides which file wins (`src/deploy/entrypoint.sh:387-418`).
 
-**So the file to restore is `/data/hive.yaml.dashboard`.** It is the only
-writable layer and wins. See `src/docs/config-layering.md` for the precedence
-order. Query `GET /api/config/provenance` on an active spoke to identify the
-source for any field.
+**Steady state, in Kubernetes.** The entrypoint reads the PVC runtime config
+first: `/data/hive.yaml.runtime`, or the legacy `/data/hive.yaml.bak` when only
+that one exists. It copies that file over the ConfigMap seed and boots from the
+result. It does **not** merge the dashboard overlay on this path. The log line
+is:
 
-#### `hive.yaml.runtime` is a snapshot, not a restore source
+```
+[entrypoint] K8s mode — booting from runtime config /data/hive.yaml.runtime (ConfigMap is a seed, not merged)
+```
 
-The name misleads. The entrypoint writes `hive.yaml.runtime` after the merge
-(`src/deploy/entrypoint.sh:150`). The file records the result, not an input.
-Variant C does not read it during normal boot.
+**First boot, and a hive reprovisioned onto an existing PVC.** The PVC holds no
+runtime config, so the entrypoint merges `/data/hive.yaml.dashboard` over the
+ConfigMap seed (`src/deploy/entrypoint.sh:419-560`). The overlay wins for
+`acmm_level` and the GitHub App credentials. The seed wins for `hub.is_public`.
+The entrypoint then writes the merged result to `/data/hive.yaml.runtime`
+(`src/deploy/entrypoint.sh:562`), so every later boot takes the steady-state
+path above.
 
-Its only role is the **disaster fallback** at `entrypoint.sh:152-161`. The
-fallback reads `hive.yaml.runtime` when the ConfigMap is missing or empty. This
-case differs from the overlay path, so capture this file too.
+The ConfigMap seed stays small. In sampled hives it provides 4–11% of the
+effective config and lacks top-level blocks (`policies`, `data`, `knowledge`,
+`notifications`, `hive_id`). The state that matters is on the PVC.
 
-`hive.yaml.runtime` and the overlay are similar but not interchangeable. The
-overlay contains no secrets by design: `dashboardOverlayBytes` replaces
-`HIVE_GITHUB_TOKEN` with `${HIVE_GITHUB_TOKEN}` and clears the pod-env-derived
-`dashboard.auth_token`. The runtime file copies the merged config and keeps
-those secrets. Live values on `projectbluefin-knuckle` show the difference:
+#### Restore `hive.yaml.runtime` and the overlay together
+
+**`/data/hive.yaml.runtime` is the file a restored spoke boots from.** A stale
+runtime file on the PVC wins over a current overlay. Nothing reports the
+conflict. The spoke starts, the entrypoint skips the overlay, and the
+`dashboard overlay merged over ConfigMap seed` log line never appears.
+
+Restore the runtime file from the same backup as the overlay. As an
+alternative, delete the runtime file on the PVC. The next boot then merges the
+overlay and writes a new runtime file.
+
+`/data/hive.yaml.dashboard` is still required. It is the only layer that holds
+a dashboard-installed GitHub App. The merge path reads it after you reprovision
+a hive onto an existing PVC. See `src/docs/config-layering.md` for the
+precedence order. Query `GET /api/config/provenance` on an active spoke to
+identify the source for any field.
+
+The two files are similar but not interchangeable. The overlay contains no
+secrets by design: `dashboardOverlayBytes` replaces `HIVE_GITHUB_TOKEN` with
+`${HIVE_GITHUB_TOKEN}` and clears the pod-env-derived `dashboard.auth_token`.
+The runtime file copies the merged config and keeps those secrets. Live values
+on `projectbluefin-knuckle` show the difference:
 
 ```
 /data/hive.yaml.runtime        14609 B   auth_token: 55c076f9…
@@ -306,9 +330,11 @@ NS=hive-hosted-$HIVE
 POD=$(kubectl get pods -n $NS --field-selector=status.phase=Running \
         -o jsonpath='{.items[0].metadata.name}')
 
-# Restore BOTH config files. The overlay is what wins on a normal boot
-# (all 51 hives); hive.yaml.runtime is what the disaster fallback reads when the
-# ConfigMap is missing/empty, and what variant-A/B hives boot from.
+# Restore BOTH config files, from the same backup. hive.yaml.runtime is what
+# the main container boots from whenever the PVC holds one. The overlay is what
+# a first boot merges over the seed when it does not, and it is where a
+# dashboard-installed GitHub App lives. A stale runtime file silently beats a
+# current overlay.
 #
 # Archives taken before the hive.yaml.bak -> hive.yaml.runtime rename carry the
 # legacy name. Restore whichever the archive has, under the NEW name.
@@ -324,19 +350,21 @@ done
 kubectl rollout restart deploy/hive -n $NS
 ```
 
-Confirm the spoke used the restored config. **Which log line to expect depends
-on the variant** (see §3):
+Confirm the spoke used the restored config. The `copy-config` log says which
+init-container variant ran (see §3). The log of the main container says what
+the hive booted from:
 
 ```bash
 kubectl logs -n $NS -c copy-config $POD
 #   variant A/B  -> "override-used"     (runtime config restored)
 #   variant C    -> "configmap-copied"  (seed copied; runtime config NOT read)
 
-# On variant C the overlay is what matters, and the merge happens in the
-# main container, not copy-config:
 kubectl logs -n $NS -c hive $POD | grep '\[entrypoint\]'
-#   expect: "dashboard overlay merged over ConfigMap seed"
-#   NOT:    "dashboard overlay invalid, using ConfigMap seed as-is"
+#   runtime config restored (the normal case):
+#     expect: "booting from runtime config /data/hive.yaml.runtime"
+#   overlay restored with NO runtime config on the PVC:
+#     expect: "dashboard overlay merged over ConfigMap seed"
+#     NOT:    "dashboard overlay invalid, using ConfigMap seed as-is"
 ```
 
 The best confirmation is to ask the spoke directly:
@@ -363,7 +391,9 @@ Manual, and unavoidable:
 - [ ] hive count and vanity URLs unchanged
 - [ ] spokes appear online and heartbeat to the hub
 - [ ] `copy-config` logged `override-used` on A/B or `configmap-copied` on C
-- [ ] The hive container logged "dashboard overlay merged over ConfigMap seed"
+- [ ] The log of the hive container names the config it booted from: the
+      runtime config on a normal restore, or the merged overlay when the PVC
+      holds no runtime config
 - [ ] a fresh `hive-backup run` succeeds against the rebuilt hub
 
 ---
@@ -431,8 +461,8 @@ preserves that record.
 
 | Path | Why |
 |---|---|
-| `hive.yaml.dashboard` | The **overlay** — the layer that wins the boot merge (see below) |
-| `hive.yaml.runtime` | Post-merge snapshot; disaster fallback + variant-A/B boot source |
+| `hive.yaml.dashboard` | The **overlay** — the writable layer a first boot merges over the seed (see below) |
+| `hive.yaml.runtime` | The steady-state boot input; also the only copy that keeps env-derived secrets |
 | `hive-id` | Hive identity as known to the hub |
 | `hive-state.json` | Agent runtime state |
 | `gh-app-key*.pem` | GitHub App private keys — **credentials** |
@@ -459,20 +489,20 @@ Bead directories are **discovered, not hardcoded**. A production spoke had ten
 spoke. Beads use 2.6MB; the whole PVC uses about 796MB.
 The small archive streams to a browser and stays responsive.
 
-## Capture the overlay and `hive.yaml.runtime`, not `hive.yaml`
+## Capture `hive.yaml.runtime` and the overlay, not `hive.yaml`
 
 The hub backup has the same silent trap.
 
 `/etc/hive/hive.yaml` is **not** the file to back up. A sampled production
 spoke had a root-owned copy that lagged the live config by days. The boot
-process creates it from the seed and overlay at each boot.
+process writes it from the PVC on each boot.
 
 Capture these two files:
 
 | File | Why |
 |---|---|
-| `/data/hive.yaml.dashboard` | The **overlay** — the only writable layer, and the one that wins the boot-time merge on all 51 hives. This is the real running config. |
-| `/data/hive.yaml.runtime` | The post-merge snapshot. Read by the disaster fallback when the ConfigMap is missing/empty, and by variant-A/B hives on every boot. Also the only copy that retains env-derived secrets. |
+| `/data/hive.yaml.runtime` | The file the main container boots from whenever the PVC holds one — the steady state on every hive, and the init-container source on variant A/B. Also the only copy that keeps env-derived secrets. |
+| `/data/hive.yaml.dashboard` | The **overlay** — the only layer the dashboard writes. A first boot, and a hive reprovisioned onto an existing PVC, merges it over the ConfigMap seed. It is the only layer that holds a dashboard-installed GitHub App. |
 
 They are similar but **not interchangeable**. The overlay has no secrets. A
 later restore can silently lose the owner's settings when you back up the wrong
@@ -546,8 +576,9 @@ kubectl -n $NS scale deploy/hive --replicas=1
 POD=$(kubectl -n $NS get pods --field-selector=status.phase=Running \
         -o jsonpath='{.items[0].metadata.name}')
 
-# 3. Config FIRST. Restore BOTH: the overlay is what wins the boot merge on
-#    every hive; hive.yaml.runtime covers the disaster fallback and variant-A/B hives.
+# 3. Config FIRST. Restore BOTH, from the same backup: hive.yaml.runtime is
+#    what the hive boots from whenever the PVC holds one, and the overlay is
+#    what a first boot merges over the seed when it does not.
 #    Pre-rename archives carry hive.yaml.bak — restore it under the new name.
 kubectl -n $NS cp ./restore/spoke/hive.yaml.dashboard $POD:/data/hive.yaml.dashboard -c hive
 RUNTIME_SRC=./restore/spoke/hive.yaml.runtime
