@@ -400,13 +400,34 @@ test('Pause is staged and relay receipt distinguishes persistence from runtime u
   const t = await boot();
   t.walkTo('beta');
   await t.control(t.row('beta'), 'Pause: beta').onclick();
-  assert.match(t.doc.getElementById('tree-info').textContent, /Pause selected in this review.*Apply saves this choice.*Runtime pause is not confirmed/);
+  assert.match(t.doc.getElementById('tree-info').textContent, /Pause staged in this review.*Apply saves it.*Runtime pause is not confirmed/);
+  assert.match(t.row('beta').textContent, /Pause staged/);
   assert.doesNotMatch(t.doc.getElementById('tree-info').textContent, /no new work is requested/);
   const receipt = vm.runInContext("describeReceipt('profiles-and-projection-saved', 'no-managed-relay-found', 'unknown')", t.ctx);
   assert.match(receipt, /profiles.yml and contributor.env/);
   assert.match(receipt, /another relay may still be running/);
   assert.match(receipt, /Confirmed by relay: unknown/);
   assert.doesNotMatch(receipt, /no relay running/);
+});
+
+test('a Hive that is already saved as paused says so and offers nothing to apply', async () => {
+  const t = await boot({ setup: state => { state.tree.subscriptions[1].disabled = true; } });
+  t.row('beta').focus();
+  const info = t.doc.getElementById('tree-info').textContent;
+  assert.match(info, /Paused in the saved profiles/);
+  assert.doesNotMatch(info, /Apply saves|staged/);
+  assert.match(t.row('beta').textContent, /Paused/);
+  assert.doesNotMatch(t.row('beta').textContent, /staged/);
+});
+
+test('a server error without punctuation stays a separate sentence in the batch message', async () => {
+  let calls = 0;
+  const t = await boot({ fetch: next => async (url, opts) => {
+    if (opts && opts.method && ++calls === 2) throw new Error('storage busy');
+    return next(url, opts);
+  } });
+  await t.control(t.row('beta'), 'Accept 2 new: beta').onclick();
+  assert.match(t.said.at(-1)[0], /not attempted\. storage busy\. Successful changes remain staged/);
 });
 
 test('detail descriptions expose API provenance, offered state and global exclusion recovery', async () => {

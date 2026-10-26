@@ -111,6 +111,14 @@ function button(text, action, key, context) {
   if(context) b.setAttribute('aria-label', text + ': ' + context);
   return b;
 }
+// The review's diff.enabled lists only staged pauses/resumes; a Hive that is paused with nothing staged is saved state.
+function pauseNotice(sub) {
+  const staged = ((review && review.diff.enabled) || []).find(e => e.target === sub.id);
+  if(staged) return staged.after
+    ? {label: 'Resume staged', detail: 'Resume staged in this review. Apply saves it; a relay must pick it up before new work resumes. Runtime resume is not confirmed here.'}
+    : {label: 'Pause staged', detail: 'Pause staged in this review: choices are kept. Apply saves it; stopping new work still requires a relay to pick it up. Runtime pause is not confirmed here.'};
+  return sub.disabled ? {label: 'Paused', detail: 'Paused in the saved profiles: choices are kept. A relay that has loaded this profile requests no new work; this page cannot confirm that one has.'} : null;
+}
 function selectionText(s) {
   if(s.legacy_unrestricted) return 'Unrestricted — legacy: can receive work from ' + (s.repositories ? 'all ' + s.repositories + ' repositories' : 'every repository it offers') + ' until you restrict it' + (s.membership_incomplete ? '; Membership incomplete' : '');
   return ({off:'Off', partial:'Partial', 'all-current':'All current'}[s.state] || s.state) +
@@ -212,7 +220,9 @@ async function stageBatch(changes, confirmation) {
     if(confirmation && !await styledConfirm(confirmation, 'Turn on')) return {cancelled:true};
     const result = await stageList(changes);
     const counts = result.staged + ' of ' + changes.length + ' changes confirmed staged. ';
-    say(result.failed ? counts + result.failed + ' failed; ' + result.unattempted + ' not attempted. ' + result.error + ' Successful changes remain staged. Review before retrying; nothing has been applied.' : counts + 'Apply to save; runtime changes are not confirmed.', result.failed ? 'error' : undefined);
+    // The server's error text may end without punctuation; keep it a sentence of its own.
+    const reason = result.error ? result.error.replace(/[\s.]*$/, '') + '.' : '';
+    say(result.failed ? counts + result.failed + ' failed; ' + result.unattempted + ' not attempted. ' + reason + ' Successful changes remain staged. Review before retrying; nothing has been applied.' : counts + 'Apply to save; runtime changes are not confirmed.', result.failed ? 'error' : undefined);
     return result;
   } catch(e) { say(e.message, 'error'); return {error:e.message}; }
   finally { treeBusy = false; treeControls(); }
@@ -326,12 +336,13 @@ function renderTree() {
     for(const sub of members.filter(matches)) {
       const skey = JSON.stringify([hub.id,sub.id]);
       const subFollow = followState([sub]), subNew = newRepos([sub]), legacy = sub.selection.legacy_unrestricted;
-      const subText = [shortText(sub.selection), sub.disabled && 'Pause selected', sub.shared_across_hubs > 1 && 'in ' + sub.shared_across_hubs + ' hubs'].filter(Boolean).join(' · ');
+      const pause = pauseNotice(sub);
+      const subText = [shortText(sub.selection), pause && pause.label, sub.shared_across_hubs > 1 && 'in ' + sub.shared_across_hubs + ' hubs'].filter(Boolean).join(' · ');
       const s = treeItem(h.group, skey, sub.id, sub.selection, {operation:'current',target:sub.id}, true, subText, {kind: 'Hive', title: sub.id, lines: [
         legacy ? 'Unrestricted: gets work from every repository it offers, whatever is ticked. “Choose what to allow” limits it.' : sub.selection.selected + ' of ' + sub.selection.repositories + ' repositories on.',
         legacy ? '' : (sub.follow_new_repositories ? 'New repositories are turned on automatically when you check for new.' : 'New repositories wait until you turn them on.'),
         subNew.length ? subNew.length + ' new ' + (subNew.length === 1 ? 'repository' : 'repositories') + ' waiting.' : 'Nothing new waiting.',
-        sub.disabled ? 'Pause selected in this review: choices are kept. Apply saves this choice; stopping new work requires the relay to pick it up. Runtime pause is not confirmed here.' : '',
+        pause ? pause.detail : '',
         sub.shared_across_hubs > 1 ? 'Listed under ' + sub.shared_across_hubs + ' hubs; a change here shows in each.' : '',
         sub.selection_sources && sub.selection_sources.length ? 'Selection sources: ' + sub.selection_sources.join(', ') + '. These describe the selection, not repository ownership.' : 'No selection provenance recorded.',
         'Address: ' + sub.hive_id].filter(Boolean)});
