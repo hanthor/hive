@@ -782,20 +782,28 @@ func (o HivesOverlay) treeFooter() string {
 		"j/k move  enter/l/h expand  / search  ctrl+r refresh  " + back
 }
 
-// Five fixed context/action rows and three margin rows surround the viewport.
+// Six fixed context/action rows (title, notice, scope, position, two hints) and
+// two margin rows surround the viewport.
 const hivesTreeReviewReservedRows = 8
 
-// TreeReviewFits requires room for confirmation context and at least one diff
-// row. Enter must not apply when a resize has hidden the review.
+// The review needs room for its pinned context and enough diff rows to read:
+// at 12 rows the viewport is 4 rows (at 10 it was 2, i.e. 60 pages for 61 changes).
+const (
+	hivesTreeReviewMinWidth  = 40
+	hivesTreeReviewMinHeight = 12
+)
+
+// TreeReviewFits requires room for confirmation context and a readable diff
+// window. Enter must not apply when a resize has hidden the review.
 func (o HivesOverlay) TreeReviewFits(width, height int) bool {
-	return width >= 40 && height >= 10
+	return width >= hivesTreeReviewMinWidth && height >= hivesTreeReviewMinHeight
 }
 
+// treeReviewLines wraps only the diff; the scope is pinned above the viewport.
 func (o HivesOverlay) treeReviewLines(width int) []string {
-	text := "Effective scope: " + o.tree.view.Scope + "\n" + strings.Join(o.tree.view.Diff, "\n")
 	// Hard wrapping retains every character of long canonical identities,
 	// including wide/combining Unicode, without inserting ellipses.
-	return strings.Split(ansi.Hardwrap(text, max(1, width-4), true), "\n")
+	return strings.Split(ansi.Hardwrap(strings.Join(o.tree.view.Diff, "\n"), max(1, width-4), true), "\n")
 }
 
 // TreeReviewScroll moves in physical wrapped rows using the current terminal
@@ -827,8 +835,9 @@ func (o HivesOverlay) TreeReviewScroll(key string, width, height int) HivesOverl
 
 func (o HivesOverlay) treeReviewView(width, height int) string {
 	if !o.TreeReviewFits(width, height) {
-		// No enabled Apply hint on a screen too small to show its context.
-		lines := strings.Split(ansi.Hardwrap("Enter disabled; Esc back.\nReview paused: resize to 40x10.\nStaged edits kept.", max(1, width), true), "\n")
+		// No enabled Apply hint on a screen too small to show its context. No
+		// trailing punctuation: it would wrap onto a line of its own.
+		lines := strings.Split(ansi.Hardwrap(fmt.Sprintf("Enter disabled; Esc back\nReview paused: resize to %dx%d\nStaged edits kept", hivesTreeReviewMinWidth, hivesTreeReviewMinHeight), max(1, width), true), "\n")
 		return strings.Join(lines[:min(len(lines), max(0, height))], "\n")
 	}
 	lines := o.treeReviewLines(width)
@@ -839,6 +848,9 @@ func (o HivesOverlay) treeReviewView(width, height int) string {
 	for len(body) < page {
 		body = append(body, "")
 	}
-	return fmt.Sprintf("Review staged changes (%d)\nNothing has been written yet.\n%s\nRows %d-%d of %d\n↑/↓ j/k scroll · PgUp/PgDn · Home/End\nEnter apply · Esc back (keep edits)",
-		o.tree.view.Staged, strings.Join(body, "\n"), start+1, end, len(lines))
+	// The scope is a summary, not an identity, so it is truncated rather than wrapped.
+	scope := ansi.Truncate("Effective scope: "+o.tree.view.Scope, width, "…")
+	// "Lines" are wrapped screen lines; the title counts changes.
+	return fmt.Sprintf("%s\nNothing has been written yet.\n%s\n%s\nLines %d-%d of %d\n↑/↓ j/k scroll · PgUp/PgDn · Home/End\nEnter apply · Esc back (keep edits)",
+		hivesTitleStyle.Render(fmt.Sprintf("Review staged changes (%d)", o.tree.view.Staged)), scope, strings.Join(body, "\n"), start+1, end, len(lines))
 }

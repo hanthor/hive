@@ -540,7 +540,7 @@ func TestHivesTreeReviewViewport(t *testing.T) {
 		if lipgloss.Width(view) > width || lipgloss.Height(view) > height {
 			t.Fatalf("review exceeds %dx%d: %dx%d", width, height, lipgloss.Width(view), lipgloss.Height(view))
 		}
-		for _, hint := range []string{"Nothing has been written", "Enter apply", "Esc back", "PgUp/PgDn", "Rows "} {
+		for _, hint := range []string{"Nothing has been written", "Effective scope:", "Enter apply", "Esc back", "PgUp/PgDn", "Lines "} {
 			if !strings.Contains(view, hint) {
 				t.Fatalf("missing %q: %s", hint, view)
 			}
@@ -563,7 +563,7 @@ func TestHivesTreeReviewViewport(t *testing.T) {
 	if !strings.Contains(check(80, 24), "change-59") {
 		t.Fatal("End did not reveal final change")
 	}
-	check(40, 10)
+	check(40, 12)
 	check(120, 60) // clamps an offset beyond the new final page
 	o = o.TreeReviewScroll("home", 80, 24)
 	if check(80, 24) != first {
@@ -579,8 +579,13 @@ func TestHivesTreeReviewViewport(t *testing.T) {
 			t.Fatal("reverse line scroll did not return")
 		}
 	}
-	if o.TreeReviewFits(39, 24) || o.TreeReviewFits(80, 9) || !strings.Contains(o.View(39, 9), "Enter disabled") {
+	if o.TreeReviewFits(39, 24) || o.TreeReviewFits(80, 11) || !strings.Contains(o.View(39, 11), "Enter disabled") || !strings.Contains(o.View(80, 11), "resize to 40x12") {
 		t.Fatal("small terminal must pause Apply explicitly")
+	}
+	for _, line := range strings.Split(o.View(30, 8), "\n") {
+		if strings.TrimSpace(line) == "." {
+			t.Fatal("paused message wrapped a lone period onto its own line")
+		}
 	}
 	if o.TreeCancel().TreeStaged() != 60 {
 		t.Fatal("Escape lost staged edits")

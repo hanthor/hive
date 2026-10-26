@@ -497,11 +497,11 @@ func TestHivesTreeLargeReviewNavigationDoesNotWrite(t *testing.T) {
 			t.Fatal("review navigation issued a command")
 		}
 	}
-	h.send(t, tea.WindowSizeMsg{Width: 40, Height: 10})
-	if view := h.view(); lipgloss.Width(view) > 40 || lipgloss.Height(view) > 10 || !strings.Contains(view, "Enter apply") {
+	h.send(t, tea.WindowSizeMsg{Width: 40, Height: 12})
+	if view := h.view(); lipgloss.Width(view) > 40 || lipgloss.Height(view) > 12 || !strings.Contains(view, "Enter apply") || !strings.Contains(view, "Effective scope:") {
 		t.Fatalf("model review did not resize: %s", view)
 	}
-	h.send(t, tea.WindowSizeMsg{Width: 30, Height: 8})
+	h.send(t, tea.WindowSizeMsg{Width: 40, Height: 11})
 	if cmd := h.send(t, treeEnter); cmd != nil {
 		t.Fatal("Enter applied while review context was hidden")
 	}

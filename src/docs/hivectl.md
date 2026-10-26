@@ -1071,8 +1071,9 @@ Notes:
   and Hive actions show affected counts before staging. In review, `↑`/`↓` or
   `j`/`k` scroll wrapped rows; `PageUp`/`PageDown` page and `Home`/`End` jump.
   Full target identities wrap without truncation. `Enter` explicitly applies;
-  `Esc` returns with edits kept. The review adapts to resize and pauses Apply
-  below 40 columns or 10 rows until its confirmation context fits again.
+  `Esc` returns with edits kept. The review pins the title, scope and key hints,
+  scrolls only the diff, adapts to resize and pauses Apply
+  below 40 columns or 12 rows until its confirmation context fits again.
   Nothing is written until Apply; a review whose profiles changed elsewhere must
   be discarded and reviewed again, and leaving or quitting with unapplied edits asks first.
 - **Disable instead of removing a hive to pause it.** `hivectl hives disable <name>`
