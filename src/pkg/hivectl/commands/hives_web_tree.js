@@ -91,7 +91,7 @@ async function loadTree(discover=false, accept=false) {
 async function stageChange(change) {
   if(!review || review.diff.stale) return {ok:false, error:'Discard the stale review and review again before editing.'};
   try { await treeRequest('/api/tree/diff', change); return {ok:true}; }
-  catch(e) { return {ok:false, error:e.message}; }
+  catch(e) { return {ok:false, error:e.message || 'Contribution request failed without an explanation.'}; }
 }
 async function editTree(change) {
   if(treeBusy || !review) return {ok:false, blocked:true};
@@ -212,7 +212,7 @@ async function stageBatch(changes, confirmation) {
     if(confirmation && !await styledConfirm(confirmation, 'Turn on')) return {cancelled:true};
     const result = await stageList(changes);
     const counts = result.staged + ' of ' + changes.length + ' changes confirmed staged. ';
-    say(result.error ? counts + result.failed + ' failed; ' + result.unattempted + ' not attempted. ' + result.error + ' Successful changes remain staged. Review before retrying; nothing has been applied.' : counts + 'Apply to save; runtime changes are not confirmed.', result.error ? 'error' : undefined);
+    say(result.failed ? counts + result.failed + ' failed; ' + result.unattempted + ' not attempted. ' + result.error + ' Successful changes remain staged. Review before retrying; nothing has been applied.' : counts + 'Apply to save; runtime changes are not confirmed.', result.failed ? 'error' : undefined);
     return result;
   } catch(e) { say(e.message, 'error'); return {error:e.message}; }
   finally { treeBusy = false; treeControls(); }
@@ -461,8 +461,8 @@ discardButton.onclick = async () => {
   catch(e) { say(e.message,'error'); }
   finally { treeBusy = false; treeControls(); }
 };
-async function leaveTreeEdits() {
-  if(treeBusy) { say('Wait for the current contribution request.'); return false; }
+async function leaveTreeEdits(ownsBusy=false) {
+  if(treeBusy && !ownsBusy) { say('Wait for the current contribution request.'); return false; }
   if(review && review.projection_pending) { say('Profiles were saved, but projection failed. Retry Apply before leaving this review.','error'); return false; }
   if(hasTreeEdits() && !await styledConfirm('Discard unapplied contribution edits?', 'Discard edits')) return false;
   await discardTree(); return true;
@@ -471,12 +471,13 @@ async function leaveTreeEdits() {
 // The page-load call passes false, so opening the page never stages anything.
 async function refreshTree(accept) {
   if(treeBusy) return;
+  treeBusy = true; clearTimeout(searchTimer); treeControls();
   // Ordinary refresh keeps pending edits and focus; renewed discovery requires
   // explicitly discarding the old reviewed snapshot, never replaying its edits.
   try {
     if(hasTreeEdits() && !review.diff.stale) { await loadTree(); say('Your changes are kept. Apply or Discard them before checking for new.'); return; }
-    if(!await leaveTreeEdits()) return;
-    treeBusy = true; clearTimeout(searchTimer); treeControls(); say('Checking for new repositories…'); await loadTree(true, accept);
+    if(!await leaveTreeEdits(true)) return;
+    say('Checking for new repositories…'); await loadTree(true, accept);
     const n = (review.diff.auto || []).length;
     say(n ? n + ' new ' + (n === 1 ? 'repository was' : 'repositories were') + ' turned on automatically because you follow their Hive. Apply to save, or Discard.' : 'Up to date. Nothing saved.');
   } catch(e) { say(e.message,'error'); }

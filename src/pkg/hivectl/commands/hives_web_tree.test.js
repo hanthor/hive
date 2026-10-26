@@ -202,7 +202,7 @@ function makeFetch(state) {
       state.diff.membership = [{ subscription: sub.id }];
     } else if (body.operation === 'repository') {
       const repo = sub.repositories.find(r => r.id === body.repository);
-      repo.selected = !!body.value; repo.unreviewed = false;
+      repo.selected = !!body.value && !repo.excluded_by.length; repo.unreviewed = false;
       state.diff.membership = [{ subscription: sub.id }];
     } else if (body.operation === 'exclude') {
       sub.repositories.find(r => r.id === body.repository).excluded_by = body.value ? [sub.id] : [];
@@ -480,6 +480,50 @@ test('a repository checkbox sends only selection and preserves other Hive exclus
   assert.equal(requests[0].operation, 'repository');
   assert.equal(requests[0].target, 'beta');
   assert.deepEqual(t.state.tree.subscriptions[1].repositories[0].excluded_by, ['alpha']);
+  assert.equal(t.row('beta-org/agent').querySelector('input').checked, false, 'global veto keeps the effective selection off');
   t.row('beta-org/agent').focus();
   assert.match(t.doc.getElementById('tree-info').textContent, /Excluded by: alpha/);
+});
+
+
+test('empty request errors still report a failed batch', async () => {
+  const t = await boot({ fetch: next => async (url, opts) => {
+    if (opts && opts.method) throw new Error('');
+    return next(url, opts);
+  } });
+  const result = await t.control(t.row('beta'), 'Accept 2 new: beta').onclick();
+  assert.equal(result.failed, 1);
+  assert.match(t.said.at(-1)[0], /0 of 2 changes confirmed staged.*1 failed; 1 not attempted/);
+  assert.equal(t.said.at(-1)[1], 'error');
+});
+
+test('refresh owns its lock before awaiting and cannot overlap or unlock a batch', async () => {
+  let releaseRefresh, releaseEdit, gets = 0, edits = 0;
+  const t = await boot({
+    setup: state => { state.diff.membership = [{ subscription:'alpha' }]; },
+    fetch: next => async (url, opts) => {
+      if (!opts || !opts.method) {
+        if (++gets > 1) await new Promise(r => { releaseRefresh = r; });
+      } else {
+        edits++;
+        await new Promise(r => { releaseEdit = r; });
+      }
+      return next(url, opts);
+    },
+  });
+  const refresh = t.doc.getElementById('tree-refresh').onclick();
+  await t.control(t.row('beta'), 'Accept 2 new: beta').onclick();
+  assert.equal(edits, 0, 'refresh blocks staging until its response is received');
+  releaseRefresh(); await refresh;
+  assert.equal(t.ul.getAttribute('aria-busy'), 'false');
+  const batch = t.control(t.row('beta'), 'Accept 2 new: beta').onclick();
+  await settle();
+  await t.doc.getElementById('tree-refresh').onclick();
+  assert.equal(gets, 2, 'refresh must not start during the batch');
+  assert.equal(t.ul.getAttribute('aria-busy'), 'true');
+  await t.control(t.row('beta'), 'Pause: beta').onclick();
+  assert.equal(edits, 1, 'blocked refresh must not release the batch lock');
+  releaseEdit(); await settle();
+  releaseEdit(); await batch;
+  assert.equal(edits, 2);
 });
