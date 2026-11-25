@@ -43,6 +43,10 @@ var CLIPaneMarkers = []string{
 	// healthy. "%/" matches the fixed "%%/1.0M" context-meter suffix pi
 	// renders at every context size.
 	PiContextMarker,
+	// opencode's marker. Its TUI draws no "❯" and none of the strings above;
+	// without this a healthy opencode pane reads as a crashed CLI and every kick
+	// restarts it before delivery.
+	OpenCodeInputFooterMarker,
 	// bob's markers. NONE of the entries above match a running bob: verified
 	// against the installed bundle (bobshell 1.0.6 bundle/bob.js), which
 	// contains zero "❯" characters and no "esc cancel" / "/ commands" /

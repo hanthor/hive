@@ -74,6 +74,10 @@ func TestOpencodePane_ReadyWhenIdleBusyWhenTurnRuns(t *testing.T) {
 	if !panesignal.ShowsInputPrompt(opencodeIdlePane) || panesignal.ShowsAgentWorking(opencodeIdlePane) {
 		t.Error("idle opencode pane must read as a ready, not-working prompt")
 	}
+	// A live opencode pane must count as a running CLI, or every kick restarts it.
+	if !panesignal.HasCLIMarker(opencodeIdlePane) || !panesignal.HasCLIMarker(opencodeBusyPane) {
+		t.Error("opencode panes must carry a CLI marker so a healthy TUI is not treated as a crashed shell")
+	}
 	if !panesignal.ShowsAgentWorking(opencodeBusyPane) {
 		t.Error("opencode pane showing 'esc interrupt' must read as working, so a kick is not typed into a live turn")
 	}
