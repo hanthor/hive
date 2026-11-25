@@ -143,6 +143,14 @@ var agentWorkingMarkers = []string{
 	BobBusyMarker,
 }
 
+// OpenCodeInputFooterMarker is the command hint opencode's TUI keeps in its
+// footer while idle ("ctrl+p commands"; the prompt box itself is a bare "┃"
+// gutter with an "Ask anything…" placeholder, which no other backend shares).
+// While a turn runs the footer swaps in "esc interrupt", which
+// agentWorkingMarkers already treats as busy, so readiness callers must check
+// ShowsAgentWorking first, as they do for every backend.
+const OpenCodeInputFooterMarker = "ctrl+p commands"
+
 // BobBusyMarker is the steer hint bob 2.x shows only while it is processing a
 // request. Verified live on Bob-Shell 2.0.5 (#15864).
 const BobBusyMarker = "Enter to steer"
@@ -217,6 +225,7 @@ func ShowsInputPrompt(output string) bool {
 		strings.Contains(output, AgyHeadlessReadyMarker) ||
 		strings.Contains(output, cline.ReadyMarker) ||
 		strings.Contains(output, "π >") ||
+		strings.Contains(output, OpenCodeInputFooterMarker) ||
 		strings.Contains(output, "╰─")
 }
 
